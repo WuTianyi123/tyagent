@@ -94,13 +94,14 @@ class Gateway:
         session_key = adapter.build_session_key(event)
         session = self.session_store.get(session_key)
 
-        # Handle reset commands
-        if event.is_command() and event.get_command() in self.config.reset_triggers:
+        # Handle reset commands (normalize triggers to strip leading /)
+        normalized_triggers = {t.lstrip("/").lower() for t in self.config.reset_triggers}
+        if event.is_command() and event.get_command() in normalized_triggers:
             self.session_store.reset(session_key)
             await adapter.send_message(
                 event.chat_id or "",
-                "✨ Session reset! Starting fresh.",
-                reply_to_message_id=event.message_id,
+                "✅ 已重置会话，历史记录已清除。",
+                reply_to=event.reply_to_text,
             )
             return "Session reset"
 
