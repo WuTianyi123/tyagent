@@ -103,6 +103,28 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_model(args: argparse.Namespace) -> int:
+    """Set AI model configuration."""
+    config = load_config(Path(args.config) if args.config else None)
+
+    if args.model:
+        config.agent.model = args.model
+        print(f"  Model set to: {args.model}")
+    if args.api_key:
+        config.agent.api_key = args.api_key
+        print("  API key set.")
+    if args.base_url:
+        config.agent.base_url = args.base_url
+        print(f"  Base URL set to: {args.base_url}")
+    if args.system_prompt:
+        config.agent.system_prompt = args.system_prompt
+        print(f"  System prompt set to: {args.system_prompt}")
+
+    save_config(config, Path(args.config) if args.config else None)
+    print(f"  Config saved to {config.home_dir / 'config.yaml'}")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ty-agent",
@@ -139,6 +161,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # config
     config_parser = subparsers.add_parser("config", help="Show configuration")
     config_parser.set_defaults(func=cmd_config)
+
+    # set-model
+    set_model_parser = subparsers.add_parser("set-model", help="Set AI model configuration")
+    set_model_parser.add_argument("--model", help="Model name (e.g. gpt-4o, claude-sonnet-4)")
+    set_model_parser.add_argument("--api-key", help="API key for the LLM provider")
+    set_model_parser.add_argument("--base-url", help="Base URL for the LLM API (e.g. https://api.openai.com/v1)")
+    set_model_parser.add_argument("--system-prompt", help="System prompt for the agent")
+    set_model_parser.set_defaults(func=cmd_set_model)
 
     args = parser.parse_args(argv)
     if not args.command:

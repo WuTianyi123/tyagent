@@ -426,6 +426,7 @@ class FeishuAdapter(BasePlatformAdapter):
         This callback runs in the WS client's background thread.
         We must not call asyncio.create_task() here directly.
         """
+        logger.info("_on_message called")
         if self._loop is None or self._loop.is_closed():
             logger.warning("No event loop available for Feishu message handling")
             return
@@ -433,11 +434,15 @@ class FeishuAdapter(BasePlatformAdapter):
         try:
             event = self._parse_event(data)
         except Exception as exc:
-            logger.warning("Failed to parse Feishu event: %s", exc)
+            logger.warning("Failed to parse Feishu event: %s", exc, exc_info=True)
             return
 
         if event is None:
+            logger.info("_parse_event returned None, skipping")
             return
+
+        logger.info("Received message from %s in %s chat %s: %r",
+                    event.sender_id, event.chat_type, event.chat_id, event.text)
 
         # Schedule coroutine on the main event loop thread-safely
         future = asyncio.run_coroutine_threadsafe(
@@ -449,7 +454,8 @@ class FeishuAdapter(BasePlatformAdapter):
     def _on_task_done(self, future: Any) -> None:
         """Callback for background tasks to log errors."""
         try:
-            future.result()
+            result = future.result()
+            logger.info("Message handler completed, result=%s", result)
         except Exception as exc:
             logger.exception("Feishu message handler task failed: %s", exc)
 
@@ -460,16 +466,21 @@ class FeishuAdapter(BasePlatformAdapter):
         header = getattr(data, "header", None)
         event_type = getattr(header, "event_type", "") if header else ""
 
+        logger.info("Parsing event, type=%s", event_type)
+
         if event_type != "im.message.receive_v1":
+            logger.info("Ignoring non-message event: %s", event_type)
             return None
 
         event_data = getattr(data, "event", None)
         if event_data is None:
+            logger.warning("Event has no event data")
             return None
 
         message = getattr(event_data, "message", None)
         sender = getattr(event_data, "sender", None)
         if message is None or sender is None:
+            logger.warning("Event missing message or sender")
             return None
 
         sender_id_info = getattr(sender, "sender_id", None) or {}
@@ -477,6 +488,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         message_id = getattr(message, "message_id", "") or ""
         if self._is_duplicate(message_id):
+            logger.info("Duplicate message %s, skipping", message_id)
             return None
 
         msg_type = getattr(message, "message_type", "")
@@ -486,6 +498,9 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type = "group" if chat_type_raw == "group" else "private"
         sender_id = getattr(sender_id_info, "open_id", "") or ""
 
+        logger.info("Raw message: msg_type=%s, chat_type=%s, sender_type=%s, sender_id=%s, bot_open_id=%s",
+                    msg_type, chat_type, sender_type, sender_id, self._bot_open_id)
+
         try:
             content = json.loads(content_str) if isinstance(content_str, str) else content_str
         except json.JSONDecodeError:
@@ -493,6 +508,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Skip messages sent by the bot itself
         if sender_type == "bot" or sender_id == self._bot_open_id:
+            logger.info("Skipping self-message: sender_type=%s, sender_id=%s, bot_open_id=%s",
+                        sender_type, sender_id, self._bot_open_id)
             return None
 
         # Parse text content
