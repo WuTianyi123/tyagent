@@ -13,8 +13,14 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Default config directory
-default_home = Path.home() / ".ty_agent"
+# Default config directory — use passwd entry so we aren't fooled by $HOME overrides
+_usr_home = Path(os.path.expanduser("~"))
+try:
+    import pwd
+    _usr_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+except (ImportError, KeyError):
+    pass
+default_home = _usr_home / ".ty_agent"
 
 
 @dataclass

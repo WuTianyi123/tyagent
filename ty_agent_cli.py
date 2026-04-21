@@ -125,6 +125,216 @@ def cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_configure(args: argparse.Namespace) -> int:
+    """Interactive configuration wizard for ty-agent."""
+    import os
+
+    config = load_config(Path(args.config) if args.config else None)
+
+    print("=" * 50)
+    print("  ty-agent Configuration Wizard")
+    print("=" * 50)
+    print()
+
+    # Show current config
+    current_model = config.agent.model or "(not set)"
+    current_base_url = config.agent.base_url or "(not set)"
+    has_key = "Yes" if config.agent.api_key else "No"
+    print(f"  Current model:      {current_model}")
+    print(f"  Current base URL:   {current_base_url}")
+    print(f"  API key configured: {has_key}")
+    print()
+
+    # Provider presets
+    _PROVIDERS = [
+        {
+            "name": "OpenAI",
+            "base_url": "https://api.openai.com/v1",
+            "env_var": "OPENAI_API_KEY",
+            "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+        },
+        {
+            "name": "Anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "env_var": "ANTHROPIC_API_KEY",
+            "models": ["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
+        },
+        {
+            "name": "OpenRouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "env_var": "OPENROUTER_API_KEY",
+            "models": ["anthropic/claude-sonnet-4", "openai/gpt-4o", "deepseek/deepseek-chat"],
+        },
+        {
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com/v1",
+            "env_var": "DEEPSEEK_API_KEY",
+            "models": ["deepseek-chat", "deepseek-reasoner"],
+        },
+        {
+            "name": "Moonshot (Kimi)",
+            "base_url": "https://api.moonshot.cn/v1",
+            "env_var": "MOONSHOT_API_KEY",
+            "models": ["kimi-latest", "kimi-k2", "moonshot-v1-128k"],
+        },
+        {
+            "name": "SiliconFlow",
+            "base_url": "https://api.siliconflow.cn/v1",
+            "env_var": "SILICONFLOW_API_KEY",
+            "models": ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1", "Qwen/Qwen2.5-72B-Instruct"],
+        },
+        {
+            "name": "Local / Custom",
+            "base_url": "",
+            "env_var": "",
+            "models": [],
+        },
+    ]
+
+    print("  Select your LLM provider:")
+    for i, p in enumerate(_PROVIDERS, 1):
+        marker = "  "
+        print(f"    {i}. {marker}{p['name']}")
+    print(f"    0.  Leave unchanged")
+    print()
+
+    try:
+        choice = input("  Enter number: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return 0
+
+    if choice == "0":
+        print("  No change.")
+        return 0
+
+    try:
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(_PROVIDERS):
+            print("  Invalid choice.")
+            return 1
+    except ValueError:
+        print("  Invalid input.")
+        return 1
+
+    provider = _PROVIDERS[idx]
+    print()
+    print(f"  → {provider['name']}")
+
+    # Base URL
+    if provider["name"] == "Local / Custom":
+        try:
+            base_url = input("  Base URL (e.g. http://localhost:8000/v1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return 0
+        if not base_url:
+            print("  Base URL is required for custom providers.")
+            return 1
+        config.agent.base_url = base_url
+    else:
+        config.agent.base_url = provider["base_url"]
+        print(f"  Base URL: {provider['base_url']}")
+
+    # Model selection
+    if provider["models"]:
+        print()
+        print("  Select a model (or type a custom name):")
+        for i, m in enumerate(provider["models"], 1):
+            print(f"    {i}. {m}")
+        print(f"    0.  Other (type manually)")
+        print()
+
+        try:
+            model_choice = input("  Enter number or model name: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return 0
+
+        if model_choice == "0":
+            try:
+                model_name = input("  Model name: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.")
+                return 0
+            if not model_name:
+                print("  Model name is required.")
+                return 1
+            config.agent.model = model_name
+        else:
+            try:
+                model_idx = int(model_choice) - 1
+                if 0 <= model_idx < len(provider["models"]):
+                    config.agent.model = provider["models"][model_idx]
+                else:
+                    config.agent.model = model_choice
+            except ValueError:
+                config.agent.model = model_choice
+    else:
+        try:
+            model_name = input("  Model name: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return 0
+        if not model_name:
+            print("  Model name is required.")
+            return 1
+        config.agent.model = model_name
+
+    # API Key
+    print()
+    env_key = None
+    if provider["env_var"]:
+        env_key = os.getenv(provider["env_var"])
+    if env_key:
+        print(f"  {provider['env_var']} found in environment.")
+        try:
+            use_env = input(f"  Use it? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return 0
+        if use_env not in ("n", "no"):
+            config.agent.api_key = env_key
+        else:
+            try:
+                api_key = input("  API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.")
+                return 0
+            config.agent.api_key = api_key
+    else:
+        try:
+            api_key = input("  API key (leave blank for none): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Cancelled.")
+            return 0
+        config.agent.api_key = api_key or None
+
+    # System prompt
+    print()
+    try:
+        system_prompt = input("  System prompt (leave blank for default): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return 0
+    if system_prompt:
+        config.agent.system_prompt = system_prompt
+
+    # Save
+    save_config(config, Path(args.config) if args.config else None)
+    print()
+    print("  Configuration saved!")
+    print()
+    print(f"    Model:        {config.agent.model}")
+    print(f"    Base URL:     {config.agent.base_url}")
+    print(f"    API key:      {'*' * 10 if config.agent.api_key else '(none)'}")
+    print(f"    System:       {config.agent.system_prompt[:40]}...")
+    print()
+    print(f"  Config file: {config.home_dir / 'config.yaml'}")
+    print()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ty-agent",
@@ -169,6 +379,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     set_model_parser.add_argument("--base-url", help="Base URL for the LLM API (e.g. https://api.openai.com/v1)")
     set_model_parser.add_argument("--system-prompt", help="System prompt for the agent")
     set_model_parser.set_defaults(func=cmd_set_model)
+
+    # configure
+    configure_parser = subparsers.add_parser("configure", help="Interactive configuration wizard")
+    configure_parser.set_defaults(func=cmd_configure)
 
     args = parser.parse_args(argv)
     if not args.command:
