@@ -336,20 +336,33 @@ def _run_ws_client(ws_client: Any, adapter: Any) -> None:
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    original_loop = getattr(ws_client_module, "loop", None)
     ws_client_module.loop = loop
     adapter._ws_thread_loop = loop
 
     try:
         ws_client.start()
     except Exception:
-        pass
+        logger.warning("Feishu WS client exited with error", exc_info=True)
     finally:
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        loop.close()
+        ws_client_module.loop = original_loop
+        adapter._ws_thread_loop = None
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        try:
+            loop.stop()
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +392,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         self._client: Any = None
         self._ws_client: Any = None
+        self._ws_future: Any = None
+        self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._bot_open_id: Optional[str] = None
         self._bot_name: str = ""
         self._running = False
@@ -598,23 +613,32 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def stop(self) -> None:
         self._running = False
-        if self._ws_client:
+        ws_thread_loop = self._ws_thread_loop
+        if ws_thread_loop is not None and not ws_thread_loop.is_closed():
+            logger.debug("Cancelling Feishu websocket tasks and stopping loop")
+
+            def cancel_all_tasks() -> None:
+                for task in asyncio.all_tasks(ws_thread_loop):
+                    if not task.done():
+                        task.cancel()
+
+            ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
+
+        ws_future = self._ws_future
+        if ws_future is not None:
             try:
-                import lark_oapi.ws.client as ws_mod
-                if getattr(self, "_ws_thread_loop", None) and not self._ws_thread_loop.is_closed():
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._ws_client._disconnect(), self._ws_thread_loop
-                    )
-                    try:
-                        future.result(timeout=5)
-                    except Exception:
-                        pass
-                    # Stop the event loop to unblock start()
-                    self._ws_thread_loop.call_soon_threadsafe(self._ws_thread_loop.stop)
-            except Exception:
+                await asyncio.wait_for(ws_future, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Feishu WS thread did not exit within 10s")
+            except asyncio.CancelledError:
                 pass
-        if self._ws_future and not self._ws_future.done():
-            self._ws_future.cancel()
+            except Exception as exc:
+                logger.debug("Feishu WS thread exited with error: %s", exc, exc_info=True)
+
+        self._ws_future = None
+        self._ws_thread_loop = None
+        self._loop = None
+        self._ws_client = None
         logger.info("Feishu adapter stopped")
 
     # ---- Send methods ----
