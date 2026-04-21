@@ -1,0 +1,609 @@
+"""Feishu/Lark platform adapter for ty-agent.
+
+Supports:
+- WebSocket long connection
+- Direct-message and group @mention-gated text receive/send
+- Inbound image/file caching
+- QR scan-to-create onboarding
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+import aiohttp
+
+from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# QR onboarding constants
+# ---------------------------------------------------------------------------
+_ONBOARD_ACCOUNTS_URLS = {
+    "feishu": "https://accounts.feishu.cn",
+    "lark": "https://accounts.larksuite.com",
+}
+_ONBOARD_OPEN_URLS = {
+    "feishu": "https://open.feishu.cn",
+    "lark": "https://open.larksuite.com",
+}
+_REGISTRATION_PATH = "/oauth/v1/app/registration"
+_ONBOARD_REQUEST_TIMEOUT_S = 10
+
+# Feishu message type constants
+_MSG_TYPE_TEXT = "text"
+_MSG_TYPE_IMAGE = "image"
+_MSG_TYPE_FILE = "file"
+_MSG_TYPE_POST = "post"
+_MSG_TYPE_MERGE_FORWARD = "merge_forward"
+_MSG_TYPE_SHARE_CHAT = "share_chat"
+
+# Dedup TTL
+_DEDUP_TTL_SECONDS = 24 * 60 * 60
+
+
+try:
+    import lark_oapi as lark
+    from lark_oapi.api.im.v1 import (
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+        GetMessageResourceRequest,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
+    )
+    from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+    from lark_oapi.ws import Client as FeishuWSClient
+
+    FEISHU_AVAILABLE = True
+except ImportError:
+    FEISHU_AVAILABLE = False
+    lark = None  # type: ignore[assignment]
+    FeishuWSClient = None  # type: ignore[assignment, misc]
+    FEISHU_DOMAIN = None  # type: ignore[assignment]
+    LARK_DOMAIN = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# QR scan-to-create onboarding
+# ---------------------------------------------------------------------------
+
+def _accounts_base_url(domain: str) -> str:
+    return _ONBOARD_ACCOUNTS_URLS.get(domain, _ONBOARD_ACCOUNTS_URLS["feishu"])
+
+
+def _onboard_open_base_url(domain: str) -> str:
+    return _ONBOARD_OPEN_URLS.get(domain, _ONBOARD_OPEN_URLS["feishu"])
+
+
+def _post_registration(base_url: str, body: Dict[str, str]) -> dict:
+    """POST form-encoded data to the registration endpoint, return parsed JSON."""
+    url = f"{base_url}{_REGISTRATION_PATH}"
+    data = urlencode(body).encode("utf-8")
+    req = Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urlopen(req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body_bytes = exc.read()
+        if body_bytes:
+            try:
+                return json.loads(body_bytes.decode("utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                raise exc from None
+        raise
+
+
+def _init_registration(domain: str = "feishu") -> None:
+    """Verify the environment supports client_secret auth."""
+    base_url = _accounts_base_url(domain)
+    res = _post_registration(base_url, {"action": "init"})
+    methods = res.get("supported_auth_methods") or []
+    if "client_secret" not in methods:
+        raise RuntimeError(
+            f"Feishu / Lark registration environment does not support client_secret auth. "
+            f"Supported: {methods}"
+        )
+
+
+def _begin_registration(domain: str = "feishu") -> dict:
+    """Start the device-code flow."""
+    base_url = _accounts_base_url(domain)
+    res = _post_registration(base_url, {
+        "action": "begin",
+        "archetype": "PersonalAgent",
+        "auth_method": "client_secret",
+        "request_user_info": "open_id",
+    })
+    device_code = res.get("device_code")
+    if not device_code:
+        raise RuntimeError("Feishu / Lark registration did not return a device_code")
+    qr_url = res.get("verification_uri_complete", "")
+    if "?" in qr_url:
+        qr_url += "&from=ty-agent&tp=ty-agent"
+    else:
+        qr_url += "?from=ty-agent&tp=ty-agent"
+    return {
+        "device_code": device_code,
+        "qr_url": qr_url,
+        "user_code": res.get("user_code", ""),
+        "interval": res.get("interval") or 5,
+        "expire_in": res.get("expire_in") or 600,
+    }
+
+
+def _poll_registration(
+    *,
+    device_code: str,
+    interval: int,
+    expire_in: int,
+    domain: str = "feishu",
+) -> Optional[dict]:
+    """Poll until the user scans the QR code, or timeout/denial."""
+    deadline = time.time() + expire_in
+    current_domain = domain
+    domain_switched = False
+    poll_count = 0
+
+    while time.time() < deadline:
+        base_url = _accounts_base_url(current_domain)
+        try:
+            res = _post_registration(base_url, {
+                "action": "poll",
+                "device_code": device_code,
+                "tp": "ob_app",
+            })
+        except (URLError, OSError, json.JSONDecodeError):
+            time.sleep(interval)
+            continue
+
+        poll_count += 1
+        if poll_count == 1:
+            print("  Fetching configuration results...", end="", flush=True)
+        elif poll_count % 6 == 0:
+            print(".", end="", flush=True)
+
+        # Domain auto-detection
+        user_info = res.get("user_info") or {}
+        tenant_brand = user_info.get("tenant_brand")
+        if tenant_brand == "lark" and not domain_switched:
+            current_domain = "lark"
+            domain_switched = True
+
+        # Success
+        if res.get("client_id") and res.get("client_secret"):
+            if poll_count > 0:
+                print()
+            return {
+                "app_id": res["client_id"],
+                "app_secret": res["client_secret"],
+                "domain": current_domain,
+                "open_id": user_info.get("open_id"),
+            }
+
+        # Terminal errors
+        error = res.get("error", "")
+        if error in ("access_denied", "expired_token"):
+            if poll_count > 0:
+                print()
+            logger.warning("[Feishu onboard] Registration %s", error)
+            return None
+
+        time.sleep(interval)
+
+    if poll_count > 0:
+        print()
+    logger.warning("[Feishu onboard] Poll timed out after %ds", expire_in)
+    return None
+
+
+try:
+    import qrcode as _qrcode_mod
+except (ImportError, TypeError):
+    _qrcode_mod = None  # type: ignore[assignment]
+
+
+def _render_qr(url: str) -> bool:
+    """Try to render a QR code in the terminal."""
+    if _qrcode_mod is None:
+        return False
+    try:
+        qr = _qrcode_mod.QRCode()
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        return True
+    except Exception:
+        return False
+
+
+def probe_bot(app_id: str, app_secret: str, domain: str) -> Optional[dict]:
+    """Verify bot connectivity via /open-apis/bot/v3/info."""
+    base_url = _onboard_open_base_url(domain)
+    try:
+        token_data = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+        token_req = Request(
+            f"{base_url}/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(token_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
+            token_res = json.loads(resp.read().decode("utf-8"))
+
+        access_token = token_res.get("tenant_access_token")
+        if not access_token:
+            return None
+
+        bot_req = Request(
+            f"{base_url}/open-apis/bot/v3/info",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(bot_req, timeout=_ONBOARD_REQUEST_TIMEOUT_S) as resp:
+            bot_res = json.loads(resp.read().decode("utf-8"))
+
+        if bot_res.get("code") != 0:
+            return None
+        bot = bot_res.get("bot") or bot_res.get("data", {}).get("bot") or {}
+        return {
+            "bot_name": bot.get("bot_name"),
+            "bot_open_id": bot.get("open_id"),
+        }
+    except (URLError, OSError, KeyError, json.JSONDecodeError) as exc:
+        logger.debug("[Feishu onboard] HTTP probe failed: %s", exc)
+        return None
+
+
+def qr_register(
+    *,
+    initial_domain: str = "feishu",
+    timeout_seconds: int = 600,
+) -> Optional[dict]:
+    """Run the Feishu / Lark scan-to-create QR registration flow.
+
+    Returns on success:
+        {
+            "app_id": str,
+            "app_secret": str,
+            "domain": "feishu" | "lark",
+            "open_id": str | None,
+            "bot_name": str | None,
+            "bot_open_id": str | None,
+        }
+    """
+    try:
+        return _qr_register_inner(initial_domain=initial_domain, timeout_seconds=timeout_seconds)
+    except (RuntimeError, URLError, OSError, json.JSONDecodeError) as exc:
+        logger.warning("[Feishu onboard] Registration failed: %s", exc)
+        return None
+
+
+def _qr_register_inner(
+    *,
+    initial_domain: str,
+    timeout_seconds: int,
+) -> Optional[dict]:
+    """Run init -> begin -> poll -> probe."""
+    print("  Connecting to Feishu / Lark...", end="", flush=True)
+    _init_registration(initial_domain)
+    begin = _begin_registration(initial_domain)
+    print(" done.")
+
+    print()
+    qr_url = begin["qr_url"]
+    if _render_qr(qr_url):
+        print(f"\n  Scan the QR code above, or open this URL directly:\n  {qr_url}")
+    else:
+        print(f"  Open this URL in Feishu / Lark on your phone:\n\n  {qr_url}\n")
+
+    print("  Waiting for you to scan and authorize...")
+    result = _poll_registration(
+        device_code=begin["device_code"],
+        interval=begin["interval"],
+        expire_in=min(begin["expire_in"], timeout_seconds),
+        domain=initial_domain,
+    )
+    if not result:
+        return None
+
+    print("  Bot created successfully! Probing connectivity...")
+    probe = probe_bot(result["app_id"], result["app_secret"], result["domain"])
+    if probe:
+        print(f"  Bot name: {probe.get('bot_name', 'unknown')}")
+    else:
+        print("  Warning: Could not verify bot connectivity.")
+
+    return {
+        **result,
+        **(probe or {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Feishu Platform Adapter
+# ---------------------------------------------------------------------------
+
+class FeishuAdapter(BasePlatformAdapter):
+    """Feishu/Lark platform adapter."""
+
+    def __init__(self, config: Any):
+        super().__init__(config, "feishu")
+        if not FEISHU_AVAILABLE:
+            raise ImportError(
+                "lark_oapi is required for Feishu support. "
+                "Install it with: uv add lark-oapi"
+            )
+
+        self.app_id: str = config.extra.get("app_id", "")
+        self.app_secret: str = config.extra.get("app_secret", "")
+        self.domain: str = config.extra.get("domain", "feishu")
+        self.encrypt_key: str = config.extra.get("encrypt_key", "")
+        self.verification_token: str = config.extra.get("verification_token", "")
+
+        if not self.app_id or not self.app_secret:
+            raise ValueError("Feishu adapter requires app_id and app_secret in config.extra")
+
+        self._client: Any = None
+        self._ws_client: Any = None
+        self._bot_open_id: Optional[str] = None
+        self._bot_name: str = ""
+        self._running = False
+        self._dedup: Dict[str, float] = {}
+
+        # Cache dir for media
+        self._cache_dir = Path.home() / ".ty_agent" / "cache" / "feishu"
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _build_client(self) -> Any:
+        sdk_domain = LARK_DOMAIN if self.domain == "lark" else FEISHU_DOMAIN
+        return (
+            lark.Client.builder()
+            .app_id(self.app_id)
+            .app_secret(self.app_secret)
+            .domain(sdk_domain)
+            .log_level(lark.LogLevel.WARNING)
+            .build()
+        )
+
+    # ---- WebSocket handlers ----
+
+    def _on_message(self, data: dict) -> None:
+        """Handle incoming WebSocket message event."""
+        header = data.get("header", {})
+        event_type = header.get("event_type", "")
+
+        if event_type != "im.message.receive_v1":
+            return
+
+        event_data = data.get("event", {})
+        message = event_data.get("message", {})
+        sender = event_data.get("sender", {}).get("sender_id", {})
+
+        message_id = message.get("message_id", "")
+        if self._is_duplicate(message_id):
+            return
+
+        msg_type = message.get("message_type", "")
+        content_str = message.get("content", "{}")
+        chat_id = message.get("chat_id", "")
+        chat_type = "group" if message.get("chat_type") == "group" else "private"
+        sender_id = sender.get("open_id", "")
+
+        try:
+            content = json.loads(content_str) if isinstance(content_str, str) else content_str
+        except json.JSONDecodeError:
+            content = {}
+
+        # Parse text content
+        text = ""
+        if msg_type == _MSG_TYPE_TEXT:
+            text = content.get("text", "")
+            # Remove @bot mentions
+            if self._bot_open_id:
+                text = re.sub(rf"<at user_id=\"{self._bot_open_id}\">.*?</at>", "", text).strip()
+        elif msg_type == _MSG_TYPE_IMAGE:
+            text = "[Image]"
+        elif msg_type == _MSG_TYPE_FILE:
+            text = "[File]"
+        elif msg_type == _MSG_TYPE_POST:
+            text = _extract_post_text(content)
+        else:
+            text = f"[{msg_type}]"
+
+        if not text:
+            return
+
+        # Skip messages sent by ourselves
+        if sender_id == self._bot_open_id:
+            return
+
+        event = MessageEvent(
+            text=text,
+            message_type=_map_msg_type(msg_type),
+            sender_id=sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            message_id=message_id,
+            raw_message=data,
+        )
+
+        # Handle media
+        if msg_type == _MSG_TYPE_IMAGE:
+            image_key = content.get("image_key", "")
+            if image_key:
+                path = self._download_image(image_key)
+                if path:
+                    event.media_urls.append(path)
+                    event.media_types.append("image")
+
+        asyncio.create_task(self._handle_message(event))
+
+    def _is_duplicate(self, message_id: str) -> bool:
+        """Check and record message ID for deduplication."""
+        now = time.time()
+        # Clean old entries
+        cutoff = now - _DEDUP_TTL_SECONDS
+        self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
+
+        if message_id in self._dedup:
+            return True
+        self._dedup[message_id] = now
+        return False
+
+    def _download_image(self, image_key: str) -> Optional[str]:
+        """Download an image from Feishu and save to cache."""
+        try:
+            req = GetMessageResourceRequest.builder().message_id(image_key).file_key(image_key).build()
+            resp = self._client.im.v1.message_resource.get(req)
+            if resp.code != 0:
+                logger.warning("Failed to download image %s: %s", image_key, resp.msg)
+                return None
+            filepath = self._cache_dir / f"img_{uuid.uuid4().hex[:12]}.png"
+            filepath.write_bytes(resp.raw.content)
+            return str(filepath)
+        except Exception as exc:
+            logger.warning("Error downloading image %s: %s", image_key, exc)
+            return None
+
+    # ---- Lifecycle ----
+
+    async def start(self) -> None:
+        self._client = self._build_client()
+
+        # Probe bot info
+        probe = probe_bot(self.app_id, self.app_secret, self.domain)
+        if probe:
+            self._bot_name = probe.get("bot_name", "")
+            self._bot_open_id = probe.get("bot_open_id", "")
+            logger.info("Feishu bot connected: %s", self._bot_name)
+        else:
+            logger.warning("Could not probe Feishu bot info")
+
+        # Build WS client
+        event_handler = lark.EventDispatcherHandler.builder(
+            verification_token=self.verification_token or None,
+            encrypt_key=self.encrypt_key or None,
+        ).register_p2_im_message_receive_v1(self._on_message).build()
+
+        self._ws_client = FeishuWSClient.builder() \
+            .app_id(self.app_id) \
+            .app_secret(self.app_secret) \
+            .event_handler(event_handler) \
+            .build()
+
+        self._running = True
+        logger.info("Starting Feishu WebSocket client...")
+        # Run WS client in a thread
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._ws_client.start)
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._ws_client:
+            try:
+                self._ws_client.stop()
+            except Exception:
+                pass
+        logger.info("Feishu adapter stopped")
+
+    # ---- Send methods ----
+
+    async def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        if not self._client:
+            return SendResult(success=False, error="Client not initialized")
+
+        content = json.dumps({"text": text}, ensure_ascii=False)
+
+        try:
+            if reply_to_message_id:
+                req = ReplyMessageRequest.builder() \
+                    .message_id(reply_to_message_id) \
+                    .body(ReplyMessageRequestBody.builder()
+                          .content(content)
+                          .msg_type("text")
+                          .build()) \
+                    .build()
+                resp = self._client.im.v1.message.reply(req)
+            else:
+                req = CreateMessageRequest.builder() \
+                    .receive_id_type("chat_id") \
+                    .receive_id(chat_id) \
+                    .body(CreateMessageRequestBody.builder()
+                          .content(content)
+                          .msg_type("text")
+                          .build()) \
+                    .build()
+                resp = self._client.im.v1.message.create(req)
+
+            if resp.code == 0:
+                data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
+                msg_id = data.get("data", {}).get("message_id", "")
+                return SendResult(success=True, message_id=msg_id)
+            else:
+                return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
+        except Exception as exc:
+            logger.exception("Failed to send Feishu message")
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    def build_session_key(self, event: MessageEvent) -> str:
+        # Group chats: platform:chat_id:sender_id
+        # Private chats: platform:chat_id
+        if event.chat_type == "group":
+            return f"feishu:{event.chat_id}:{event.sender_id}"
+        return f"feishu:{event.chat_id}"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _map_msg_type(msg_type: str) -> MessageType:
+    mapping = {
+        _MSG_TYPE_TEXT: MessageType.TEXT,
+        _MSG_TYPE_IMAGE: MessageType.PHOTO,
+        _MSG_TYPE_FILE: MessageType.DOCUMENT,
+    }
+    return mapping.get(msg_type, MessageType.TEXT)
+
+
+def _extract_post_text(content: dict) -> str:
+    """Extract plain text from a Feishu post message."""
+    texts = []
+    try:
+        post = content.get("post", {})
+        for locale in ("zh_cn", "en_us", "ja_jp"):
+            locale_content = post.get(locale, {})
+            for row in locale_content.get("content", []):
+                for elem in row:
+                    tag = elem.get("tag", "")
+                    if tag == "text":
+                        texts.append(elem.get("text", ""))
+                    elif tag == "a":
+                        texts.append(f"{elem.get('text', '')} ({elem.get('href', '')})")
+                    elif tag == "at":
+                        texts.append(f"@{elem.get('user_name', elem.get('user_id', ''))}")
+    except Exception:
+        pass
+    return "\n".join(texts) or "[Post]"
