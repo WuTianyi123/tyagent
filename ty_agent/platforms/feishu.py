@@ -417,7 +417,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # ---- WebSocket handlers ----
 
-    def _on_message(self, data: dict) -> None:
+    def _on_message(self, data: Any) -> None:
         """Handle incoming WebSocket message event.
 
         This callback runs in the WS client's background thread.
@@ -450,29 +450,38 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("Feishu message handler task failed: %s", exc)
 
-    def _parse_event(self, data: dict) -> Optional[MessageEvent]:
-        """Parse a Feishu event into a MessageEvent."""
-        header = data.get("header", {})
-        event_type = header.get("event_type", "")
+    def _parse_event(self, data: Any) -> Optional[MessageEvent]:
+        """Parse a Feishu event (dict or P2ImMessageReceiveV1 object) into a MessageEvent."""
+        # The lark_oapi SDK passes P2ImMessageReceiveV1 objects, not dicts.
+        # Use getattr for safe attribute access.
+        header = getattr(data, "header", None)
+        event_type = getattr(header, "event_type", "") if header else ""
 
         if event_type != "im.message.receive_v1":
             return None
 
-        event_data = data.get("event", {})
-        message = event_data.get("message", {})
-        sender = event_data.get("sender", {})
-        sender_id_info = sender.get("sender_id", {})
-        sender_type = sender.get("sender_type", "")
+        event_data = getattr(data, "event", None)
+        if event_data is None:
+            return None
 
-        message_id = message.get("message_id", "")
+        message = getattr(event_data, "message", None)
+        sender = getattr(event_data, "sender", None)
+        if message is None or sender is None:
+            return None
+
+        sender_id_info = getattr(sender, "sender_id", None) or {}
+        sender_type = getattr(sender, "sender_type", "")
+
+        message_id = getattr(message, "message_id", "") or ""
         if self._is_duplicate(message_id):
             return None
 
-        msg_type = message.get("message_type", "")
-        content_str = message.get("content", "{}")
-        chat_id = message.get("chat_id", "")
-        chat_type = "group" if message.get("chat_type") == "group" else "private"
-        sender_id = sender_id_info.get("open_id", "")
+        msg_type = getattr(message, "message_type", "")
+        content_str = getattr(message, "content", "{}") or "{}"
+        chat_id = getattr(message, "chat_id", "") or ""
+        chat_type_raw = getattr(message, "chat_type", "p2p")
+        chat_type = "group" if chat_type_raw == "group" else "private"
+        sender_id = getattr(sender_id_info, "open_id", "") or ""
 
         try:
             content = json.loads(content_str) if isinstance(content_str, str) else content_str
@@ -486,7 +495,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Parse text content
         text = ""
         if msg_type == _MSG_TYPE_TEXT:
-            text = content.get("text", "")
+            text = content.get("text", "") if isinstance(content, dict) else str(content)
             # Remove @bot mentions and normalize
             if self._bot_open_id:
                 text = re.sub(rf"<at user_id=\"{self._bot_open_id}\">.*?</at>", "", text).strip()
@@ -495,7 +504,7 @@ class FeishuAdapter(BasePlatformAdapter):
         elif msg_type == _MSG_TYPE_FILE:
             text = "[File]"
         elif msg_type == _MSG_TYPE_POST:
-            text = _extract_post_text(content)
+            text = _extract_post_text(content) if isinstance(content, dict) else "[Post]"
         else:
             text = f"[{msg_type}]"
 
@@ -522,12 +531,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Handle media
         if msg_type == _MSG_TYPE_IMAGE:
-            image_key = content.get("image_key", "")
+            image_key = content.get("image_key", "") if isinstance(content, dict) else ""
             if image_key:
                 event.media_urls = [image_key]
                 event.media_types = ["image"]
         elif msg_type == _MSG_TYPE_FILE:
-            file_key = content.get("file_key", "")
+            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
             if file_key:
                 event.media_urls = [file_key]
                 event.media_types = ["file"]
@@ -586,7 +595,12 @@ class FeishuAdapter(BasePlatformAdapter):
             self._bot_open_id = probe.get("bot_open_id", "")
             logger.info("Feishu bot connected: %s", self._bot_name)
         else:
-            logger.warning("Could not probe Feishu bot info")
+            # Fallback to configured bot_open_id if probe failed
+            self._bot_open_id = self.config.extra.get("bot_open_id") or None
+            logger.warning(
+                "Could not probe Feishu bot info. "
+                "Self-message filtering and @mention gating may be impaired."
+            )
 
         # Build WS client
         event_handler = lark.EventDispatcherHandler.builder(
