@@ -701,7 +701,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if reply_to_message_id:
                     req = ReplyMessageRequest.builder() \
                         .message_id(reply_to_message_id) \
-                        .body(ReplyMessageRequestBody.builder()
+                        .request_body(ReplyMessageRequestBody.builder()
                               .content(content)
                               .msg_type("text")
                               .build()) \
@@ -710,8 +710,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 else:
                     req = CreateMessageRequest.builder() \
                         .receive_id_type("chat_id") \
-                        .receive_id(chat_id) \
-                        .body(CreateMessageRequestBody.builder()
+                        .request_body(CreateMessageRequestBody.builder()
+                              .receive_id(chat_id)
                               .content(content)
                               .msg_type("text")
                               .build()) \

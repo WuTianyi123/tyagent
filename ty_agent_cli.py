@@ -30,6 +30,42 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gateway_install(args: argparse.Namespace) -> int:
+    """Install gateway as a systemd user service."""
+    from ty_agent.service_manager import install_service
+    return install_service(force=args.force)
+
+
+def cmd_gateway_uninstall(args: argparse.Namespace) -> int:
+    """Uninstall the gateway systemd service."""
+    from ty_agent.service_manager import uninstall_service
+    return uninstall_service()
+
+
+def cmd_gateway_start(args: argparse.Namespace) -> int:
+    """Start the gateway systemd service."""
+    from ty_agent.service_manager import start_service
+    return start_service()
+
+
+def cmd_gateway_stop(args: argparse.Namespace) -> int:
+    """Stop the gateway systemd service."""
+    from ty_agent.service_manager import stop_service
+    return stop_service()
+
+
+def cmd_gateway_restart(args: argparse.Namespace) -> int:
+    """Restart the gateway systemd service."""
+    from ty_agent.service_manager import restart_service
+    return restart_service()
+
+
+def cmd_gateway_status(args: argparse.Namespace) -> int:
+    """Show gateway service status."""
+    from ty_agent.service_manager import status_service
+    return status_service()
+
+
 def cmd_setup_feishu(args: argparse.Namespace) -> int:
     """Interactive setup for Feishu/Lark."""
     from ty_agent.platforms.feishu import qr_register
@@ -122,6 +158,38 @@ def cmd_set_model(args: argparse.Namespace) -> int:
 
     save_config(config, Path(args.config) if args.config else None)
     print(f"  Config saved to {config.home_dir / 'config.yaml'}")
+    return 0
+
+
+def cmd_test_llm(args: argparse.Namespace) -> int:
+    """Test LLM API connection directly (debug helper)."""
+    import asyncio
+    from ty_agent.config import load_config
+    from ty_agent.agent import TyAgent
+
+    config = load_config(Path(args.config) if args.config else None)
+    agent = TyAgent.from_config(config.agent)
+
+    messages = [{"role": "user", "content": args.message or "你好，请用一句话介绍自己"}]
+
+    print(f"Model:    {agent.model}")
+    print(f"Base URL: {agent.base_url}")
+    print(f"API Key:  {'*' * 10 if agent.api_key else '(none)'}")
+    print()
+    print(f"Sending: {messages[0]['content']!r}")
+    print("-" * 40)
+
+    async def _run() -> str:
+        try:
+            resp = await agent.chat(messages)
+            return resp
+        except Exception as e:
+            return f"ERROR: {type(e).__name__}: {e}"
+        finally:
+            await agent.close()
+
+    resp = asyncio.run(_run())
+    print(f"Response: {resp}")
     return 0
 
 
@@ -353,7 +421,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # gateway
-    gateway_parser = subparsers.add_parser("gateway", help="Start the messaging gateway")
+    gateway_parser = subparsers.add_parser("gateway", help="Gateway commands")
+    gateway_sub = gateway_parser.add_subparsers(dest="gateway_cmd", help="Gateway subcommands")
+    
+    # gateway run (default - foreground)
+    run_parser = gateway_sub.add_parser("run", help="Run gateway in foreground")
+    run_parser.set_defaults(func=cmd_gateway)
+    
+    # gateway install
+    install_parser = gateway_sub.add_parser("install", help="Install gateway as systemd user service")
+    install_parser.add_argument("--force", action="store_true", help="Force reinstall")
+    install_parser.set_defaults(func=cmd_gateway_install)
+    
+    # gateway uninstall
+    uninstall_parser = gateway_sub.add_parser("uninstall", help="Uninstall gateway systemd service")
+    uninstall_parser.set_defaults(func=cmd_gateway_uninstall)
+    
+    # gateway start
+    start_parser = gateway_sub.add_parser("start", help="Start gateway systemd service")
+    start_parser.set_defaults(func=cmd_gateway_start)
+    
+    # gateway stop
+    stop_parser = gateway_sub.add_parser("stop", help="Stop gateway systemd service")
+    stop_parser.set_defaults(func=cmd_gateway_stop)
+    
+    # gateway restart
+    restart_parser = gateway_sub.add_parser("restart", help="Restart gateway systemd service")
+    restart_parser.set_defaults(func=cmd_gateway_restart)
+    
+    # gateway status
+    status_parser = gateway_sub.add_parser("status", help="Show gateway service status")
+    status_parser.set_defaults(func=cmd_gateway_status)
+    
+    # For backward compatibility: "ty-agent gateway" without subcommand runs in foreground
     gateway_parser.set_defaults(func=cmd_gateway)
 
     # setup-feishu
@@ -383,6 +483,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # configure
     configure_parser = subparsers.add_parser("configure", help="Interactive configuration wizard")
     configure_parser.set_defaults(func=cmd_configure)
+
+    # test-llm
+    test_parser = subparsers.add_parser("test-llm", help="Test LLM API connection directly")
+    test_parser.add_argument("--message", "-m", help="Test message to send")
+    test_parser.set_defaults(func=cmd_test_llm)
 
     args = parser.parse_args(argv)
     if not args.command:

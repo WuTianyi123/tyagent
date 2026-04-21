@@ -16,6 +16,7 @@ from ty_agent.agent import AgentError, TyAgent
 from ty_agent.config import PlatformConfig, TyAgentConfig
 from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from ty_agent.session import SessionStore
+from ty_agent.tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,11 @@ class Gateway:
 
         session.add_message("user", user_message)
 
+        # Build tool definitions
+        tool_defs = registry.get_definitions()
+
         try:
-            response = await self.agent.chat(session.messages)
+            response = await self.agent.chat(session.messages, tools=tool_defs)
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
             response = "Sorry, I encountered an error processing your request."
