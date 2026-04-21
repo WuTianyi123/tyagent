@@ -99,10 +99,20 @@ class Gateway:
             self.session_store.reset(session_key)
             await adapter.send_message(
                 event.chat_id or "",
-                "Session reset. Starting fresh!",
+                "✨ Session reset! Starting fresh.",
                 reply_to_message_id=event.message_id,
             )
             return "Session reset"
+
+        # Handle /status command
+        if event.is_command() and event.get_command() == "status":
+            status_text = self._format_status(session_key)
+            await adapter.send_message(
+                event.chat_id or "",
+                status_text,
+                reply_to_message_id=event.message_id,
+            )
+            return "Status sent"
 
         # Build message for LLM
         user_message = event.text
@@ -144,6 +154,29 @@ class Gateway:
     def _find_adapter_for_event(self, event: MessageEvent) -> Optional[BasePlatformAdapter]:
         """Find the adapter that should handle this event by platform name."""
         return self.adapters.get(event.platform)
+
+    def _format_status(self, session_key: str) -> str:
+        """Format a status message for the /status command."""
+        from datetime import datetime
+
+        session = self.session_store.get(session_key)
+        connected = list(self.adapters.keys())
+
+        created = datetime.fromtimestamp(session.created_at).strftime("%Y-%m-%d %H:%M")
+        updated = datetime.fromtimestamp(session.updated_at).strftime("%Y-%m-%d %H:%M")
+
+        lines = [
+            "📊 **ty-agent Status**",
+            "",
+            f"**Session:** `{session_key}`",
+            f"**Messages:** {len(session.messages)}",
+            f"**Created:** {created}",
+            f"**Last Activity:** {updated}",
+            "",
+            f"**Model:** `{self.agent.model}`",
+            f"**Connected Platforms:** {', '.join(connected) if connected else 'None'}",
+        ]
+        return "\n".join(lines)
 
     async def start(self) -> None:
         """Start all adapters and run the gateway."""
