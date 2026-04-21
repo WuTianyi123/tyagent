@@ -327,6 +327,32 @@ def _qr_register_inner(
 
 
 # ---------------------------------------------------------------------------
+# WS client thread runner
+# ---------------------------------------------------------------------------
+
+def _run_ws_client(ws_client: Any, adapter: Any) -> None:
+    """Run the Lark WS client in its own thread-local event loop."""
+    import lark_oapi.ws.client as ws_client_module
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ws_client_module.loop = loop
+    adapter._ws_thread_loop = loop
+
+    try:
+        ws_client.start()
+    except Exception:
+        pass
+    finally:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
 # Feishu Platform Adapter
 # ---------------------------------------------------------------------------
 
@@ -553,25 +579,42 @@ class FeishuAdapter(BasePlatformAdapter):
             encrypt_key=self.encrypt_key or None,
         ).register_p2_im_message_receive_v1(self._on_message).build()
 
-        self._ws_client = FeishuWSClient.builder() \
-            .app_id(self.app_id) \
-            .app_secret(self.app_secret) \
-            .event_handler(event_handler) \
-            .build()
+        sdk_domain = LARK_DOMAIN if self.domain == "lark" else FEISHU_DOMAIN
+        self._ws_client = FeishuWSClient(
+            app_id=self.app_id,
+            app_secret=self.app_secret,
+            log_level=lark.LogLevel.WARNING,
+            event_handler=event_handler,
+            domain=sdk_domain,
+        )
 
         self._running = True
         logger.info("Starting Feishu WebSocket client...")
-        # Run WS client in a thread
+        # Run WS client in a dedicated thread with its own event loop
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._ws_client.start)
+        self._ws_future = loop.run_in_executor(
+            None, _run_ws_client, self._ws_client, self
+        )
 
     async def stop(self) -> None:
         self._running = False
         if self._ws_client:
             try:
-                self._ws_client.stop()
+                import lark_oapi.ws.client as ws_mod
+                if getattr(self, "_ws_thread_loop", None) and not self._ws_thread_loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._ws_client._disconnect(), self._ws_thread_loop
+                    )
+                    try:
+                        future.result(timeout=5)
+                    except Exception:
+                        pass
+                    # Stop the event loop to unblock start()
+                    self._ws_thread_loop.call_soon_threadsafe(self._ws_thread_loop.stop)
             except Exception:
                 pass
+        if self._ws_future and not self._ws_future.done():
+            self._ws_future.cancel()
         logger.info("Feishu adapter stopped")
 
     # ---- Send methods ----
