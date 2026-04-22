@@ -54,31 +54,6 @@ class PlatformConfig:
 
 
 @dataclass
-class WebConfig:
-    """Configuration for web search/extraction backends."""
-
-    backend: str = "firecrawl"  # firecrawl, tavily, exa
-    api_key: Optional[str] = None
-    api_url: Optional[str] = None  # for self-hosted Firecrawl
-
-    def to_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {"backend": self.backend}
-        if self.api_key:
-            result["api_key"] = self.api_key
-        if self.api_url:
-            result["api_url"] = self.api_url
-        return result
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> WebConfig:
-        return cls(
-            backend=data.get("backend", "firecrawl"),
-            api_key=data.get("api_key"),
-            api_url=data.get("api_url"),
-        )
-
-
-@dataclass
 class AgentConfig:
     """Configuration for the AI agent."""
 
@@ -114,7 +89,6 @@ class TyAgentConfig:
 
     platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     agent: AgentConfig = field(default_factory=AgentConfig)
-    web: WebConfig = field(default_factory=WebConfig)
     home_dir: Path = field(default_factory=lambda: default_home)
     workspace_dir: Path = field(default_factory=lambda: default_workspace)
     sessions_dir: Path = field(default_factory=lambda: default_home / "sessions")
@@ -142,7 +116,6 @@ class TyAgentConfig:
         return {
             "platforms": {k: v.to_dict() for k, v in self.platforms.items()},
             "agent": self.agent.to_dict(),
-            "web": self.web.to_dict(),
             "home_dir": str(self.home_dir),
             "workspace_dir": str(self.workspace_dir),
             "sessions_dir": str(self.sessions_dir),
@@ -160,7 +133,6 @@ class TyAgentConfig:
         return cls(
             platforms=platforms,
             agent=AgentConfig.from_dict(data.get("agent", {})),
-            web=WebConfig.from_dict(data.get("web", {})),
             home_dir=home,
             workspace_dir=workspace,
             sessions_dir=Path(data.get("sessions_dir", str(home / "sessions"))),
