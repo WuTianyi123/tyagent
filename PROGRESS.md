@@ -1,6 +1,6 @@
 # ty-agent 开发进展追踪
 
-> 记录：2026-04-22
+> 记录：2026-04-22 → 2026-04-23
 > 下次会话开始时先读此文件了解当前状态
 
 ---
@@ -30,11 +30,17 @@
 - 入站媒体下载：支持 image/file/audio/media，自动推断扩展名
 - 出站媒体发送：send_photo / send_document 通过 Feishu 上传 API 实现
 
+### 稳定性改进（2026-04-23）
+- Session 自动裁剪：启动时清理一次，之后每 24 小时定期清理 90 天以上的旧 session
+- Tool dispatch 异步化：`registry.dispatch()` 通过 `run_in_executor` 在线程池执行，不再阻塞 event loop
+- Agent 添加 `import asyncio`（之前缺失，tool calling loop 中需要）
+- 修复 agent-browser Chromium 版本不匹配（v1217）
+
 ---
 
 ## 已核实问题状态
 
-### 已修复（11个）
+### 已修复（13个）
 
 1. WebSocket 回调线程安全 — 使用 run_coroutine_threadsafe，不是 create_task
 2. 图片下载 API 参数 — message_id 和 file_key 分开传
@@ -47,6 +53,8 @@
 9. Post 消息媒体标签 — 支持 img/media/file/audio/video 标签解析
 10. send_photo — 上传图片到 Feishu 后发送 image 类型消息
 11. send_document — 上传文件到 Feishu 后发送 file 类型消息
+12. Agent `import asyncio` 缺失 — tool calling loop 中 `asyncio.get_running_loop()` 需要
+13. agent-browser Chromium 版本不匹配 — 安装 v1217 匹配 agent-browser 0.13.0
 
 ### 仍存在（0个）
 
@@ -54,19 +62,28 @@
 
 ---
 
-## 近期计划
+## 测试状态
 
-1. ~~媒体下载支持多类型和正确扩展名~~ ✅
-2. ~~完善 Post 消息解析（media/file/audio/video 标签）~~ ✅
-3. ~~实现 Feishu 图片/文件上传（send_photo/send_document 覆盖）~~ ✅
-4. 持续测试和稳定性改进
-5. 考虑添加更多平台适配器（Telegram、Discord 等）
+**151 tests passed**
+
+| 测试文件 | 数量 | 覆盖范围 |
+|----------|------|----------|
+| test_browser_tools.py | 24 | 注册、CLI 发现、snapshot 解析、命令执行、handler、集成 |
+| test_feishu_media.py | 8 | 媒体扩展名推断 |
+| test_feishu_message_building.py | 13 | Markdown→飞书 post 构建 |
+| test_config.py | 54 | PlatformConfig、AgentConfig、TyAgentConfig、load/save |
+| test_session.py | 26 | Session CRUD、持久化、sanitize、prune |
+| test_agent.py | 14 | 初始化、chat 基本流程、tool loop、错误处理、max turns |
+| test_gateway.py | 12 | 消息路由、reset/status 命令、media 附件、错误降级 |
 
 ---
 
-## 测试状态
+## 近期计划
 
-37 tests passed — 24 browser + 13 feishu
+1. 消息处理超时保护 — LLM 长时间无响应时给用户反馈
+2. WebSocket 断连日志降级 — SDK 重连日志从 ERROR 改为 WARNING
+3. 持续测试和稳定性改进
+4. 考虑添加更多平台适配器（Telegram、Discord 等）
 
 ---
 
@@ -74,5 +91,5 @@
 
 - Python 3.11 + uv
 - lark-oapi（飞书 SDK）
-- agent-browser CLI（Playwright，已安装在 Hermes env）
+- agent-browser CLI（Playwright，v1217 chromium）
 - systemd user service

@@ -6,6 +6,7 @@ Supports OpenAI-compatible APIs, model routing, and function calling (tools).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -162,10 +163,12 @@ class TyAgent:
                     })
                     continue
 
-                # Dispatch
-                emoji = registry.get_emoji(func_name, default="⚡")
-                logger.info("  %s %s(%s)", emoji, func_name, ", ".join(f"{k}={v!r}" for k, v in list(func_args.items())[:3]))
-                result = registry.dispatch(func_name, func_args)
+                # Dispatch — run in executor to avoid blocking the event loop
+                logger.info("  ⚡ %s(%s)", func_name, ", ".join(f"{k}={v!r}" for k, v in list(func_args.items())[:3]))
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, registry.dispatch, func_name, func_args
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
