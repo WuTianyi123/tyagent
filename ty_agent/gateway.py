@@ -98,13 +98,13 @@ class Gateway:
         # Handle reset commands (normalize triggers to strip leading /)
         normalized_triggers = {t.lstrip("/").lower() for t in self.config.reset_triggers}
         if event.is_command() and event.get_command() in normalized_triggers:
-            self.session_store.reset(session_key)
+            self.session_store.archive(session_key)
             await adapter.send_message(
                 event.chat_id or "",
-                "✅ 已重置会话，历史记录已清除。",
+                "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
                 reply_to=event.reply_to_text,
             )
-            return "Session reset"
+            return "Session archived"
 
         # Handle /status command
         if event.is_command() and event.get_command() == "status":
@@ -190,18 +190,8 @@ class Gateway:
         self._running = True
         logger.info("Starting ty-agent gateway with %d adapter(s)", len(self.adapters))
 
-        # Prune old sessions on startup
-        pruned = self.session_store.prune_old_sessions()
-        if pruned:
-            logger.info("Pruned %d old sessions on startup", pruned)
-
-        # Start periodic session pruning (every 24 hours)
-        prune_task = asyncio.create_task(
-            self._periodic_prune(), name="session-prune"
-        )
-
         # Start all adapters
-        tasks = [prune_task]
+        tasks = []
         for name, adapter in self.adapters.items():
             task = asyncio.create_task(
                 self._run_adapter_with_retry(name, adapter),
@@ -227,19 +217,6 @@ class Gateway:
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.agent.close()
         logger.info("Gateway stopped")
-
-    async def _periodic_prune(self, interval_hours: int = 24, max_age_days: int = 90) -> None:
-        """Periodically prune old sessions to prevent unbounded growth."""
-        while self._running:
-            await asyncio.sleep(interval_hours * 3600)
-            if not self._running:
-                break
-            try:
-                pruned = self.session_store.prune_old_sessions(max_age_days=max_age_days)
-                if pruned:
-                    logger.info("Periodic prune removed %d old sessions", pruned)
-            except Exception as exc:
-                logger.warning("Session prune failed: %s", exc)
 
     async def _run_adapter_with_retry(self, name: str, adapter: BasePlatformAdapter) -> None:
         """Run a single adapter with exponential backoff retry."""

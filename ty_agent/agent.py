@@ -58,6 +58,11 @@ class TyAgent:
         The *messages* list is mutated in-place so that tool calls and
         results are preserved in the caller's session history.
 
+        If the message list is too long for the context window, it is
+        automatically compressed before sending to the API. The original
+        *messages* list is NOT truncated — compression creates a temporary
+        copy.
+
         Args:
             messages: List of message dicts with 'role' and 'content' keys.
                 Mutated in-place with assistant/tool messages.
@@ -69,6 +74,7 @@ class TyAgent:
         """
         # Lazy import to avoid circular dependency
         from ty_agent.tools.registry import registry
+        from ty_agent.context import should_compress, compress_messages
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -80,9 +86,11 @@ class TyAgent:
         if not messages or messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": self.system_prompt})
 
-        payload_base = {
+        # Build the message list to send (may be compressed)
+        api_messages = compress_messages(messages) if should_compress(messages) else messages
+
+        payload_base: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
             "max_tokens": 4096,
             "temperature": 0.7,
         }
@@ -96,6 +104,11 @@ class TyAgent:
             if tool_turn >= self.max_tool_turns:
                 logger.warning("Max tool turns (%d) reached, returning last content", self.max_tool_turns)
                 break
+
+            # Refresh compressed view each turn (messages may have grown)
+            if tool_turn > 0 and should_compress(messages):
+                api_messages = compress_messages(messages)
+            payload_base["messages"] = api_messages
 
             try:
                 resp = await self._client.post(

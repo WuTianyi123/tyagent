@@ -31,10 +31,19 @@
 - 出站媒体发送：send_photo / send_document 通过 Feishu 上传 API 实现
 
 ### 稳定性改进（2026-04-23）
-- Session 自动裁剪：启动时清理一次，之后每 24 小时定期清理 90 天以上的旧 session
 - Tool dispatch 异步化：`registry.dispatch()` 通过 `run_in_executor` 在线程池执行，不再阻塞 event loop
 - Agent 添加 `import asyncio`（之前缺失，tool calling loop 中需要）
 - 修复 agent-browser Chromium 版本不匹配（v1217）
+
+### 上下文管理（2026-04-23 晚）
+- **移除了自动裁剪**：不再在启动/定期删除旧 session 文件
+- **新增 `ty_agent/context.py`**：上下文压缩模块
+  - `estimate_tokens()`：字符数 / 3.5 粗估 token 数
+  - `should_compress()`：检查是否超出预算（默认 100k 字符 / 28k token）
+  - `compress_messages()`：头保护 + 中间摘要 + 尾保护，返回临时副本不动原始数据
+  - `_summarize_middle()`：将中间消息压缩为结构化文本摘要（话题 + 关键事实 + 工具操作）
+- **agent.chat() 集成**：发送 API 前自动检查并压缩；tool loop 每轮刷新压缩视图
+- **`/new` 命令改为归档**：旧 session 文件重命名为 `<key>__archived_<timestamp>.json` 保留，新建空 session
 
 ---
 
@@ -64,7 +73,7 @@
 
 ## 测试状态
 
-**151 tests passed**
+**169 tests passed**
 
 | 测试文件 | 数量 | 覆盖范围 |
 |----------|------|----------|
@@ -72,9 +81,10 @@
 | test_feishu_media.py | 8 | 媒体扩展名推断 |
 | test_feishu_message_building.py | 13 | Markdown→飞书 post 构建 |
 | test_config.py | 54 | PlatformConfig、AgentConfig、TyAgentConfig、load/save |
-| test_session.py | 26 | Session CRUD、持久化、sanitize、prune |
+| test_session.py | 26 | Session CRUD、持久化、sanitize、archive |
 | test_agent.py | 14 | 初始化、chat 基本流程、tool loop、错误处理、max turns |
-| test_gateway.py | 12 | 消息路由、reset/status 命令、media 附件、错误降级 |
+| test_gateway.py | 12 | 消息路由、reset/status 命令、archive、media 附件、错误降级 |
+| test_context.py | 18 | token 估算、压缩触发、压缩结构、摘要生成、原始数据保护 |
 
 ---
 

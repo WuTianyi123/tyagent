@@ -83,9 +83,36 @@ class SessionStore:
         return self._sessions[session_key]
 
     def reset(self, session_key: str) -> None:
+        """Clear messages in the session but keep the session object."""
         if session_key in self._sessions:
             self._sessions[session_key].clear()
             self._save(session_key)
+
+    def archive(self, session_key: str) -> None:
+        """Archive a session: rename the file with a timestamp suffix,
+        remove from active sessions. The next get() for this key will
+        create a fresh session. The archived file is preserved on disk.
+
+        This is the preferred alternative to reset() — it keeps the
+        conversation history for future reference instead of clearing it.
+        """
+        session = self._sessions.pop(session_key, None)
+        if session is None or not self._sessions_dir:
+            return
+
+        # Rename the file with timestamp suffix
+        filename = _sanitize_session_key(session_key) + ".json"
+        old_path = self._sessions_dir / filename
+        if old_path.exists():
+            import time
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(session.updated_at))
+            archive_name = f"{_sanitize_session_key(session_key)}__archived_{ts}.json"
+            archive_path = self._sessions_dir / archive_name
+            try:
+                old_path.rename(archive_path)
+                logger.info("Archived session %s → %s", session_key, archive_name)
+            except OSError as exc:
+                logger.warning("Failed to archive session %s: %s", session_key, exc)
 
     def delete(self, session_key: str) -> None:
         self._sessions.pop(session_key, None)

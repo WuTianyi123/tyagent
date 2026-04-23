@@ -126,7 +126,7 @@ class TestOnMessage:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_reset_command(self, tmp_path):
+    async def test_reset_command_archives(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config, agent=MagicMock())
 
@@ -136,14 +136,19 @@ class TestOnMessage:
         # Add some history first
         session = gw.session_store.get("feishu:chat1")
         session.add_message("user", "old message")
+        gw.session_store.save("feishu:chat1")
 
         event = _make_event(text="/new", is_cmd=True, cmd_name="new")
         result = await gw._on_message(event)
 
-        assert result == "Session reset"
-        # Session should be cleared
+        assert result == "Session archived"
+        # Old session should be removed from active store
+        # get() creates a new one with empty messages
         session = gw.session_store.get("feishu:chat1")
         assert len(session.messages) == 0
+        # Archived file should exist on disk
+        archive_files = list((tmp_path / "sessions").glob("*__archived_*.json"))
+        assert len(archive_files) == 1
 
     @pytest.mark.asyncio
     async def test_status_command(self, tmp_path):
