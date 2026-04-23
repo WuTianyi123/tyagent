@@ -3,7 +3,8 @@
 Supports:
 - WebSocket long connection
 - Direct-message and group @mention-gated text receive/send
-- Inbound image caching
+- Inbound image/file/audio/video caching with correct extensions
+- Outbound image/file upload (send_photo, send_document)
 - QR scan-to-create onboarding
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -43,10 +45,43 @@ _ONBOARD_REQUEST_TIMEOUT_S = 10
 _MSG_TYPE_TEXT = "text"
 _MSG_TYPE_IMAGE = "image"
 _MSG_TYPE_FILE = "file"
+_MSG_TYPE_AUDIO = "audio"
+_MSG_TYPE_MEDIA = "media"
 _MSG_TYPE_POST = "post"
 
 # Dedup TTL
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
+
+# Content-Type to extension mapping (supplements mimetypes)
+_CT_EXT_OVERRIDES = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/aac": ".aac",
+    "audio/m4a": ".m4a",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/ogg": ".ogv",
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/zip": ".zip",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/html": ".html",
+}
 
 # ---------------------------------------------------------------------------
 # Markdown rendering helpers (inspired by hermes-agent)
@@ -167,8 +202,14 @@ def _build_outbound_payload(text: str) -> tuple[str, str]:
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
+        CreateFileRequest,
+        CreateFileRequestBody,
+        CreateImageRequest,
+        CreateImageRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
+        GetFileRequest,
+        GetImageRequest,
         GetMessageResourceRequest,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
@@ -485,6 +526,49 @@ def _run_ws_client(ws_client: Any, adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Media helpers
+# ---------------------------------------------------------------------------
+
+def _guess_extension_from_content_type(content_type: Optional[str]) -> str:
+    """Guess file extension from Content-Type header."""
+    if not content_type:
+        return ""
+    # Clean up content type (remove charset, etc.)
+    ct = content_type.split(";")[0].strip().lower()
+    # Check overrides first
+    if ct in _CT_EXT_OVERRIDES:
+        return _CT_EXT_OVERRIDES[ct]
+    # Fall back to mimetypes
+    ext = mimetypes.guess_extension(ct)
+    return ext or ""
+
+
+def _guess_extension_from_filename(filename: Optional[str]) -> str:
+    """Guess extension from filename."""
+    if not filename:
+        return ""
+    _, ext = os.path.splitext(filename)
+    return ext.lower()
+
+
+def _resolve_extension(
+    content_type: Optional[str] = None,
+    filename: Optional[str] = None,
+    default: str = ".bin",
+) -> str:
+    """Resolve the best file extension from Content-Type and/or filename."""
+    # Prefer filename extension if available
+    from_filename = _guess_extension_from_filename(filename)
+    if from_filename:
+        return from_filename
+    # Fall back to Content-Type
+    from_ct = _guess_extension_from_content_type(content_type)
+    if from_ct:
+        return from_ct
+    return default
+
+
+# ---------------------------------------------------------------------------
 # Feishu Platform Adapter
 # ---------------------------------------------------------------------------
 
@@ -702,6 +786,10 @@ class FeishuAdapter(BasePlatformAdapter):
             text = "[Image]"
         elif msg_type == _MSG_TYPE_FILE:
             text = "[File]"
+        elif msg_type == _MSG_TYPE_AUDIO:
+            text = "[Audio]"
+        elif msg_type == _MSG_TYPE_MEDIA:
+            text = "[Media]"
         elif msg_type == _MSG_TYPE_POST:
             text = _extract_post_text(content) if isinstance(content, dict) else "[Post]"
         else:
@@ -739,48 +827,103 @@ class FeishuAdapter(BasePlatformAdapter):
             if file_key:
                 event.media_urls = [file_key]
                 event.media_types = ["file"]
+        elif msg_type == _MSG_TYPE_AUDIO:
+            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
+            if file_key:
+                event.media_urls = [file_key]
+                event.media_types = ["audio"]
+        elif msg_type == _MSG_TYPE_MEDIA:
+            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
+            if file_key:
+                event.media_urls = [file_key]
+                event.media_types = ["media"]
 
         return event
 
-    def _is_duplicate(self, message_id: str) -> bool:
-        """Check and record message ID for deduplication (persisted to disk)."""
-        now = time.time()
-        cutoff = now - _DEDUP_TTL_SECONDS
+    # ---- Media download ----
 
-        with self._dedup_lock:
-            # Prune expired entries
-            self._dedup = {k: v for k, v in self._dedup.items() if v > cutoff}
+    async def _download_media(
+        self,
+        message_id: str,
+        file_key: str,
+        media_type: str,
+    ) -> Optional[str]:
+        """Download media (image/file/audio/media) from Feishu with correct extension.
 
-            if message_id in self._dedup:
-                return True
-            self._dedup[message_id] = now
-            self._save_dedup()
-            return False
-
-    async def _download_image(self, message_id: str, image_key: str) -> Optional[str]:
-        """Download an image from Feishu and save to cache (async-safe)."""
+        Uses the appropriate API based on media_type:
+        - image: GetMessageResourceRequest (or GetImageRequest)
+        - file: GetMessageResourceRequest (or GetFileRequest)
+        - audio/media: GetMessageResourceRequest
+        """
         if not self._client:
             return None
         loop = asyncio.get_running_loop()
 
         def _sync_download() -> Optional[str]:
             try:
-                req = GetMessageResourceRequest.builder() \
-                    .message_id(message_id) \
-                    .file_key(image_key) \
-                    .build()
-                resp = self._client.im.v1.message_resource.get(req)
+                if media_type == "image":
+                    # Try GetImageRequest first (dedicated image API)
+                    req = GetImageRequest.builder().image_key(file_key).build()
+                    resp = self._client.im.v1.image.get(req)
+                elif media_type == "file":
+                    # Try GetFileRequest first (dedicated file API)
+                    req = GetFileRequest.builder().file_key(file_key).build()
+                    resp = self._client.im.v1.file.get(req)
+                else:
+                    # Fallback to GetMessageResourceRequest for audio/media
+                    req = GetMessageResourceRequest.builder() \
+                        .message_id(message_id) \
+                        .file_key(file_key) \
+                        .build()
+                    resp = self._client.im.v1.message_resource.get(req)
+
                 if resp.code != 0:
-                    logger.warning("Failed to download image %s: %s", image_key, resp.msg)
+                    logger.warning("Failed to download %s %s: %s", media_type, file_key, resp.msg)
                     return None
-                filepath = self._cache_dir / f"img_{uuid.uuid4().hex[:12]}.png"
-                filepath.write_bytes(resp.raw.content)
+
+                # Determine extension from Content-Type and/or filename
+                content_type = None
+                filename = None
+                if resp.raw and resp.raw.headers:
+                    content_type = resp.raw.headers.get("Content-Type")
+                if hasattr(resp, "file_name") and resp.file_name:
+                    filename = resp.file_name
+
+                ext = _resolve_extension(content_type, filename)
+                if not ext:
+                    # Fallback based on media type
+                    ext = {
+                        "image": ".png",
+                        "file": ".bin",
+                        "audio": ".mp3",
+                        "media": ".mp4",
+                    }.get(media_type, ".bin")
+
+                prefix = media_type[:3]  # img, fil, aud, med
+                filepath = self._cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
+
+                # Read content from response
+                if hasattr(resp, "file") and resp.file:
+                    filepath.write_bytes(resp.file.read())
+                elif resp.raw and resp.raw.content:
+                    filepath.write_bytes(resp.raw.content)
+                else:
+                    logger.warning("No content in %s download response", media_type)
+                    return None
+
+                logger.info("Downloaded %s to %s (Content-Type: %s, filename: %s)",
+                            media_type, filepath, content_type, filename)
                 return str(filepath)
             except Exception as exc:
-                logger.warning("Error downloading image %s: %s", image_key, exc)
+                logger.warning("Error downloading %s %s: %s", media_type, file_key, exc)
                 return None
 
         return await loop.run_in_executor(None, _sync_download)
+
+    # Backward-compatible alias
+    async def _download_image(self, message_id: str, image_key: str) -> Optional[str]:
+        """Download an image (backward-compatible alias)."""
+        return await self._download_media(message_id, image_key, "image")
 
     # ---- Lifecycle ----
 
@@ -889,6 +1032,163 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return result
 
+    async def send_photo(
+        self,
+        chat_id: str,
+        photo_path: str,
+        *,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a photo by uploading it to Feishu first, then sending as image message."""
+        if not self._client:
+            return SendResult(success=False, error="Client not initialized")
+
+        # Upload image to Feishu
+        image_key = await self._upload_image(photo_path)
+        if not image_key:
+            # Fallback to text with path
+            text = f"[Photo: {photo_path}]"
+            if caption:
+                text = f"{caption}\n{text}"
+            return await self.send_message(chat_id, text, **kwargs)
+
+        # Build image message payload
+        payload = json.dumps({"image_key": image_key}, ensure_ascii=False)
+        return await self._sync_send(chat_id, "image", payload, kwargs.get("reply_to_message_id"))
+
+    async def send_document(
+        self,
+        chat_id: str,
+        document_path: str,
+        *,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a document by uploading it to Feishu first, then sending as file message."""
+        if not self._client:
+            return SendResult(success=False, error="Client not initialized")
+
+        # Upload file to Feishu
+        file_key = await self._upload_file(document_path)
+        if not file_key:
+            # Fallback to text with path
+            text = f"[Document: {document_path}]"
+            if caption:
+                text = f"{caption}\n{text}"
+            return await self.send_message(chat_id, text, **kwargs)
+
+        # Build file message payload
+        filename = os.path.basename(document_path)
+        payload = json.dumps({
+            "file_key": file_key,
+            "file_name": filename,
+        }, ensure_ascii=False)
+        return await self._sync_send(chat_id, "file", payload, kwargs.get("reply_to_message_id"))
+
+    async def _upload_image(self, image_path: str) -> Optional[str]:
+        """Upload an image to Feishu and return the image_key."""
+        path = Path(image_path)
+        if not path.exists():
+            logger.warning("Image file not found: %s", image_path)
+            return None
+
+        loop = asyncio.get_running_loop()
+
+        def _do_upload() -> Optional[str]:
+            try:
+                image_bytes = path.read_bytes()
+                # Guess image type from extension
+                ext = path.suffix.lower()
+                image_type = {
+                    ".png": "png",
+                    ".jpg": "jpeg",
+                    ".jpeg": "jpeg",
+                    ".gif": "gif",
+                    ".bmp": "bmp",
+                    ".webp": "webp",
+                }.get(ext, "png")
+
+                req = (
+                    CreateImageRequest.builder()
+                    .request_body(
+                        CreateImageRequestBody.builder()
+                        .image(image_bytes)
+                        .image_type(image_type)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.image.create(req)
+                if resp.code == 0 and resp.data and resp.data.image_key:
+                    logger.info("Uploaded image %s -> key %s", image_path, resp.data.image_key)
+                    return resp.data.image_key
+                else:
+                    logger.warning("Failed to upload image %s: %s", image_path, resp.msg)
+                    return None
+            except Exception as exc:
+                logger.warning("Error uploading image %s: %s", image_path, exc)
+                return None
+
+        return await loop.run_in_executor(None, _do_upload)
+
+    async def _upload_file(self, file_path: str) -> Optional[str]:
+        """Upload a file to Feishu and return the file_key."""
+        path = Path(file_path)
+        if not path.exists():
+            logger.warning("File not found: %s", file_path)
+            return None
+
+        loop = asyncio.get_running_loop()
+
+        def _do_upload() -> Optional[str]:
+            try:
+                file_bytes = path.read_bytes()
+                filename = path.name
+                ext = path.suffix.lower()
+                # Map extension to Feishu file_type
+                file_type = {
+                    ".pdf": "pdf",
+                    ".doc": "doc",
+                    ".docx": "docx",
+                    ".xls": "xls",
+                    ".xlsx": "xlsx",
+                    ".ppt": "ppt",
+                    ".pptx": "pptx",
+                    ".txt": "txt",
+                    ".md": "txt",  # markdown as text
+                    ".csv": "csv",
+                    ".zip": "zip",
+                    ".mp4": "mp4",
+                    ".mov": "mov",
+                    ".mp3": "mp3",
+                    ".wav": "wav",
+                }.get(ext, "stream")
+
+                req = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file(file_bytes)
+                        .file_name(filename)
+                        .file_type(file_type)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.file.create(req)
+                if resp.code == 0 and resp.data and resp.data.file_key:
+                    logger.info("Uploaded file %s -> key %s", file_path, resp.data.file_key)
+                    return resp.data.file_key
+                else:
+                    logger.warning("Failed to upload file %s: %s", file_path, resp.msg)
+                    return None
+            except Exception as exc:
+                logger.warning("Error uploading file %s: %s", file_path, exc)
+                return None
+
+        return await loop.run_in_executor(None, _do_upload)
+
     async def _sync_send(
         self, chat_id: str, msg_type: str, payload: str, reply_to_message_id: Optional[str]
     ) -> SendResult:
@@ -954,6 +1254,8 @@ def _map_msg_type(msg_type: str) -> MessageType:
         _MSG_TYPE_TEXT: MessageType.TEXT,
         _MSG_TYPE_IMAGE: MessageType.PHOTO,
         _MSG_TYPE_FILE: MessageType.DOCUMENT,
+        _MSG_TYPE_AUDIO: MessageType.AUDIO,
+        _MSG_TYPE_MEDIA: MessageType.VIDEO,
     }
     return mapping.get(msg_type, MessageType.TEXT)
 
@@ -963,6 +1265,7 @@ def _extract_post_text(content: dict) -> str:
 
     Handles text elements with style attributes (bold, italic, underline,
     strikethrough, code) and converts them to markdown syntax.
+    Also handles media tags: img, media, file, audio, video.
     """
     texts = []
     try:
@@ -985,6 +1288,14 @@ def _extract_post_text(content: dict) -> str:
                         row_parts.append(f"@{name}")
                     elif tag == "img":
                         row_parts.append("[Image]")
+                    elif tag == "media":
+                        row_parts.append("[Media]")
+                    elif tag == "file":
+                        row_parts.append("[File]")
+                    elif tag == "audio":
+                        row_parts.append("[Audio]")
+                    elif tag == "video":
+                        row_parts.append("[Video]")
                     elif tag == "code":
                         code = elem.get("text", "")
                         row_parts.append(_wrap_inline_code(code) if code else "")

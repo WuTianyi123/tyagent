@@ -109,13 +109,18 @@ def test_fence_boundary_nested_4_in_6():
 
 
 def test_extract_post_text_basic():
-    """Extract text from Feishu post JSON."""
+    """Extract text from Feishu post JSON with all supported tags."""
     post_json = {
         "post": {
             "zh_cn": {
                 "content": [
                     [{"tag": "text", "text": "Hello "}],
                     [{"tag": "text", "text": "world"}],
+                    [{"tag": "img", "image_key": "img_123"}],
+                    [{"tag": "media", "file_key": "media_123"}],
+                    [{"tag": "file", "file_key": "file_123"}],
+                    [{"tag": "audio", "file_key": "audio_123"}],
+                    [{"tag": "video", "file_key": "video_123"}],
                 ]
             }
         }
@@ -123,6 +128,11 @@ def test_extract_post_text_basic():
     result = _extract_post_text(post_json)
     assert "Hello" in result
     assert "world" in result
+    assert "[Image]" in result
+    assert "[Media]" in result
+    assert "[File]" in result
+    assert "[Audio]" in result
+    assert "[Video]" in result
 
 
 def test_markdown_hint_re_patterns():
