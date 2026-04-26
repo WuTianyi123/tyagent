@@ -1,4 +1,4 @@
-"""Core tool implementations for ty-agent.
+"""Core tool implementations for tyagent.
 
 read_file  — Read text files with line numbers and pagination.
 write_file — Write content to a file, creating parent directories.
@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ty_agent.tools.registry import registry, tool_error, tool_result
+from tyagent.tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 

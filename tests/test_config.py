@@ -1,4 +1,4 @@
-"""Comprehensive unit tests for ty_agent.config."""
+"""Comprehensive unit tests for tyagent.config."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ty_agent.config import (
+from tyagent.config import (
     AgentConfig,
     PlatformConfig,
     TyAgentConfig,
@@ -136,7 +136,9 @@ class TestAgentConfigToDict:
             "api_key": None,
             "base_url": None,
             "max_turns": 50,
+            "max_tool_turns": 30,
             "system_prompt": "You are a helpful assistant.",
+            "context_max_chars": 280_000,
         }
 
     def test_custom_to_dict(self):
@@ -465,7 +467,7 @@ class TestLoadConfig:
 
     def test_load_no_path_no_default_files(self, tmp_path, monkeypatch):
         """When no config_path given and no default files exist, return defaults."""
-        monkeypatch.setattr("ty_agent.config.default_home", tmp_path)
+        monkeypatch.setattr("tyagent.config.default_home", tmp_path)
         cfg = load_config()
         assert isinstance(cfg, TyAgentConfig)
         assert cfg.agent == AgentConfig()
@@ -473,7 +475,7 @@ class TestLoadConfig:
 
     def test_load_defaults_from_yaml_in_home(self, tmp_path, monkeypatch):
         """When no config_path given, should find config.yaml in default_home."""
-        monkeypatch.setattr("ty_agent.config.default_home", tmp_path)
+        monkeypatch.setattr("tyagent.config.default_home", tmp_path)
         config_data = {"log_level": "CUSTOM"}
         (tmp_path / "config.yaml").write_text(
             yaml.dump(config_data), encoding="utf-8"
@@ -483,7 +485,7 @@ class TestLoadConfig:
 
     def test_load_defaults_from_json_in_home(self, tmp_path, monkeypatch):
         """When no config_path given, should find config.json in default_home."""
-        monkeypatch.setattr("ty_agent.config.default_home", tmp_path)
+        monkeypatch.setattr("tyagent.config.default_home", tmp_path)
         config_data = {"log_level": "CUSTOM_JSON"}
         (tmp_path / "config.json").write_text(
             json.dumps(config_data), encoding="utf-8"
@@ -493,7 +495,7 @@ class TestLoadConfig:
 
     def test_yaml_takes_priority_over_json(self, tmp_path, monkeypatch):
         """When both config.yaml and config.json exist, yaml should win."""
-        monkeypatch.setattr("ty_agent.config.default_home", tmp_path)
+        monkeypatch.setattr("tyagent.config.default_home", tmp_path)
         (tmp_path / "config.yaml").write_text(
             yaml.dump({"log_level": "FROM_YAML"}), encoding="utf-8"
         )

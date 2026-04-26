@@ -1,4 +1,4 @@
-"""AI Agent interface for ty-agent.
+"""AI Agent interface for tyagent.
 
 Provides a simplified adapter layer for LLM interactions.
 Supports OpenAI-compatible APIs, model routing, and function calling (tools).
@@ -10,15 +10,20 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+# Type alias for the on_message callback
+OnMessageCallback = Callable[..., Any]
 
 import httpx
+
+from tyagent.context import DEFAULT_MAX_CHARS, build_api_messages, should_compress
 
 logger = logging.getLogger(__name__)
 
 
 class TyAgent:
-    """Simplified AI agent for ty-agent.
+    """Simplified AI agent for tyagent.
 
     Uses OpenAI-compatible chat completions API with optional tool calling.
     """
@@ -31,6 +36,7 @@ class TyAgent:
         max_turns: int = 50,
         max_tool_turns: int = 30,
         system_prompt: str = "You are a helpful assistant.",
+        context_max_chars: int = DEFAULT_MAX_CHARS,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
@@ -38,6 +44,7 @@ class TyAgent:
         self.max_turns = max_turns
         self.max_tool_turns = max_tool_turns
         self.system_prompt = system_prompt
+        self.context_max_chars = context_max_chars
         self._client = httpx.AsyncClient(timeout=120.0)
 
     async def chat(
@@ -46,6 +53,7 @@ class TyAgent:
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
+        on_message: Optional[OnMessageCallback] = None,
     ) -> str:
         """Send messages to the LLM and return the response text.
 
@@ -58,6 +66,10 @@ class TyAgent:
         The *messages* list is mutated in-place so that tool calls and
         results are preserved in the caller's session history.
 
+        If *on_message* is provided, it is called for each assistant and
+        tool message produced, allowing the caller to persist messages
+        to a database. Signature: on_message(role, content, **extras).
+
         If the message list is too long for the context window, it is
         automatically compressed before sending to the API. The original
         *messages* list is NOT truncated — compression creates a temporary
@@ -68,13 +80,14 @@ class TyAgent:
                 Mutated in-place with assistant/tool messages.
             tools: Optional list of OpenAI-format tool definitions.
             stream: Whether to stream the response (not yet implemented).
+            on_message: Optional callback for message persistence.
+                Called as on_message(role, content, tool_calls=...,
+                tool_call_id=..., reasoning=...).
 
         Returns:
             The assistant's final response text.
         """
-        # Lazy import to avoid circular dependency
-        from ty_agent.tools.registry import registry
-        from ty_agent.context import should_compress, compress_messages
+        from tyagent.tools.registry import registry
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -87,7 +100,11 @@ class TyAgent:
             messages.insert(0, {"role": "system", "content": self.system_prompt})
 
         # Build the message list to send (may be compressed)
-        api_messages = compress_messages(messages) if should_compress(messages) else messages
+        api_messages = (
+            build_api_messages(messages, max_chars=self.context_max_chars)
+            if should_compress(messages, max_chars=self.context_max_chars)
+            else messages
+        )
 
         payload_base: Dict[str, Any] = {
             "model": self.model,
@@ -106,8 +123,8 @@ class TyAgent:
                 break
 
             # Refresh compressed view each turn (messages may have grown)
-            if tool_turn > 0 and should_compress(messages):
-                api_messages = compress_messages(messages)
+            if tool_turn > 0 and should_compress(messages, max_chars=self.context_max_chars):
+                api_messages = build_api_messages(messages, max_chars=self.context_max_chars)
             payload_base["messages"] = api_messages
 
             try:
@@ -131,7 +148,7 @@ class TyAgent:
             tool_calls = message.get("tool_calls")
             reasoning_content = message.get("reasoning_content")
 
-            # Append the assistant message (with or without tool_calls)
+            # Build the assistant message
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
             if content is not None:
                 assistant_msg["content"] = content
@@ -140,6 +157,15 @@ class TyAgent:
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
+
+            # Persist via callback if provided
+            if on_message:
+                kwargs: Dict[str, Any] = {}
+                if tool_calls:
+                    kwargs["tool_calls"] = tool_calls
+                if reasoning_content:
+                    kwargs["reasoning"] = reasoning_content
+                on_message("assistant", content or "", **kwargs)
 
             # No tool calls -> we have the final answer
             if not tool_calls:
@@ -153,27 +179,33 @@ class TyAgent:
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_type = tc.get("type", "")
-                func = tc.get("function", {})
+                func = tc.get("function", {}) or {}
                 func_name = func.get("name", "")
                 func_args_str = func.get("arguments", "")
 
                 if tc_type != "function" or not func_name:
+                    tool_result = json.dumps({"error": "Malformed tool call"})
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": json.dumps({"error": "Malformed tool call"}),
+                        "content": tool_result,
                     })
+                    if on_message:
+                        on_message("tool", tool_result, tool_call_id=tc_id)
                     continue
 
                 # Parse arguments
                 try:
                     func_args = json.loads(func_args_str) if func_args_str else {}
                 except json.JSONDecodeError:
+                    tool_result = json.dumps({"error": f"Invalid JSON arguments: {func_args_str}"})
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": json.dumps({"error": f"Invalid JSON arguments: {func_args_str}"}),
+                        "content": tool_result,
                     })
+                    if on_message:
+                        on_message("tool", tool_result, tool_call_id=tc_id)
                     continue
 
                 # Dispatch — run in executor to avoid blocking the event loop
@@ -187,6 +219,8 @@ class TyAgent:
                     "tool_call_id": tc_id,
                     "content": result,
                 })
+                if on_message:
+                    on_message("tool", result, tool_call_id=tc_id)
 
         # If we broke out of the loop (max turns), return the last content we saw
         return content or ""
@@ -202,7 +236,9 @@ class TyAgent:
             api_key=config.api_key,
             base_url=config.base_url,
             max_turns=config.max_turns,
+            max_tool_turns=getattr(config, "max_tool_turns", 30),
             system_prompt=config.system_prompt,
+            context_max_chars=getattr(config, "context_max_chars", 280_000),
         )
 
 

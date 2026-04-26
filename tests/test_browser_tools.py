@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ty_agent.tools.registry import registry
-from ty_agent.tools.browser_tools import (
+from tyagent.tools.registry import registry
+from tyagent.tools.browser_tools import (
     _find_agent_browser,
     _is_browser_available,
     _parse_snapshot_text,
@@ -67,17 +67,17 @@ class TestCLIDiscovery:
     def test_find_agent_browser_env_override(self):
         with patch.dict(os.environ, {"AGENT_BROWSER_CMD": "/fake/agent-browser"}, clear=False):
             # Reset cache
-            from ty_agent.tools import browser_tools
+            from tyagent.tools import browser_tools
             browser_tools._cached_browser_cmd = None
             result = _find_agent_browser(silent=True)
             assert result == "/fake/agent-browser"
 
     def test_is_browser_available_false(self):
         with patch.dict(os.environ, {}, clear=True):
-            from ty_agent.tools import browser_tools
+            from tyagent.tools import browser_tools
             browser_tools._cached_browser_cmd = None
             with patch(
-                "ty_agent.tools.browser_tools._find_agent_browser", return_value=None
+                "tyagent.tools.browser_tools._find_agent_browser", return_value=None
             ):
                 assert _is_browser_available() is False
 
@@ -113,8 +113,8 @@ class TestSnapshotParser:
 
 
 class TestCommandRunner:
-    @patch("ty_agent.tools.browser_tools._find_agent_browser")
-    @patch("ty_agent.tools.browser_tools.subprocess.run")
+    @patch("tyagent.tools.browser_tools._find_agent_browser")
+    @patch("tyagent.tools.browser_tools.subprocess.run")
     def test_run_cmd_success(self, mock_run, mock_find):
         mock_find.return_value = "agent-browser"
         mock_run.return_value = MagicMock(
@@ -126,8 +126,8 @@ class TestCommandRunner:
         assert result["success"] is True
         assert result["stdout"] == "Success output"
 
-    @patch("ty_agent.tools.browser_tools._find_agent_browser")
-    @patch("ty_agent.tools.browser_tools.subprocess.run")
+    @patch("tyagent.tools.browser_tools._find_agent_browser")
+    @patch("tyagent.tools.browser_tools.subprocess.run")
     def test_run_cmd_json_output(self, mock_run, mock_find):
         mock_find.return_value = "agent-browser"
         mock_run.return_value = MagicMock(
@@ -139,8 +139,8 @@ class TestCommandRunner:
         assert result["success"] is True
         assert result["data"]["title"] == "Test"
 
-    @patch("ty_agent.tools.browser_tools._find_agent_browser")
-    @patch("ty_agent.tools.browser_tools.subprocess.run")
+    @patch("tyagent.tools.browser_tools._find_agent_browser")
+    @patch("tyagent.tools.browser_tools.subprocess.run")
     def test_run_cmd_failure(self, mock_run, mock_find):
         mock_find.return_value = "agent-browser"
         mock_run.return_value = MagicMock(
@@ -152,7 +152,7 @@ class TestCommandRunner:
         assert result["success"] is False
         assert "Page not found" in result["error"]
 
-    @patch("ty_agent.tools.browser_tools._find_agent_browser")
+    @patch("tyagent.tools.browser_tools._find_agent_browser")
     def test_run_cmd_browser_not_found(self, mock_find):
         mock_find.return_value = None
         result = _run_cmd("test_session", "open", ["https://example.com"])
@@ -166,86 +166,86 @@ class TestCommandRunner:
 
 
 class TestBrowserHandlers:
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_navigate(self, mock_run):
         mock_run.side_effect = [
             {"success": True, "stdout": "\u2713 Example Domain\n  https://example.com/", "stderr": ""},
             {"success": True, "stdout": '- heading "Test" [ref=e1]', "stderr": ""},
         ]
-        from ty_agent.tools.browser_tools import _handle_browser_navigate
+        from tyagent.tools.browser_tools import _handle_browser_navigate
         result = _handle_browser_navigate({"url": "https://example.com"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["url"].startswith("https://example.com")
         assert "snapshot" in data
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_navigate_missing_url(self, mock_run):
-        from ty_agent.tools.browser_tools import _handle_browser_navigate
+        from tyagent.tools.browser_tools import _handle_browser_navigate
         result = _handle_browser_navigate({"url": ""})
         data = json.loads(result)
         assert "error" in data
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_click(self, mock_run):
         mock_run.return_value = {"success": True, "stdout": "\u2713 Done", "stderr": ""}
-        from ty_agent.tools.browser_tools import _handle_browser_click
+        from tyagent.tools.browser_tools import _handle_browser_click
         result = _handle_browser_click({"ref": "e5"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["ref"] == "@e5"
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_click_missing_ref(self, mock_run):
-        from ty_agent.tools.browser_tools import _handle_browser_click
+        from tyagent.tools.browser_tools import _handle_browser_click
         result = _handle_browser_click({"ref": ""})
         data = json.loads(result)
         assert "error" in data
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_type(self, mock_run):
         mock_run.return_value = {"success": True, "stdout": "\u2713 Done", "stderr": ""}
-        from ty_agent.tools.browser_tools import _handle_browser_type
+        from tyagent.tools.browser_tools import _handle_browser_type
         result = _handle_browser_type({"ref": "e3", "text": "hello"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["ref"] == "@e3"
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_scroll(self, mock_run):
         mock_run.return_value = {"success": True, "stdout": "\u2713 Done", "stderr": ""}
-        from ty_agent.tools.browser_tools import _handle_browser_scroll
+        from tyagent.tools.browser_tools import _handle_browser_scroll
         result = _handle_browser_scroll({"direction": "down"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["direction"] == "down"
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_press(self, mock_run):
         mock_run.return_value = {"success": True, "stdout": "\u2713 Done", "stderr": ""}
-        from ty_agent.tools.browser_tools import _handle_browser_press
+        from tyagent.tools.browser_tools import _handle_browser_press
         result = _handle_browser_press({"key": "Enter"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["key"] == "Enter"
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_console_eval(self, mock_run):
         mock_run.return_value = {"success": True, "stdout": '"Example Domain"', "stderr": ""}
-        from ty_agent.tools.browser_tools import _handle_browser_console
+        from tyagent.tools.browser_tools import _handle_browser_console
         result = _handle_browser_console({"expression": "document.title"})
         data = json.loads(result)
         assert data["success"] is True
         assert data["result"] == '"Example Domain"'
 
-    @patch("ty_agent.tools.browser_tools._run_cmd")
+    @patch("tyagent.tools.browser_tools._run_cmd")
     def test_get_images(self, mock_run):
         mock_run.return_value = {
             "success": True,
             "stdout": '[{"src":"https://example.com/img.png","alt":"test","width":100,"height":50}]',
             "stderr": "",
         }
-        from ty_agent.tools.browser_tools import _handle_browser_get_images
+        from tyagent.tools.browser_tools import _handle_browser_get_images
         result = _handle_browser_get_images({})
         data = json.loads(result)
         assert data["success"] is True

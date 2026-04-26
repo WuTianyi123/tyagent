@@ -1,4 +1,4 @@
-"""Standalone tests for ty-agent Feishu message building and parsing.
+"""Standalone tests for tyagent Feishu message building and parsing.
 
 Run with: python3 -m pytest tests/test_feishu_message_building.py -v
 Or directly: python3 tests/test_feishu_message_building.py
@@ -8,10 +8,10 @@ import json
 import sys
 from pathlib import Path
 
-# Add parent to path so we can import ty_agent
+# Add parent to path so we can import tyagent
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ty_agent.platforms.feishu import (
+from tyagent.platforms.feishu import (
     _build_markdown_post_rows,
     _build_outbound_payload,
     _extract_post_text,

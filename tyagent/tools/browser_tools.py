@@ -1,4 +1,4 @@
-"""Browser automation tools for ty-agent.
+"""Browser automation tools for tyagent.
 
 Uses the ``agent-browser`` CLI (a Playwright-based Node.js tool) for local
 headless browser automation.  Zero API keys required — just needs
@@ -34,7 +34,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from ty_agent.tools.registry import registry, tool_error, tool_result
+from tyagent.tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 

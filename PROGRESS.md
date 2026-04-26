@@ -1,6 +1,6 @@
-# ty-agent 开发进展追踪
+# tyagent 开发进展追踪
 
-> 记录：2026-04-22 → 2026-04-23
+> 记录：2026-04-22 → 2026-04-24
 > 下次会话开始时先读此文件了解当前状态
 
 ---
@@ -26,80 +26,100 @@
 - Markdown → Feishu post 自动转换（代码块、粗体、斜体、链接等）
 - 群聊 @mention 门控
 - 自身消息过滤
-- 消息去重持久化（24h TTL，保存到 ~/.ty_agent/cache/feishu/seen_message_ids.json）
+- 消息去重持久化（24h TTL，保存到 ~/.tyagent/cache/feishu/seen_message_ids.json）
 - 入站媒体下载：支持 image/file/audio/media，自动推断扩展名
 - 出站媒体发送：send_photo / send_document 通过 Feishu 上传 API 实现
 
-### 稳定性改进（2026-04-23）
-- Tool dispatch 异步化：`registry.dispatch()` 通过 `run_in_executor` 在线程池执行，不再阻塞 event loop
-- Agent 添加 `import asyncio`（之前缺失，tool calling loop 中需要）
-- 修复 agent-browser Chromium 版本不匹配（v1217）
-
-### 上下文管理（2026-04-23 晚）
-- **移除了自动裁剪**：不再在启动/定期删除旧 session 文件
-- **新增 `ty_agent/context.py`**：上下文压缩模块
-  - `estimate_tokens()`：字符数 / 3.5 粗估 token 数
-  - `should_compress()`：检查是否超出预算（默认 100k 字符 / 28k token）
-  - `compress_messages()`：头保护 + 中间摘要 + 尾保护，返回临时副本不动原始数据
-  - `_summarize_middle()`：将中间消息压缩为结构化文本摘要（话题 + 关键事实 + 工具操作）
-- **agent.chat() 集成**：发送 API 前自动检查并压缩；tool loop 每轮刷新压缩视图
-- **`/new` 命令改为归档**：旧 session 文件重命名为 `<key>__archived_<timestamp>.json` 保留，新建空 session
-
 ---
 
-## 已核实问题状态
+## 架构重构（2026-04-24）
 
-### 已修复（13个）
+### SQLite 会话存储
 
-1. WebSocket 回调线程安全 — 使用 run_coroutine_threadsafe，不是 create_task
-2. 图片下载 API 参数 — message_id 和 file_key 分开传
-3. 群聊 @mention 门控 — 已实现，检查 raw_content 中是否含 @bot
-4. 自身消息识别 — 检查 sender_type == "bot" 和 sender_id
-5. Markdown/富文本发送 — _build_outbound_payload 检测 Markdown 语法自动发 post
-6. gateway.py 路由 — 按 event.platform 查找适配器
-7. 消息去重持久化 — 保存到磁盘 JSON，启动时加载，线程安全锁保护
-8. 媒体下载拓展名 — 根据 Content-Type 和 filename 推断，支持 image/file/audio/media
-9. Post 消息媒体标签 — 支持 img/media/file/audio/video 标签解析
-10. send_photo — 上传图片到 Feishu 后发送 image 类型消息
-11. send_document — 上传文件到 Feishu 后发送 file 类型消息
-12. Agent `import asyncio` 缺失 — tool calling loop 中 `asyncio.get_running_loop()` 需要
-13. agent-browser Chromium 版本不匹配 — 安装 v1217 匹配 agent-browser 0.13.0
+将 session 存储从 JSON 文件迁移到 SQLite：
 
-### 仍存在（0个）
+- **`tyagent/db.py`**（新建）：SQLite 存储层，WAL 模式 + 线程锁，消息永不删除
+  - `sessions` 表和 `messages` 表，外键约束保障引用完整性
+  - `INSERT OR IGNORE` 原子 create-if-not-exists，消除 TOCTOU 竞态
+  - `add_message()` 自动创建 session（无需显式 create）
+  - `delete_sessions_older_than()` 单条 SQL 批量清理
+  - `import_messages()` 支持 JSON → SQLite 迁移
+  - 29 个测试全部通过，经过 7 轮盲审-修复循环后连续 2 轮无实质性问题
 
-所有已知问题已修复。
+- **`tyagent/session.py`**（重写）：轻量 Session + SessionStore 封装
+  - `Session.messages` 属性按需从 DB 惰性加载
+  - `Session.add_message()` 委托给 store 实时持久化
+  - `SessionStore` 带 `close()` 和 context manager，自动清理临时目录
+  - `save()` 为 no-op（消息实时写入，无需显式保存）
+  - 26 个测试全部通过，经过 7 轮盲审-修复循环后连续 2 轮无实质性问题
+
+### 确定性上下文压缩
+
+替换旧的头-中-尾摘要方案：
+
+- **`tyagent/context.py`**（重写）：基于 tool 消息丢弃的确定性压缩
+  - 保留最后一个 user 消息及之后的所有 tool 链
+  - 丢弃之前的 tool 消息，剥离之前 assistant 的 tool_calls
+  - 零额外 API 成本，不依赖辅助 LLM
+  - `_content_chars()` 统一字符预算计算（含 tool_calls 元数据）
+  - `DEFAULT_MAX_CHARS = 280_000`（~70k tokens，适合 128k+ 模型）
+  - 26 个测试全部通过，经过 6 轮盲审-修复循环后连续 2 轮无实质性问题
+
+### Agent 层适配
+
+- **`tyagent/agent.py`**：新增 `on_message` 回调参数
+  - tool loop 中每条 assistant/tool 消息持久化回调
+  - 使用 `build_api_messages()` + `should_compress(messages, max_chars=...)` 正确触发压缩
+  - 14 个测试全部通过
+
+### Gateway 层适配
+
+- **`tyagent/gateway.py`**：使用新的 session store API
+  - `build_api_messages(session.messages)` 构建压缩视图
+  - `on_message` 回调持久化 tool loop 消息
+  - `get_message_count()` 替代 `len(session.messages)`
+  - 移除 `session_store.save()` 调用
+  - 14 个测试全部通过
+
+### 迁移工具
+
+- **`tyagent/migrate.py`**（新建）：JSON → SQLite 迁移脚本
+  - 支持活跃 session 和归档 session 的迁移
+  - `verify_migration()` 验证 JSON 文件数与 DB session 数一致
+  - 旧 JSON 文件保留作为备份
+  - 12 个测试全部通过
 
 ---
 
 ## 测试状态
 
-**169 tests passed**
+**196 tests passed**（核心模块 119 + 其他 77）
 
 | 测试文件 | 数量 | 覆盖范围 |
 |----------|------|----------|
-| test_browser_tools.py | 24 | 注册、CLI 发现、snapshot 解析、命令执行、handler、集成 |
+| test_db.py | 29 | SQLite CRUD、并发安全、迁移、边界情况 |
+| test_session.py | 26 | Session/SessionStore、惰性加载、归档、context manager |
+| test_context.py | 26 | 确定性压缩、字符预算、边界情况、常量导出 |
+| test_agent.py | 14 | 初始化、chat 流程、tool loop、错误处理、on_message 回调 |
+| test_gateway.py | 14 | 消息路由、归档、status、错误降级、on_message |
+| test_migrate.py | 12 | 迁移脚本、归档文件、损坏文件、验证 |
+| test_browser_tools.py | 24 | 浏览器工具注册、CLI 发现、snapshot 解析、handler |
+| test_config.py | 54 | PlatformConfig、AgentConfig、TyAgentConfig、load/save |
 | test_feishu_media.py | 8 | 媒体扩展名推断 |
 | test_feishu_message_building.py | 13 | Markdown→飞书 post 构建 |
-| test_config.py | 54 | PlatformConfig、AgentConfig、TyAgentConfig、load/save |
-| test_session.py | 26 | Session CRUD、持久化、sanitize、archive |
-| test_agent.py | 14 | 初始化、chat 基本流程、tool loop、错误处理、max turns |
-| test_gateway.py | 12 | 消息路由、reset/status 命令、archive、media 附件、错误降级 |
-| test_context.py | 18 | token 估算、压缩触发、压缩结构、摘要生成、原始数据保护 |
 
 ---
 
-## 近期计划
+## 已知问题
 
-1. 消息处理超时保护 — LLM 长时间无响应时给用户反馈
-2. WebSocket 断连日志降级 — SDK 重连日志从 ERROR 改为 WARNING
-3. 持续测试和稳定性改进
-4. 考虑添加更多平台适配器（Telegram、Discord 等）
+- 3 个浏览器集成测试需要真实 `agent-browser` CLI 环境（不在 CI 中运行）
 
 ---
 
 ## 技术栈
 
 - Python 3.11 + uv
+- SQLite（WAL 模式，线程安全）
 - lark-oapi（飞书 SDK）
 - agent-browser CLI（Playwright，v1217 chromium）
 - systemd user service

@@ -1,4 +1,4 @@
-"""Feishu/Lark platform adapter for ty-agent.
+"""Feishu/Lark platform adapter for tyagent.
 
 Supports:
 - WebSocket long connection
@@ -25,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
 
@@ -282,9 +282,9 @@ def _begin_registration(domain: str = "feishu") -> dict:
         raise RuntimeError("Feishu / Lark registration did not return a device_code")
     qr_url = res.get("verification_uri_complete", "")
     if "?" in qr_url:
-        qr_url += "&from=ty-agent&tp=ty-agent"
+        qr_url += "&from=tyagent&tp=tyagent"
     else:
-        qr_url += "?from=ty-agent&tp=ty-agent"
+        qr_url += "?from=tyagent&tp=tyagent"
     return {
         "device_code": device_code,
         "qr_url": qr_url,
@@ -603,7 +603,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Cache dir for media and dedup state
-        self._cache_dir = Path.home() / ".ty_agent" / "cache" / "feishu"
+        self._cache_dir = Path.home() / ".tyagent" / "cache" / "feishu"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Persistent message dedup state

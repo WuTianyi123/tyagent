@@ -1,4 +1,4 @@
-"""Gateway runner for ty-agent.
+"""Gateway runner for tyagent.
 
 Manages platform adapters, routes messages to the AI agent,
 and handles session lifecycle.
@@ -13,11 +13,14 @@ import signal
 import sys
 from typing import Any, Dict, List, Optional, Type
 
-from ty_agent.agent import AgentError, TyAgent
-from ty_agent.config import PlatformConfig, TyAgentConfig
-from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
-from ty_agent.session import SessionStore
-from ty_agent.tools.registry import registry
+from tyagent.agent import AgentError, TyAgent
+from tyagent.config import PlatformConfig, TyAgentConfig
+from tyagent.context import build_api_messages
+from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from tyagent.session import SessionStore
+from tyagent.tools import memory_tool
+from tyagent.tools import search_tool
+from tyagent.tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ def register_platform(name: str, adapter_class: Type[BasePlatformAdapter]) -> No
 
     Example::
 
-        from ty_agent.gateway import register_platform
+        from tyagent.gateway import register_platform
         from my_platform import MyAdapter
         register_platform("my_platform", MyAdapter)
     """
@@ -41,7 +44,7 @@ def register_platform(name: str, adapter_class: Type[BasePlatformAdapter]) -> No
 def _load_builtin_platforms() -> None:
     """Load built-in platform adapters."""
     try:
-        from ty_agent.platforms.feishu import FeishuAdapter
+        from tyagent.platforms.feishu import FeishuAdapter
 
         register_platform("feishu", FeishuAdapter)
     except ImportError as exc:
@@ -62,6 +65,12 @@ class Gateway:
         self.adapters: Dict[str, BasePlatformAdapter] = {}
         self.session_store = session_store or SessionStore(sessions_dir=config.sessions_dir)
         self.agent = agent or TyAgent.from_config(config.agent)
+        # Initialize persistent memory store
+        memories_dir = config.home_dir / "memories"
+        self.memory_store = memory_tool.MemoryStore(memories_dir)
+        memory_tool.set_store(self.memory_store)
+        # Wire up session search tool
+        search_tool.set_search_db(self.session_store.db)
         self._running = False
         self._shutdown_event = asyncio.Event()
 
@@ -125,22 +134,43 @@ class Gateway:
             )
             user_message = f"{user_message}\n\n{media_desc}" if user_message else media_desc
 
+        # Persist user message to DB
         session.add_message("user", user_message)
 
         # Build tool definitions
         tool_defs = registry.get_definitions()
 
         try:
-            response = await self.agent.chat(session.messages, tools=tool_defs)
+            # Build compressed API message list for the agent
+            api_messages = build_api_messages(session.messages)
+
+            # Inject persistent memory as a system message
+            memory_block = self.memory_store.get_all_formatted()
+            if memory_block:
+                insert_at = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
+                api_messages = (
+                    api_messages[:insert_at]
+                    + [{"role": "system", "content": memory_block}]
+                    + api_messages[insert_at:]
+                )
+
+            # Define the persistence callback for tool loop messages
+            def persist_message(role: str, content: str, **extras) -> None:
+                self.session_store.add_message(
+                    session_key, role, content, **extras
+                )
+
+            response = await self.agent.chat(
+                api_messages,
+                tools=tool_defs,
+                on_message=persist_message,
+            )
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
             response = "Sorry, I encountered an error processing your request."
         except Exception:
             logger.exception("Unexpected agent error")
             response = "Sorry, something went wrong."
-
-        session.add_message("assistant", response)
-        self.session_store.save(session_key)
 
         # Send response
         result = await adapter.send_message(
@@ -168,10 +198,10 @@ class Gateway:
         updated = datetime.fromtimestamp(session.updated_at).strftime("%Y-%m-%d %H:%M")
 
         lines = [
-            "📊 **ty-agent Status**",
+            "📊 **tyagent Status**",
             "",
             f"**Session:** `{session_key}`",
-            f"**Messages:** {len(session.messages)}",
+            f"**Messages:** {self.session_store.get_message_count(session_key)}",
             f"**Created:** {created}",
             f"**Last Activity:** {updated}",
             "",
@@ -188,7 +218,7 @@ class Gateway:
             return
 
         self._running = True
-        logger.info("Starting ty-agent gateway with %d adapter(s)", len(self.adapters))
+        logger.info("Starting tyagent gateway with %d adapter(s)", len(self.adapters))
 
         # Start all adapters
         tasks = []
@@ -216,6 +246,7 @@ class Gateway:
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.agent.close()
+        self.session_store.close()
         logger.info("Gateway stopped")
 
     async def _run_adapter_with_retry(self, name: str, adapter: BasePlatformAdapter) -> None:
@@ -265,7 +296,7 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
     """Entry point to start the gateway."""
     from pathlib import Path
 
-    from ty_agent.config import load_config
+    from tyagent.config import load_config
 
     config = load_config(Path(config_path) if config_path else None)
 
@@ -284,8 +315,8 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
     if not gitconfig.exists():
         gitconfig.write_text(
             "[user]\n"
-            "    name = ty-agent\n"
-            "    email = agent@ty-agent.local\n",
+            "    name = tyagent\n"
+            "    email = agent@tyagent.local\n",
             encoding="utf-8"
         )
     

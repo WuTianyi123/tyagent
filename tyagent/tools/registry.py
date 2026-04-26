@@ -1,4 +1,4 @@
-"""Lightweight tool registry for ty-agent.
+"""Lightweight tool registry for tyagent.
 
 Each tool self-registers its OpenAI-compatible schema and sync handler.
 The registry provides schema retrieval (for LLM API calls) and dispatch
@@ -36,7 +36,7 @@ class ToolEntry:
 
 
 class ToolRegistry:
-    """Singleton registry for ty-agent tools."""
+    """Singleton registry for tyagent tools."""
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}

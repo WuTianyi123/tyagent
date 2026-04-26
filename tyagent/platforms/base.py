@@ -1,4 +1,4 @@
-"""Base platform adapter interface for ty-agent.
+"""Base platform adapter interface for tyagent.
 
 All platform adapters inherit from this and implement the required methods.
 """

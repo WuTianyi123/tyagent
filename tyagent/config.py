@@ -1,4 +1,4 @@
-"""Configuration management for ty-agent."""
+"""Configuration management for tyagent."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ try:
     _usr_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
 except (ImportError, KeyError):
     pass
-default_home = _usr_home / ".ty_agent"
+default_home = _usr_home / ".tyagent"
 
 # Default workspace — user's real home, not the agent profile home
 default_workspace = _usr_home
@@ -61,7 +61,9 @@ class AgentConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     max_turns: int = 50
+    max_tool_turns: int = 30
     system_prompt: str = "You are a helpful assistant."
+    context_max_chars: int = 280_000
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,7 +71,9 @@ class AgentConfig:
             "api_key": self.api_key,
             "base_url": self.base_url,
             "max_turns": self.max_turns,
+            "max_tool_turns": self.max_tool_turns,
             "system_prompt": self.system_prompt,
+            "context_max_chars": self.context_max_chars,
         }
 
     @classmethod
@@ -79,13 +83,15 @@ class AgentConfig:
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
             max_turns=data.get("max_turns", 50),
+            max_tool_turns=data.get("max_tool_turns", 30),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
+            context_max_chars=data.get("context_max_chars", 280_000),
         )
 
 
 @dataclass
 class TyAgentConfig:
-    """Main configuration for ty-agent."""
+    """Main configuration for tyagent."""
 
     platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     agent: AgentConfig = field(default_factory=AgentConfig)
@@ -146,8 +152,8 @@ def load_config(config_path: Optional[Path] = None) -> TyAgentConfig:
 
     Priority:
     1. Explicit config_path
-    2. ~/.ty_agent/config.yaml
-    3. ~/.ty_agent/config.json
+    2. ~/.tyagent/config.yaml
+    3. ~/.tyagent/config.json
     4. Built-in defaults
     """
     if config_path:

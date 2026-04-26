@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ty_agent.platforms.feishu import (
+from tyagent.platforms.feishu import (
     _guess_extension_from_content_type,
     _guess_extension_from_filename,
     _resolve_extension,

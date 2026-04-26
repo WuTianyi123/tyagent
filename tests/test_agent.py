@@ -1,4 +1,4 @@
-"""Unit tests for ty_agent.agent — TyAgent LLM interface."""
+"""Unit tests for tyagent.agent — TyAgent LLM interface."""
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from ty_agent.agent import AgentError, TyAgent
+from tyagent.agent import AgentError, TyAgent
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ class TestChatToolLoop:
 
         with patch.object(agent._client, "post", new_callable=AsyncMock) as mock_post:
             mock_post.side_effect = [tool_resp, final_resp]
-            with patch("ty_agent.tools.registry.registry") as mock_reg:
+            with patch("tyagent.tools.registry.registry") as mock_reg:
                 mock_reg.dispatch.return_value = "hello"
                 mock_reg.get_emoji.return_value = "📄"
                 messages = [{"role": "user", "content": "read the file"}]
@@ -255,7 +255,7 @@ class TestChatToolLoop:
 
         with patch.object(agent._client, "post", new_callable=AsyncMock) as mock_post:
             mock_post.side_effect = [tool_resp, final_resp]
-            with patch("ty_agent.tools.registry.registry") as mock_reg:
+            with patch("tyagent.tools.registry.registry") as mock_reg:
                 messages = [{"role": "user", "content": "test"}]
                 result = await agent.chat(
                     messages, tools=[{"type": "function", "function": {}}]
@@ -300,7 +300,7 @@ class TestChatToolLoop:
 
         with patch.object(agent._client, "post", new_callable=AsyncMock) as mock_post:
             mock_post.side_effect = [tool_resp, final_resp]
-            with patch("ty_agent.tools.registry.registry") as mock_reg:
+            with patch("tyagent.tools.registry.registry") as mock_reg:
                 messages = [{"role": "user", "content": "test"}]
                 result = await agent.chat(
                     messages, tools=[{"type": "function", "function": {}}]
@@ -343,7 +343,7 @@ class TestChatToolLoop:
 
         with patch.object(agent._client, "post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = tool_resp
-            with patch("ty_agent.tools.registry.registry") as mock_reg:
+            with patch("tyagent.tools.registry.registry") as mock_reg:
                 mock_reg.dispatch.return_value = "data"
                 mock_reg.get_emoji.return_value = "📄"
                 messages = [{"role": "user", "content": "loop"}]

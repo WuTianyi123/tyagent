@@ -1,15 +1,15 @@
-"""Unit tests for ty_agent.gateway — Gateway message routing and lifecycle."""
+"""Unit tests for tyagent.gateway — Gateway message routing and lifecycle."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ty_agent.agent import AgentError
-from ty_agent.config import AgentConfig, TyAgentConfig
-from ty_agent.gateway import Gateway
-from ty_agent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from ty_agent.session import Session, SessionStore
+from tyagent.agent import AgentError
+from tyagent.config import AgentConfig, TyAgentConfig
+from tyagent.gateway import Gateway
+from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from tyagent.session import Session, SessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +81,7 @@ class TestGatewayInit:
         assert gw.config is config
         assert isinstance(gw.session_store, SessionStore)
         assert isinstance(gw.adapters, dict)
+        gw.session_store.close()
 
     def test_custom_agent_and_store(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
@@ -113,9 +114,11 @@ class TestOnMessage:
 
         assert result == "Hi there!"
         adapter.send_message.assert_called_once()
-        # Check session has messages
-        session = gw.session_store.get("feishu:chat1")
-        assert len(session.messages) >= 2  # user + assistant
+        # User message is persisted by gateway directly.
+        # Intermediate assistant/tool messages are persisted via on_message
+        # callback (mocked here, so not actually in DB).
+        assert gw.session_store.get_message_count("feishu:chat1") >= 1
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_unknown_platform_returns_none(self, tmp_path):
@@ -124,11 +127,14 @@ class TestOnMessage:
         event = _make_event(platform="telegram")
         result = await gw._on_message(event)
         assert result is None
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_reset_command_archives(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
-        gw = Gateway(config, agent=MagicMock())
+        agent = MagicMock()
+        agent.chat = AsyncMock()
+        gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
         gw.adapters["feishu"] = adapter
@@ -136,19 +142,19 @@ class TestOnMessage:
         # Add some history first
         session = gw.session_store.get("feishu:chat1")
         session.add_message("user", "old message")
-        gw.session_store.save("feishu:chat1")
+        # Message is persisted immediately, so count should be 1
+        assert gw.session_store.get_message_count("feishu:chat1") == 1
 
         event = _make_event(text="/new", is_cmd=True, cmd_name="new")
         result = await gw._on_message(event)
 
         assert result == "Session archived"
-        # Old session should be removed from active store
-        # get() creates a new one with empty messages
-        session = gw.session_store.get("feishu:chat1")
-        assert len(session.messages) == 0
-        # Archived file should exist on disk
-        archive_files = list((tmp_path / "sessions").glob("*__archived_*.json"))
-        assert len(archive_files) == 1
+        # After archive, get_or_create_after_archive gives fresh session
+        fresh = gw.session_store.get_or_create_after_archive("feishu:chat1")
+        assert fresh.session_key == "feishu:chat1"
+        # Old messages still in DB
+        assert gw.session_store.get_message_count("feishu:chat1") == 1
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_status_command(self, tmp_path):
@@ -166,7 +172,8 @@ class TestOnMessage:
         assert result == "Status sent"
         adapter.send_message.assert_called_once()
         sent_text = adapter.send_message.call_args[0][1]
-        assert "ty-agent Status" in sent_text
+        assert "tyagent Status" in sent_text
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_agent_error_returns_fallback(self, tmp_path):
@@ -182,6 +189,7 @@ class TestOnMessage:
         result = await gw._on_message(event)
 
         assert "error" in result.lower() or "sorry" in result.lower()
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_unexpected_exception_returns_fallback(self, tmp_path):
@@ -197,6 +205,7 @@ class TestOnMessage:
         result = await gw._on_message(event)
 
         assert "sorry" in result.lower() or "wrong" in result.lower()
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_media_attached_to_message(self, tmp_path):
@@ -215,9 +224,10 @@ class TestOnMessage:
         result = await gw._on_message(event)
 
         assert result == "Got it"
-        session = gw.session_store.get("feishu:chat1")
-        user_msg = session.messages[0]["content"]
+        msgs = gw.session_store.get_messages("feishu:chat1")
+        user_msg = msgs[0]["content"]
         assert "Attached image" in user_msg or "img_key_123" in user_msg
+        gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_send_failure_logged(self, tmp_path):
@@ -235,6 +245,28 @@ class TestOnMessage:
         event = _make_event()
         await gw._on_message(event)
         # Should not raise, just log the error
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_normal_message_flow_on_message_callback(self, tmp_path):
+        """Verify on_message callback is passed to agent.chat()."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        agent = MagicMock()
+        agent.chat = AsyncMock(return_value="Hi!")
+        agent.model = "test-model"
+        gw = Gateway(config, agent=agent)
+
+        adapter = _make_adapter()
+        gw.adapters["feishu"] = adapter
+
+        event = _make_event(text="hello")
+        await gw._on_message(event)
+
+        # Verify agent.chat was called with on_message
+        call_kwargs = agent.chat.call_args[1]
+        assert "on_message" in call_kwargs
+        assert callable(call_kwargs["on_message"])
+        gw.session_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +286,7 @@ class TestFormatStatus:
         assert "test_key" in status
         assert "my-model" in status
         assert "feishu" in status
+        gw.session_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -269,3 +302,4 @@ class TestGatewayStop:
         gw._running = True
         gw.stop()
         assert gw._running is False
+        gw.session_store.close()

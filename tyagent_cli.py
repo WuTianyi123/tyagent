@@ -1,4 +1,4 @@
-"""CLI entry point for ty-agent."""
+"""CLI entry point for tyagent."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import yaml
 
-from ty_agent.config import load_config, save_config, TyAgentConfig
+from tyagent.config import load_config, save_config, TyAgentConfig
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -23,7 +23,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 def cmd_gateway(args: argparse.Namespace) -> int:
     """Run the gateway."""
-    from ty_agent.gateway import run_gateway
+    from tyagent.gateway import run_gateway
 
     setup_logging(args.log_level or "INFO")
     asyncio.run(run_gateway(config_path=args.config))
@@ -32,47 +32,47 @@ def cmd_gateway(args: argparse.Namespace) -> int:
 
 def cmd_gateway_install(args: argparse.Namespace) -> int:
     """Install gateway as a systemd user service."""
-    from ty_agent.service_manager import install_service
+    from tyagent.service_manager import install_service
     return install_service(force=args.force)
 
 
 def cmd_gateway_uninstall(args: argparse.Namespace) -> int:
     """Uninstall the gateway systemd service."""
-    from ty_agent.service_manager import uninstall_service
+    from tyagent.service_manager import uninstall_service
     return uninstall_service()
 
 
 def cmd_gateway_start(args: argparse.Namespace) -> int:
     """Start the gateway systemd service."""
-    from ty_agent.service_manager import start_service
+    from tyagent.service_manager import start_service
     return start_service()
 
 
 def cmd_gateway_stop(args: argparse.Namespace) -> int:
     """Stop the gateway systemd service."""
-    from ty_agent.service_manager import stop_service
+    from tyagent.service_manager import stop_service
     return stop_service()
 
 
 def cmd_gateway_restart(args: argparse.Namespace) -> int:
     """Restart the gateway systemd service."""
-    from ty_agent.service_manager import restart_service
+    from tyagent.service_manager import restart_service
     return restart_service()
 
 
 def cmd_gateway_status(args: argparse.Namespace) -> int:
     """Show gateway service status."""
-    from ty_agent.service_manager import status_service
+    from tyagent.service_manager import status_service
     return status_service()
 
 
 def cmd_setup_feishu(args: argparse.Namespace) -> int:
     """Interactive setup for Feishu/Lark."""
-    from ty_agent.platforms.feishu import qr_register
-    from ty_agent.config import TyAgentConfig, PlatformConfig
+    from tyagent.platforms.feishu import qr_register
+    from tyagent.config import TyAgentConfig, PlatformConfig
 
     print("=" * 50)
-    print("  ty-agent Feishu / Lark Setup")
+    print("  tyagent Feishu / Lark Setup")
     print("=" * 50)
     print()
 
@@ -109,7 +109,7 @@ def cmd_setup_feishu(args: argparse.Namespace) -> int:
     save_config(config, Path(args.config) if args.config else None)
     print()
     print(f"  Config saved to {config.home_dir / 'config.yaml'}")
-    print("  Run 'python -m ty_agent gateway' to start.")
+    print("  Run 'python -m tyagent gateway' to start.")
     return 0
 
 
@@ -164,8 +164,8 @@ def cmd_set_model(args: argparse.Namespace) -> int:
 def cmd_test_llm(args: argparse.Namespace) -> int:
     """Test LLM API connection directly (debug helper)."""
     import asyncio
-    from ty_agent.config import load_config
-    from ty_agent.agent import TyAgent
+    from tyagent.config import load_config
+    from tyagent.agent import TyAgent
 
     config = load_config(Path(args.config) if args.config else None)
     agent = TyAgent.from_config(config.agent)
@@ -194,13 +194,13 @@ def cmd_test_llm(args: argparse.Namespace) -> int:
 
 
 def cmd_configure(args: argparse.Namespace) -> int:
-    """Interactive configuration wizard for ty-agent."""
+    """Interactive configuration wizard for tyagent."""
     import os
 
     config = load_config(Path(args.config) if args.config else None)
 
     print("=" * 50)
-    print("  ty-agent Configuration Wizard")
+    print("  tyagent Configuration Wizard")
     print("=" * 50)
     print()
 
@@ -405,8 +405,8 @@ def cmd_configure(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="ty-agent",
-        description="ty-agent: A lightweight, extensible agent framework.",
+        prog="tyagent",
+        description="tyagent: A lightweight, extensible agent framework.",
     )
     parser.add_argument(
         "-c", "--config",
@@ -453,7 +453,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     status_parser = gateway_sub.add_parser("status", help="Show gateway service status")
     status_parser.set_defaults(func=cmd_gateway_status)
     
-    # For backward compatibility: "ty-agent gateway" without subcommand runs in foreground
+    # For backward compatibility: "tyagent gateway" without subcommand runs in foreground
     gateway_parser.set_defaults(func=cmd_gateway)
 
     # setup-feishu

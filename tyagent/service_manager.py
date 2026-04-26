@@ -1,4 +1,4 @@
-"""Systemd service manager for ty-agent gateway.
+"""Systemd service manager for tyagent gateway.
 
 Provides install/start/stop/status/uninstall commands for systemd user services.
 """
@@ -12,8 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-SERVICE_NAME = "ty-agent-gateway"
-SERVICE_DESCRIPTION = "ty-agent messaging gateway"
+SERVICE_NAME = "tyagent-gateway"
+SERVICE_DESCRIPTION = "tyagent messaging gateway"
 
 
 def _get_project_root() -> Path:
@@ -97,7 +97,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart={python_path} -m ty_agent_cli gateway
+ExecStart={python_path} -m tyagent_cli gateway
 WorkingDirectory={project_root}
 Environment="PATH={':'.join(path_entries)}"
 {env_block}
@@ -115,10 +115,10 @@ WantedBy=default.target
 
 
 def install_service(force: bool = False) -> int:
-    """Install ty-agent gateway as a systemd user service."""
+    """Install tyagent gateway as a systemd user service."""
     if not _supports_systemd():
         print("Error: systemd is not available or not running.")
-        print("You can still run 'ty-agent gateway' in the foreground.")
+        print("You can still run 'tyagent gateway' in the foreground.")
         return 1
     
     unit_path = _get_unit_path()
@@ -137,9 +137,9 @@ def install_service(force: bool = False) -> int:
     print(f"✓ Service installed: {unit_path}")
     print()
     print("Commands:")
-    print(f"  ty-agent gateway start    # Start the service")
-    print(f"  ty-agent gateway stop     # Stop the service")
-    print(f"  ty-agent gateway status   # Check status")
+    print(f"  tyagent gateway start    # Start the service")
+    print(f"  tyagent gateway stop     # Stop the service")
+    print(f"  tyagent gateway status   # Check status")
     print(f"  journalctl --user -u {SERVICE_NAME} -f  # View logs")
     print()
     
@@ -182,7 +182,7 @@ def start_service() -> int:
     
     unit_path = _get_unit_path()
     if not unit_path.exists():
-        print("Service not installed. Run 'ty-agent gateway install' first.")
+        print("Service not installed. Run 'tyagent gateway install' first.")
         return 1
     
     _run_systemctl(["start", SERVICE_NAME], check=True, timeout=30)
@@ -209,7 +209,7 @@ def restart_service() -> int:
     
     unit_path = _get_unit_path()
     if not unit_path.exists():
-        print("Service not installed. Run 'ty-agent gateway install' first.")
+        print("Service not installed. Run 'tyagent gateway install' first.")
         return 1
     
     _run_systemctl(["restart", SERVICE_NAME], check=True, timeout=30)
