@@ -197,18 +197,18 @@ class StreamConsumer:
                         await self._try_edit(display, add_cursor=not got_done)
                     self._last_edit_time = time.monotonic()
 
+                # --- 截断检查：在发送前确保累积文本不超 safe_limit ---
+                if len(self._accumulated) > _safe_limit:
+                    logger.warning(
+                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating from start",
+                        len(self._accumulated), _safe_limit,
+                    )
+                    self._accumulated = self._accumulated[:_safe_limit]
+
                 # Segment break: finalize current message
                 if got_segment_break:
                     self._message_id = None
                     self._accumulated = ""
-
-                # Truncate accumulated text if it exceeds safe limit
-                if len(self._accumulated) > _safe_limit:
-                    logger.warning(
-                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating",
-                        len(self._accumulated), _safe_limit,
-                    )
-                    self._accumulated = self._accumulated[-_safe_limit:]
 
                 if got_done:
                     # Final send without cursor
@@ -377,7 +377,7 @@ class Gateway:
             session.add_message(
                 msg.get("role", "assistant"),
                 msg.get("content"),
-                **{k: msg[k] for k in ("tool_calls", "tool_call_id", "reasoning") if k in msg},
+                **{k: msg[k] for k in ("tool_calls", "tool_call_id", "reasoning", "reasoning_content") if k in msg},
             )
 
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
@@ -465,7 +465,7 @@ class Gateway:
                         on_message=persist_message,
                     )
                 except Exception:
-                    # Propagate to outer try/except so error message (line 440) is sent to user
+                    logger.exception("Agent streaming chat failed, propagating to outer handler")
                     raise
                 finally:
                     consumer.finish()
