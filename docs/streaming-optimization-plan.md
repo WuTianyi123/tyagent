@@ -329,6 +329,7 @@ class StreamConsumer:
                 self._current_edit_interval = min(
                     self._current_edit_interval * 2, 10.0  # 自适应 backoff，上限 10s
                 )
+                self._last_edit_time = time.monotonic()  # 让 backoff 间隔实际生效
                 if self._flood_strikes >= self._MAX_FLOOD_STRIKES:
                     self._edit_supported = False  # 永久关闭编辑模式
                     logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)
@@ -391,11 +392,17 @@ def _get_or_create_agent(self, session_key: str) -> TyAgent:
         # Evict oldest if over cap
         while len(self._agent_cache) > self._AGENT_CACHE_MAX_SIZE:
             lru_key, (lru_agent, _) = next(iter(self._agent_cache))
-            # TyAgent.close() 是 async 方法，不能直接传 run_in_executor。
-            # 使用 ensure_future 在后台调度 async close。
-            # 注意：确保释放锁后才真正执行 close；close() 是轻量操作
-            # （关闭 httpx client），可在锁内安全调度。
-            asyncio.ensure_future(lru_agent.close())
+            # TyAgent.close() 是 async 方法，不能依赖事件循环（可能在其他线程调用）。
+            # 使用独立线程 + 新事件循环执行 async close，类似 Hermes 的
+            # _release_evicted_agent_soft（gateway/run.py 行 8744-8765）。
+            def _close_agent(a):
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(a.close())
+                    loop.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_close_agent, args=(lru_agent,), daemon=True).start()
             del self._agent_cache[lru_key]
     return agent
 ```
