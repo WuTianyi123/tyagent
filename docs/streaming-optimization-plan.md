@@ -78,10 +78,14 @@ async def chat(self, messages, *, tools=None, stream=False,
                 "POST", f"{self.base_url}/chat/completions",
                 json=payload_base, headers=headers,
             ) as response:
+                # 检查初始 HTTP 状态码（401/429/503 等）
+                await response.araise_for_status()
+
                 content_parts = []
                 tool_calls_acc = {}
                 reasoning_parts = []
                 finish_reason = None
+                usage_obj = None  # 循环内捕获，避免依赖循环外变量
 
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
@@ -127,6 +131,10 @@ async def chat(self, messages, *, tools=None, stream=False,
                         reasoning_parts.append(delta["reasoning_content"])
                         if stream_delta_callback:
                             stream_delta_callback(f"[reasoning]{delta['reasoning_content']}")
+
+                    # 在循环内捕获 usage（在 choices 为空但含 usage 的 chunk 中）
+                    if chunk.get("usage"):
+                        usage_obj = chunk["usage"]
 
                 # 拼装完整 response
                 content = "".join(content_parts) if content_parts else None
@@ -219,9 +227,14 @@ class StreamConsumer:
         self._message_id: Optional[str] = None  # ID of the in-progress platform message
         self._accumulated: str = ""
         self._last_edit_time: float = 0.0
-        self._edit_interval: float = 0.8  # seconds between edits
+        self._edit_interval: float = 1.0  # seconds between edits (Hermes default)
         self._buffer_threshold: int = 30  # chars to send before timer
         self._final_content: str = ""  # full accumulated response
+        self._last_sent_text: str = ""  # track last-sent text to skip redundant edits
+        self._edit_supported: bool = True
+        self._flood_strikes: int = 0
+        self._MAX_FLOOD_STRIKES: int = 3
+        self._current_edit_interval: float = 1.0
     
     def on_delta(self, text: Optional[str]) -> None:
         """Called from agent's thread (sync). None = tool boundary."""
@@ -277,7 +290,7 @@ class StreamConsumer:
             if got_segment_break:
                 self._message_id = None
                 self._accumulated = ""  # Content already in the platform message
-            
+
             if got_done:
                 # Final send without cursor
                 if self._accumulated:
@@ -288,6 +301,8 @@ class StreamConsumer:
                         if result.success:
                             self._message_id = result.message_id
                 return self._accumulated
+
+            await asyncio.sleep(0.05)  # 防止 busy-loop（Hermes stream_consumer.py 第 450 行）
     
     async def _try_edit(self, text: str) -> None:
         """Try to edit the platform message; fallback to new message on failure.
@@ -376,8 +391,11 @@ def _get_or_create_agent(self, session_key: str) -> TyAgent:
         # Evict oldest if over cap
         while len(self._agent_cache) > self._AGENT_CACHE_MAX_SIZE:
             lru_key, (lru_agent, _) = next(iter(self._agent_cache))
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, lru_agent.close)
+            # TyAgent.close() 是 async 方法，不能直接传 run_in_executor。
+            # 使用 ensure_future 在后台调度 async close。
+            # 注意：确保释放锁后才真正执行 close；close() 是轻量操作
+            # （关闭 httpx client），可在锁内安全调度。
+            asyncio.ensure_future(lru_agent.close())
             del self._agent_cache[lru_key]
     return agent
 ```
@@ -394,13 +412,19 @@ def _get_or_create_agent(self, session_key: str) -> TyAgent:
 **现状：** 只有 `send_message()`（创建新消息），无编辑现有消息的能力。
 
 **改动：** 新增 `edit_message()` 方法。
+"""
+    飞书 API 支持编辑消息：`PATCH /im/v1/messages/{message_id}`
 
-飞书 API 支持编辑消息：`PATCH /im/v1/messages/{message_id}`
+    ⚠️ **重要限制**：飞书 PATCH API **不允许切换 `msg_type`**。
+    编辑时必须使用与初始消息完全相同的 msg_type。
+    因此 send_message 首次发送时，StreamConsumer 需要记录该消息的 msg_type，
+    编辑时传入相同的类型。如果类型不匹配，降级到纯文本编辑。
 
-⚠️ **注意**：飞书 PATCH API 不允许切换 `msg_type`。如果初始消息是用 `text` 类型发送的，编辑时必须用同一类型。因此 `edit_message` 应该：
-1. 使用与原始消息相同的 `msg_type`（可以从 `send_message` 首次发送时记录，或由调用者传入）
-2. 如果编辑失败（如类型不匹配），降级到纯文本编辑
-
+    StreamConsumer 中的协作方式：
+    - 首次 `send_message(chat_id, text)` 返回 `SendResult` 中带 `message_id`
+    - consumer 额外记录 `_msg_type`（创建消息时使用的类型）
+    - 编辑时调用 `edit_message(chat_id, msg_id, text, msg_type=self._msg_type)`
+    """
 ```python
 # In FeishuAdapter:
 async def edit_message(
@@ -421,6 +445,8 @@ async def edit_message(
     loop = asyncio.get_running_loop()
     def _do_edit() -> SendResult:
         try:
+            # 确保 lark_oapi 导出了 PatchMessageRequest & PatchMessageRequestBody
+            # （feishu.py 现有的 import 块需要添加对应导入）
             from lark_oapi.api.im.v1.model import PatchMessageRequest, PatchMessageRequestBody
             req = (
                 PatchMessageRequest.builder()
