@@ -60,6 +60,9 @@ class TyAgent:
         tools: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
         on_message: Optional[OnMessageCallback] = None,
+        stream_delta_callback: Optional[Callable[[str], None]] = None,
+        on_segment_break: Optional[Callable[[], None]] = None,
+        reasoning_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Send messages to the LLM and return the response text.
 
@@ -89,10 +92,16 @@ class TyAgent:
             messages: List of message dicts with 'role' and 'content' keys.
                 Mutated in-place with assistant/tool messages.
             tools: Optional list of OpenAI-format tool definitions.
-            stream: Whether to stream the response (not yet implemented).
+            stream: Whether to stream the response using SSE.
             on_message: Optional callback for message persistence.
                 Called as on_message(role, content, tool_calls=...,
                 tool_call_id=..., reasoning=...).
+            stream_delta_callback: Called with each text content delta
+                during streaming. Called as stream_delta_callback(chunk).
+            on_segment_break: Called between the assistant message and
+                tool execution during streaming (on tool boundaries).
+            reasoning_callback: Called with each reasoning_content delta
+                during streaming. Called as reasoning_callback(chunk).
 
         Returns:
             The assistant's final response text.
@@ -157,35 +166,120 @@ class TyAgent:
             self._prev_msg_count = len(messages)
             payload_base["messages"] = api_messages
 
-            try:
-                resp = await self._client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=headers,
-                    json=payload_base,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # Save real token usage from API response
-                usage = data.get("usage")
-                if usage:
-                    self.last_usage = {
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
-                    }
-            except httpx.HTTPStatusError as exc:
-                logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
-                raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
-            except Exception as exc:
-                logger.exception("LLM request failed")
-                raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+            if stream:
+                # --- Streaming path ---
+                payload = {
+                    **payload_base,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                try:
+                    async with self._client.stream(
+                        "POST", f"{self.base_url}/chat/completions",
+                        json=payload, headers=headers,
+                    ) as resp:
+                        resp.raise_for_status()
 
-            choice = data.get("choices", [{}])[0]
-            message = choice.get("message", {})
-            content = message.get("content")
-            tool_calls = message.get("tool_calls")
-            reasoning_content = message.get("reasoning_content")
+                        content_parts: List[str] = []
+                        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+                        reasoning_parts: List[str] = []
+                        usage_obj: Optional[Dict[str, Any]] = None
 
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]" or not data_str:
+                                break
+
+                            chunk = json.loads(data_str)
+                            if not chunk.get("choices"):
+                                if chunk.get("usage"):
+                                    usage_obj = chunk["usage"]
+                                continue
+
+                            delta = chunk["choices"][0].get("delta", {})
+
+                            # Text delta
+                            if delta.get("content"):
+                                content_parts.append(delta["content"])
+                                if not tool_calls_acc and stream_delta_callback:
+                                    stream_delta_callback(delta["content"])
+
+                            # Tool calls delta — accumulate
+                            if delta.get("tool_calls"):
+                                for tc_delta in delta["tool_calls"]:
+                                    idx = tc_delta.get("index", 0)
+                                    if idx not in tool_calls_acc:
+                                        tool_calls_acc[idx] = {
+                                            "id": tc_delta.get("id", ""),
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        }
+                                    acc = tool_calls_acc[idx]
+                                    if tc_delta.get("id"):
+                                        acc["id"] = tc_delta["id"]
+                                    if tc_delta.get("function", {}).get("name"):
+                                        acc["function"]["name"] = tc_delta["function"]["name"]
+                                    if tc_delta.get("function", {}).get("arguments"):
+                                        acc["function"]["arguments"] += tc_delta["function"]["arguments"]
+
+                            # Reasoning delta
+                            if delta.get("reasoning_content"):
+                                reasoning_parts.append(delta["reasoning_content"])
+                                if reasoning_callback:
+                                    reasoning_callback(delta["reasoning_content"])
+
+                        # Build final content/tool_calls from accumulated parts
+                        content = "".join(content_parts) if content_parts else None
+                        reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
+                        tool_calls = list(tool_calls_acc.values()) if tool_calls_acc else None
+
+                        # Save usage
+                        if usage_obj:
+                            self.last_usage = {
+                                "prompt_tokens": usage_obj.get("prompt_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "prompt_tokens", 0),
+                                "completion_tokens": usage_obj.get("completion_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "completion_tokens", 0),
+                                "total_tokens": usage_obj.get("total_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "total_tokens", 0),
+                            }
+                except httpx.HTTPStatusError as exc:
+                    logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
+                    raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
+                except Exception as exc:
+                    logger.exception("LLM request failed")
+                    raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+            else:
+                # --- Non-streaming path (unchanged) ---
+                try:
+                    resp = await self._client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=payload_base,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    # Save real token usage from API response
+                    usage = data.get("usage")
+                    if usage:
+                        self.last_usage = {
+                            "prompt_tokens": usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
+                except httpx.HTTPStatusError as exc:
+                    logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
+                    raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
+                except Exception as exc:
+                    logger.exception("LLM request failed")
+                    raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+
+                choice = data.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                content = message.get("content")
+                tool_calls = message.get("tool_calls")
+                reasoning_content = message.get("reasoning_content")
+
+            # --- Shared assistant message building (stream and non-stream) ---
             # Build the assistant message
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
             if content is not None:
@@ -210,6 +304,13 @@ class TyAgent:
                 # Some models (e.g. DeepSeek) put the actual answer in
                 # reasoning_content when content is empty.
                 return (content or reasoning_content or "")
+
+            # Tool boundary: fire segment break (streaming only)
+            if stream and on_segment_break:
+                try:
+                    on_segment_break()
+                except Exception:
+                    pass
 
             # Execute tool calls and append results
             tool_turn += 1

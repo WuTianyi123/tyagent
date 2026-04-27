@@ -5,9 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from tyagent.agent import AgentError
 from tyagent.config import AgentConfig, TyAgentConfig
-from tyagent.gateway import Gateway, _sanitize_message_chain
+from tyagent.gateway import Gateway, StreamConsumer, _sanitize_message_chain
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import Session, SessionStore
 
@@ -88,7 +92,7 @@ class TestGatewayInit:
         agent = MagicMock()
         store = SessionStore(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config, session_store=store, agent=agent)
-        assert gw.agent is agent
+        assert gw._agent_cache.get("_default") is agent
         assert gw.session_store is store
 
 
@@ -100,6 +104,8 @@ class TestGatewayInit:
 class TestOnMessage:
     @pytest.mark.asyncio
     async def test_normal_message_flow(self, tmp_path):
+        """Normal message flow: non-command messages go through streaming path
+        and response is sent via StreamConsumer."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.chat = AsyncMock(return_value="Hi there!")
@@ -112,11 +118,11 @@ class TestOnMessage:
         event = _make_event(text="hello")
         result = await gw._on_message(event)
 
+        # Streaming path: returns the agent response directly
         assert result == "Hi there!"
-        adapter.send_message.assert_called_once()
+        # Streaming path does NOT call adapter.send_message at the end
+        # (StreamConsumer handles message delivery internally)
         # User message is persisted by gateway directly.
-        # Intermediate assistant/tool messages are persisted via on_message
-        # callback (mocked here, so not actually in DB).
         assert gw.session_store.get_message_count("feishu:chat1") >= 1
         gw.session_store.close()
 

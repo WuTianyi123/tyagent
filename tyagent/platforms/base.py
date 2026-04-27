@@ -92,6 +92,8 @@ class BasePlatformAdapter(ABC):
     - Sending messages/responses
     """
 
+    MAX_MESSAGE_LENGTH: int = 4096
+
     def __init__(self, config: Any, platform_name: str):
         self.config = config
         self.platform_name = platform_name
@@ -166,6 +168,18 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send_message(chat_id, text, **kwargs)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        *,
+        msg_type: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Edit an existing message. Default: not supported — subclasses override."""
+        return SendResult(success=False, error="Not supported", retryable=False)
 
     def build_session_key(self, event: MessageEvent) -> str:
         """Build a unique session key for a message event.

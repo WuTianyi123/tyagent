@@ -1244,6 +1244,70 @@ class FeishuAdapter(BasePlatformAdapter):
             return f"feishu:{event.chat_id}:{event.sender_id}"
         return f"feishu:{event.chat_id}"
 
+    # ---- Edit message (progressive streaming update) ----
+
+    MAX_MESSAGE_LENGTH: int = 20000
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        *,
+        msg_type: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Edit an existing message (progressive update for streaming).
+
+        Uses Feishu PATCH /im/v1/messages/{message_id} API.
+
+        ⚠️ The PATCH API does NOT support switching msg_type. The caller
+        (StreamConsumer) is responsible for passing the correct msg_type
+        that matches the initial message's type.
+
+        If no msg_type is provided, falls back to _build_outbound_payload
+        to determine it. If the type doesn't match the original message,
+        the edit will fail and the caller should fall back to text editing.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Client not initialized")
+
+        if msg_type is None:
+            msg_type, payload = _build_outbound_payload(text)
+        else:
+            # Use caller-specified msg_type (same as initial message's type)
+            # to avoid PATCH API rejecting type switches.
+            if msg_type == "text":
+                payload = json.dumps({"text": text}, ensure_ascii=False)
+            else:
+                _, payload = _build_outbound_payload(text)  # use autodetected payload for post
+
+        loop = asyncio.get_running_loop()
+
+        def _do_edit() -> SendResult:
+            try:
+                from lark_oapi.api.im.v1.model import PatchMessageRequest, PatchMessageRequestBody
+
+                body = PatchMessageRequestBody()
+                body.content = payload
+                body.msg_type = msg_type
+
+                req = (
+                    PatchMessageRequest.builder()
+                    .message_id(message_id)
+                    .request_body(body)
+                    .build()
+                )
+                resp = self._client.im.v1.message.patch(req)
+                if resp.code == 0:
+                    return SendResult(success=True, message_id=message_id)
+                return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
+            except Exception as exc:
+                logger.exception("Failed to edit Feishu message")
+                return SendResult(success=False, error=str(exc), retryable=True)
+
+        return await loop.run_in_executor(None, _do_edit)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -9,19 +9,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue
 import signal
 import sys
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
 from tyagent.config import PlatformConfig, TyAgentConfig
-from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import SessionStore
 from tyagent.tools import memory_tool
 from tyagent.tools import search_tool
 from tyagent.tools.registry import registry
 
 logger = logging.getLogger(__name__)
+
+# Sentinels for StreamConsumer
+_DONE = object()
+_NEW_SEGMENT = object()
 
 
 def _sanitize_message_chain(
@@ -85,6 +92,185 @@ def _load_builtin_platforms() -> None:
         logger.debug("Feishu adapter not available: %s", exc)
 
 
+class StreamConsumer:
+    """Bridges sync stream_delta from agent thread to async platform message edit.
+
+    Usage:
+        consumer = StreamConsumer(adapter, chat_id)
+        consumer_task = asyncio.create_task(consumer.run())
+        await agent.chat(..., stream=True,
+                        stream_delta_callback=consumer.on_delta,
+                        on_segment_break=consumer.on_segment_break)
+        consumer.finish()
+        await consumer_task
+        final_content = consumer.final_content
+    """
+
+    def __init__(self, adapter: BasePlatformAdapter, chat_id: str):
+        self.adapter = adapter
+        self.chat_id = chat_id
+        self._queue: "queue.Queue" = queue.Queue()
+        self._message_id: Optional[str] = None
+        self._msg_type: Optional[str] = None
+        self._accumulated: str = ""
+        self._last_edit_time: float = 0.0
+        self._edit_interval: float = 1.0
+        self._buffer_threshold: int = 30
+        self._last_sent_text: str = ""
+        self._edit_supported: bool = True
+        self._flood_strikes: int = 0
+        self._MAX_FLOOD_STRIKES: int = 3
+        self._current_edit_interval: float = 1.0
+        self.final_content: str = ""
+        self._already_sent: bool = False
+
+    def on_delta(self, text: str) -> None:
+        """Called from agent's thread (sync) for each text delta."""
+        self._queue.put(text)
+
+    def on_segment_break(self) -> None:
+        """Called on tool boundary — finalize current message, prepare for new one."""
+        self._queue.put(_NEW_SEGMENT)
+
+    def finish(self) -> None:
+        """Signal that the stream is complete."""
+        self._queue.put(_DONE)
+
+    async def run(self) -> str:
+        """Drain queue, progressively edit platform message, return final content."""
+        try:
+            _raw_limit = self.adapter.MAX_MESSAGE_LENGTH
+            _safe_limit = max(500, _raw_limit - 100)
+        except (AttributeError, TypeError):
+            _raw_limit = 4096
+            _safe_limit = 3500
+
+        try:
+            while True:
+                # Drain available items
+                got_done = False
+                got_segment_break = False
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                        if item is _DONE:
+                            got_done = True
+                            break
+                        if item is _NEW_SEGMENT:
+                            got_segment_break = True
+                            break
+                        self._accumulated += item
+                    except queue.Empty:
+                        break
+
+                # Decide whether to flush
+                now = time.monotonic()
+                elapsed = now - self._last_edit_time
+                should_edit = (
+                    got_done or got_segment_break
+                    or (elapsed >= self._current_edit_interval and self._accumulated)
+                    or len(self._accumulated) >= self._buffer_threshold
+                )
+
+                if should_edit and self._accumulated:
+                    # Don't send tiny fragments on first edit (avoid "<cursor>")
+                    if not self._already_sent and len(self._accumulated) < 4 and not got_done:
+                        pass  # Wait for more content
+                    elif self._message_id is None:
+                        # First send: create the message
+                        display = self._accumulated
+                        if not got_done:
+                            display += " ▉"
+                        result = await self.adapter.send_message(self.chat_id, display)
+                        if result.success:
+                            self._message_id = result.message_id
+                            self._already_sent = True
+                            self._last_sent_text = display
+                            # Preserve msg_type from send_message for edit consistency.
+                            # The adapter should communicate the type used; if not,
+                            # leave None so edit_message auto-detects.
+                            if hasattr(result, "msg_type") and result.msg_type:
+                                self._msg_type = result.msg_type
+                    else:
+                        # Edit existing message
+                        display = self._accumulated
+                        if not got_done:
+                            display += " ▉"
+                        await self._try_edit(display)
+                    self._last_edit_time = time.monotonic()
+
+                # Segment break: finalize current message
+                if got_segment_break:
+                    self._message_id = None
+                    self._accumulated = ""
+
+                if got_done:
+                    # Final send without cursor
+                    if self._accumulated:
+                        if self._message_id:
+                            await self._try_edit(self._accumulated)
+                        elif not self._already_sent:
+                            result = await self.adapter.send_message(self.chat_id, self._accumulated)
+                            if result.success:
+                                self._message_id = result.message_id
+                                self._already_sent = True
+                    self.final_content = self._accumulated
+                    return self.final_content
+
+                await asyncio.sleep(0.05)
+
+        except asyncio.CancelledError:
+            if self._accumulated and self._message_id:
+                try:
+                    await self._try_edit(self._accumulated)
+                except Exception:
+                    pass
+            self.final_content = self._accumulated
+            return self.final_content
+        except Exception as e:
+            logger.error("StreamConsumer error: %s", e)
+            self.final_content = self._accumulated
+            return self.final_content
+
+    async def _try_edit(self, text: str) -> None:
+        """Try to edit platform message with flood control protection."""
+        if self._message_id and text == self._last_sent_text:
+            return
+        self._last_sent_text = text
+
+        if self._message_id and self._edit_supported:
+            result = await self.adapter.edit_message(
+                self.chat_id, self._message_id, text,
+                msg_type=self._msg_type,
+            )
+            if result.success:
+                self._flood_strikes = 0
+                self._current_edit_interval = self._edit_interval
+                self._already_sent = True
+                return
+            if self._is_flood_error(result.error):
+                self._flood_strikes += 1
+                self._current_edit_interval = min(self._current_edit_interval * 2, 10.0)
+                self._last_edit_time = time.monotonic()
+                if self._flood_strikes >= self._MAX_FLOOD_STRIKES:
+                    self._edit_supported = False
+                    logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)
+                return
+            self._edit_supported = False
+
+        # Fallback: send new message
+        result = await self.adapter.send_message(self.chat_id, text)
+        if result.success:
+            self._message_id = result.message_id
+            self._already_sent = True
+
+    @staticmethod
+    def _is_flood_error(error: Optional[str]) -> bool:
+        if not error:
+            return False
+        return any(code in error for code in ["99991400", "99991401", "99991402", "429 ", "rate limit"])
+
+
 class Gateway:
     """Main gateway managing platform adapters and AI agent interactions."""
 
@@ -98,7 +284,10 @@ class Gateway:
         self.config = config
         self.adapters: Dict[str, BasePlatformAdapter] = {}
         self.session_store = session_store or SessionStore(sessions_dir=config.sessions_dir)
-        self.agent = agent or TyAgent.from_config(config.agent)
+        self._agent_cache: OrderedDict[str, TyAgent] = OrderedDict()
+        self._AGENT_CACHE_MAX_SIZE = 100
+        if agent is not None:
+            self._agent_cache["_default"] = agent
         # Initialize persistent memory store
         memories_dir = config.home_dir / "memories"
         self.memory_store = memory_tool.MemoryStore(memories_dir)
@@ -127,6 +316,33 @@ class Gateway:
                 logger.info("Loaded adapter: %s", name)
             except Exception as exc:
                 logger.error("Failed to load adapter %s: %s", name, exc)
+
+    def _get_or_create_agent(self, session_key: str) -> TyAgent:
+        """Get cached agent for session, or create new one."""
+        # If session_key exists in cache, return it (and move to end for LRU)
+        if session_key in self._agent_cache:
+            agent = self._agent_cache[session_key]
+            self._agent_cache.move_to_end(session_key)
+            return agent
+
+        # If a default agent was explicitly provided, return it for all sessions
+        # (do NOT create per-session agents in that case)
+        if "_default" in self._agent_cache:
+            agent = self._agent_cache["_default"]
+            self._agent_cache.move_to_end("_default")
+            return agent
+
+        # Create a new per-session agent
+        agent = TyAgent.from_config(self.config.agent)
+        self._agent_cache[session_key] = agent
+        self._agent_cache.move_to_end(session_key)
+        # Evict oldest if over cap
+        while len(self._agent_cache) > self._AGENT_CACHE_MAX_SIZE:
+            lru_key = next(iter(self._agent_cache))
+            lru_agent = self._agent_cache.pop(lru_key)
+            loop = asyncio.get_running_loop()
+            loop.create_task(lru_agent.close())
+        return agent
 
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message event."""
@@ -194,7 +410,32 @@ class Gateway:
                     session_key, role, content, **extras
                 )
 
-            response = await self.agent.chat(
+            agent = self._get_or_create_agent(session_key)
+
+            # Streaming path for platform chat messages (non-command)
+            if event.chat_id and not event.is_command():
+                consumer = StreamConsumer(adapter, event.chat_id)
+                consumer_task = asyncio.create_task(consumer.run())
+                try:
+                    response = await agent.chat(
+                        sanitized,
+                        tools=tool_defs,
+                        stream=True,
+                        stream_delta_callback=consumer.on_delta,
+                        on_segment_break=consumer.on_segment_break,
+                        on_message=persist_message,
+                    )
+                except Exception:
+                    # Propagate to outer try/except so error message (line 440) is sent to user
+                    raise
+                finally:
+                    consumer.finish()
+                    await consumer_task
+                # Response is already sent via StreamConsumer editing
+                return response
+
+            # Non-streaming path for commands and fallback
+            response = await agent.chat(
                 sanitized,
                 tools=tool_defs,
                 on_message=persist_message,
@@ -206,7 +447,7 @@ class Gateway:
             logger.exception("Unexpected agent error")
             response = "Sorry, something went wrong."
 
-        # Send response
+        # Send response (non-streaming path only)
         result = await adapter.send_message(
             event.chat_id or "",
             response,
@@ -239,7 +480,7 @@ class Gateway:
             f"**Created:** {created}",
             f"**Last Activity:** {updated}",
             "",
-            f"**Model:** `{self.agent.model}`",
+            f"**Model:** `{self._get_or_create_agent(session_key).model}`",
             f"**Connected Platforms:** {', '.join(connected) if connected else 'None'}",
         ]
         return "\n".join(lines)
@@ -279,7 +520,14 @@ class Gateway:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await self.agent.close()
+
+        # Close all cached agents
+        for key, cached_agent in list(self._agent_cache.items()):
+            try:
+                await cached_agent.close()
+            except Exception:
+                pass
+        self._agent_cache.clear()
         self.session_store.close()
         logger.info("Gateway stopped")
 
