@@ -77,6 +77,7 @@ class SendResult:
     error: Optional[str] = None
     raw_response: Any = None
     retryable: bool = False
+    msg_type: Optional[str] = None
 
 
 # Type alias for message handlers

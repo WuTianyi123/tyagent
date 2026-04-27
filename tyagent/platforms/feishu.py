@@ -1228,7 +1228,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if resp.code == 0:
                     data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
                     msg_id = data.get("data", {}).get("message_id", "")
-                    return SendResult(success=True, message_id=msg_id)
+                    return SendResult(success=True, message_id=msg_id, msg_type=msg_type)
                 else:
                     return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
             except Exception as exc:

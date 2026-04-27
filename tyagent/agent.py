@@ -297,7 +297,7 @@ class TyAgent:
                     kwargs["tool_calls"] = tool_calls
                 if reasoning_content:
                     kwargs["reasoning"] = reasoning_content
-                on_message("assistant", content, **kwargs)
+                on_message("assistant", content or "", **kwargs)
 
             # No tool calls -> we have the final answer
             if not tool_calls:

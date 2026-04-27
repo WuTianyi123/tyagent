@@ -242,6 +242,229 @@ class TestChatStreamBasic:
 
 
 # ---------------------------------------------------------------------------
+# Regression: api_messages should never contain duplicate assistant messages
+# in multi-turn streaming tool calls.
+# ---------------------------------------------------------------------------
+
+
+class TestStreamApiMessagesNoDuplicates:
+    """Verify that api_messages sent in subsequent streaming tool turns
+    do NOT contain duplicate assistant messages.
+
+    Bug: when tool_turn > 0 in streaming path, api_messages.extend()
+    would re-append the previous turn's assistant message because
+    self._prev_msg_count was set BEFORE messages.append(assistant_msg),
+    causing the assistant message to be included again in the next turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_assistant_in_second_api_call(self, agent):
+        """Multi-turn streaming: second API call must not have duplicate assistant."""
+        # First turn: tool call response
+        tool_sse = _make_sse_chunks(
+            text_chunks=["Let me check..."],
+            tool_calls=[
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path": "/tmp/x"}'}},
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        # Second turn: final text response (no more tool calls)
+        final_sse = _make_sse_chunks(
+            text_chunks=["The file says hello"],
+            usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+        )
+
+        mock_ctx = _mock_async_stream(tool_sse)
+        mock_ctx2 = _mock_async_stream(final_sse)
+
+        captured_payloads = []
+
+        # Use a MagicMock-based approach where we wrap side_effect to capture payloads
+        with patch.object(agent._client, "stream") as mock_stream, \
+             patch("tyagent.tools.registry.registry") as mock_reg:
+            mock_reg.dispatch.return_value = "hello"
+
+            # Configure side_effect to capture payloads and return different mocks
+            call_idx = [0]
+            def capturing_side_effect(method, url, **kwargs):
+                payload = kwargs.get("json", {})
+                captured_payloads.append({
+                    "messages": [dict(m) for m in payload.get("messages", [])]
+                })
+                idx = call_idx[0]
+                call_idx[0] += 1
+                return [mock_ctx, mock_ctx2][idx]
+
+            mock_stream.side_effect = capturing_side_effect
+
+            messages = [{"role": "user", "content": "read file"}]
+            await agent.chat(
+                messages, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+            )
+
+        # We should have made 2 API calls
+        assert len(captured_payloads) == 2, f"Expected 2 API calls, got {len(captured_payloads)}"
+
+        # Inspect the messages in the FIRST call
+        msgs1 = captured_payloads[0]["messages"]
+        roles1 = [m["role"] for m in msgs1]
+        # First call should have 0 assistant (only system + user)
+        assert roles1.count("assistant") == 0, (
+            f"Expected 0 assistant in first API call, got {roles1.count('assistant')}. Roles: {roles1}"
+        )
+        assert roles1 == ["system", "user"], f"Unexpected roles in first call: {roles1}"
+
+        # Inspect the messages in the second call's payload
+        msgs2 = captured_payloads[1]["messages"]
+        roles = [m["role"] for m in msgs2]
+
+        # Verify no duplicate assistant messages
+        assistant_count = roles.count("assistant")
+        assert assistant_count == 1, (
+            f"Expected exactly 1 'assistant' message in second API call, "
+            f"got {assistant_count}. Roles: {roles}"
+        )
+
+        # Verify structure: [system, user, assistant, tool, ...]
+        assert roles[:4] == ["system", "user", "assistant", "tool"], (
+            f"Unexpected role sequence: {roles}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_with_three_tool_turns(self, agent):
+        """Three-turn streaming: no duplicate assistant messages across all calls."""
+        # Turn 1: first tool call
+        t1_sse = _make_sse_chunks(
+            text_chunks=["Step 1..."],
+            tool_calls=[
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path": "/tmp/a"}'}},
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        # Turn 2: second tool call
+        t2_sse = _make_sse_chunks(
+            text_chunks=["Step 2..."],
+            tool_calls=[
+                {"index": 0, "id": "call_2", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path": "/tmp/b"}'}},
+            ],
+            usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+        )
+        # Turn 3: final response
+        t3_sse = _make_sse_chunks(
+            text_chunks=["Final answer"],
+            usage={"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35},
+        )
+
+        mock_ctx_list = [_mock_async_stream(s) for s in [t1_sse, t2_sse, t3_sse]]
+        captured_payloads = []
+
+        with patch.object(agent._client, "stream") as mock_stream, \
+             patch("tyagent.tools.registry.registry") as mock_reg:
+            mock_reg.dispatch.return_value = "data"
+
+            call_idx = [0]
+            def capturing_side_effect(method, url, **kwargs):
+                payload = kwargs.get("json", {})
+                captured_payloads.append({
+                    "messages": [dict(m) for m in payload.get("messages", [])]
+                })
+                idx = call_idx[0]
+                call_idx[0] += 1
+                return mock_ctx_list[idx]
+
+            mock_stream.side_effect = capturing_side_effect
+
+            messages = [{"role": "user", "content": "do three steps"}]
+            await agent.chat(
+                messages, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+            )
+
+        assert len(captured_payloads) == 3, f"Expected 3 API calls, got {len(captured_payloads)}"
+
+        for i, payload in enumerate(captured_payloads):
+            roles = [m["role"] for m in payload["messages"]]
+            assistant_count = roles.count("assistant")
+
+            # Call 1 (turn 0): should have 0 assistant (only system + user initially)
+            # Call 2 (turn 1): should have 1 assistant
+            # Call 3 (turn 2): should have 2 assistants (one from each prior turn)
+            if i == 0:
+                expected_assistant = 0
+            elif i == 1:
+                expected_assistant = 1
+            else:
+                expected_assistant = 2
+
+            assert assistant_count == expected_assistant, (
+                f"API call {i+1}: expected {expected_assistant} assistant(s), "
+                f"got {assistant_count}. Roles: {roles}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_api_messages_consistent_with_messages_list(self, agent):
+        """Second API call's messages should match the expected conversation state."""
+        tool_sse = _make_sse_chunks(
+            text_chunks=["Checking..."],
+            tool_calls=[
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path": "/tmp/x"}'}},
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        final_sse = _make_sse_chunks(
+            text_chunks=["Done"],
+            usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+        )
+
+        mock_ctx = _mock_async_stream(tool_sse)
+        mock_ctx2 = _mock_async_stream(final_sse)
+        captured_payloads = []
+
+        with patch.object(agent._client, "stream") as mock_stream, \
+             patch("tyagent.tools.registry.registry") as mock_reg:
+            mock_reg.dispatch.return_value = "file content"
+
+            call_idx = [0]
+            def capturing_side_effect(method, url, **kwargs):
+                payload = kwargs.get("json", {})
+                captured_payloads.append({
+                    "messages": [dict(m) for m in payload.get("messages", [])]
+                })
+                idx = call_idx[0]
+                call_idx[0] += 1
+                return [mock_ctx, mock_ctx2][idx]
+
+            mock_stream.side_effect = capturing_side_effect
+
+            messages = [{"role": "user", "content": "read file"}]
+            await agent.chat(
+                messages, stream=True,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+            )
+
+        # After chat, messages list should be: system, user, assistant, tool, assistant
+        assert len(messages) == 5, f"Expected 5 messages, got {len(messages)}"
+        assert messages[2]["role"] == "assistant"
+        assert messages[3]["role"] == "tool"
+        assert messages[4]["role"] == "assistant"
+
+        # The api_messages sent in call 2 should match messages except possibly
+        # the final assistant (which doesn't exist yet at that point)
+        msgs2 = captured_payloads[1]["messages"]
+        # msgs2 should contain system + user + assistant(turn1) + tool
+        assert len(msgs2) == 4, f"Expected 4 messages in second API call, got {len(msgs2)}"
+        assert msgs2[2]["role"] == "assistant"
+        assert msgs2[2]["content"] == "Checking..."
+        assert msgs2[3]["role"] == "tool"
+        assert "file content" in msgs2[3]["content"]
+
+
+# ---------------------------------------------------------------------------
 # Backward compatibility: stream=False still works
 # ---------------------------------------------------------------------------
 

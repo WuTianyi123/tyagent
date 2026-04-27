@@ -194,15 +194,21 @@ class StreamConsumer:
                     else:
                         # Edit existing message
                         display = self._accumulated
-                        if not got_done:
-                            display += " ▉"
-                        await self._try_edit(display)
+                        await self._try_edit(display, add_cursor=not got_done)
                     self._last_edit_time = time.monotonic()
 
                 # Segment break: finalize current message
                 if got_segment_break:
                     self._message_id = None
                     self._accumulated = ""
+
+                # Truncate accumulated text if it exceeds safe limit
+                if len(self._accumulated) > _safe_limit:
+                    logger.warning(
+                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating",
+                        len(self._accumulated), _safe_limit,
+                    )
+                    self._accumulated = self._accumulated[-_safe_limit:]
 
                 if got_done:
                     # Final send without cursor
@@ -232,8 +238,10 @@ class StreamConsumer:
             self.final_content = self._accumulated
             return self.final_content
 
-    async def _try_edit(self, text: str) -> None:
+    async def _try_edit(self, text: str, *, add_cursor: bool = False) -> None:
         """Try to edit platform message with flood control protection."""
+        if add_cursor:
+            text = text + " ▉"
         if self._message_id and text == self._last_sent_text:
             return
         self._last_sent_text = text
@@ -344,6 +352,34 @@ class Gateway:
             loop.create_task(lru_agent.close())
         return agent
 
+    @staticmethod
+    def _sync_messages_to_session(
+        session: Any,
+        sanitized: List[Dict[str, Any]],
+        original_count: int,
+    ) -> None:
+        """Sync messages from sanitized list back to session store.
+
+        agent.chat() mutates the sanitized list in-place (appends assistant/tool
+        messages). If sanitized is a different list object than session.messages
+        (e.g. after _sanitize_message_chain creates a copy), the original session
+        would miss these new messages. This method copies only the new messages
+        (those beyond original_count) into the session's message list.
+
+        Also syncs via persist_message callback (see _on_message), so this is
+        a safety net for any messages the callback might have missed, plus it
+        ensures session.messages is kept up-to-date for the next user turn.
+        """
+        if len(sanitized) <= original_count:
+            return
+        new_messages = sanitized[original_count:]
+        for msg in new_messages:
+            session.add_message(
+                msg.get("role", "assistant"),
+                msg.get("content"),
+                **{k: msg[k] for k in ("tool_calls", "tool_call_id", "reasoning") if k in msg},
+            )
+
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message event."""
         adapter = self._find_adapter_for_event(event)
@@ -412,6 +448,9 @@ class Gateway:
 
             agent = self._get_or_create_agent(session_key)
 
+            # Track original message count to sync back sanitized -> session
+            original_msg_count = len(session.messages)
+
             # Streaming path for platform chat messages (non-command)
             if event.chat_id and not event.is_command():
                 consumer = StreamConsumer(adapter, event.chat_id)
@@ -430,7 +469,13 @@ class Gateway:
                     raise
                 finally:
                     consumer.finish()
-                    await consumer_task
+                    try:
+                        await consumer_task
+                    except Exception:
+                        logger.exception("StreamConsumer task failed during cleanup")
+
+                # Sync sanitized messages back to session
+                self._sync_messages_to_session(session, sanitized, original_msg_count)
                 # Response is already sent via StreamConsumer editing
                 return response
 
@@ -440,6 +485,9 @@ class Gateway:
                 tools=tool_defs,
                 on_message=persist_message,
             )
+
+            # Sync sanitized messages back to session
+            self._sync_messages_to_session(session, sanitized, original_msg_count)
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
             response = "Sorry, I encountered an error processing your request."
