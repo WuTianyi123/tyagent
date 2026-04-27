@@ -42,7 +42,7 @@ class StreamConsumer:
         final_content = consumer.final_content
     """
 
-    def __init__(self, adapter: BasePlatformAdapter, chat_id: str):
+    def __init__(self, adapter: BasePlatformAdapter, chat_id: str, *, reply_to_message_id: Optional[str] = None):
         self.adapter = adapter
         self.chat_id = chat_id
         self._queue: "queue.Queue" = queue.Queue()
@@ -59,6 +59,7 @@ class StreamConsumer:
         self._current_edit_interval: float = 1.0
         self.final_content: str = ""
         self._already_sent: bool = False
+        self._reply_to_message_id = reply_to_message_id
 
     def on_delta(self, text: str) -> None:
         """Called from agent's thread (sync) for each text delta."""
@@ -117,7 +118,7 @@ class StreamConsumer:
                         display = self._accumulated
                         if not got_done:
                             display += " ▉"
-                        result = await self.adapter.send_message(self.chat_id, display)
+                        result = await self.adapter.send_message(self.chat_id, display, reply_to_message_id=self._reply_to_message_id)
                         if result.success:
                             self._message_id = result.message_id
                             self._already_sent = True
@@ -153,7 +154,7 @@ class StreamConsumer:
                         if self._message_id:
                             await self._try_edit(self._accumulated)
                         elif not self._already_sent:
-                            result = await self.adapter.send_message(self.chat_id, self._accumulated)
+                            result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
                             if result.success:
                                 self._message_id = result.message_id
                                 self._already_sent = True

@@ -261,7 +261,7 @@ class Gateway:
 
             # Streaming path for platform chat messages (non-command)
             if event.chat_id and not event.is_command():
-                consumer = StreamConsumer(adapter, event.chat_id)
+                consumer = StreamConsumer(adapter, event.chat_id, reply_to_message_id=event.message_id)
                 consumer_task = asyncio.create_task(consumer.run())
                 try:
                     response = await agent.chat(
@@ -279,8 +279,11 @@ class Gateway:
                     consumer.finish()
                     try:
                         await consumer_task
+                    except asyncio.CancelledError:
+                        pass  # Normal cancellation, consumer already handled it
                     except Exception:
                         logger.exception("StreamConsumer task failed during cleanup")
+                        raise  # Re-raise so outer handler sends error to user
 
                 # Sync sanitized messages back to session
                 self._sync_messages_to_session(session, sanitized, original_msg_count)
