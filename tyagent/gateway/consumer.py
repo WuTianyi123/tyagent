@@ -17,9 +17,9 @@ import asyncio
 import logging
 import queue
 import time
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from tyagent.platforms.base import BasePlatformAdapter, SendResult
+from tyagent.platforms.base import BasePlatformAdapter
 
 logger = logging.getLogger(__name__)
 
