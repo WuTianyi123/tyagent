@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tyagent.agent import AgentError
 from tyagent.config import AgentConfig, TyAgentConfig
-from tyagent.gateway import Gateway, StreamConsumer, _sanitize_message_chain
+from tyagent.gateway import Gateway
+from tyagent.gateway.gateway import _sanitize_message_chain
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import Session, SessionStore
 
