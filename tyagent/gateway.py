@@ -198,9 +198,10 @@ class StreamConsumer:
                     self._last_edit_time = time.monotonic()
 
                 # --- 截断检查：在发送前确保累积文本不超 safe_limit ---
+                # 截断末尾以保留开头的内容完整性（避免破坏 Markdown 结构）
                 if len(self._accumulated) > _safe_limit:
                     logger.warning(
-                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating from start",
+                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating from end",
                         len(self._accumulated), _safe_limit,
                     )
                     self._accumulated = self._accumulated[:_safe_limit]
@@ -238,8 +239,14 @@ class StreamConsumer:
             self.final_content = self._accumulated
             return self.final_content
 
-    async def _try_edit(self, text: str, *, add_cursor: bool = False) -> None:
+    async def _try_edit(self, text: str, *, add_cursor: bool = False, safe_limit: int = 0) -> None:
         """Try to edit platform message with flood control protection."""
+        if safe_limit > 0 and len(text) > safe_limit:
+            logger.warning(
+                "_try_edit text exceeds safe limit (%d > %d), truncating",
+                len(text), safe_limit,
+            )
+            text = text[:safe_limit]
         if add_cursor:
             text = text + " ▉"
         if self._message_id and text == self._last_sent_text:
