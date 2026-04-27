@@ -629,10 +629,15 @@ def _row_to_session(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 def _row_to_message(row: sqlite3.Row) -> Dict[str, Any]:
-    """Convert a SQLite row to a message dict suitable for LLM API."""
+    """Convert a SQLite row to a message dict suitable for LLM API.
+
+    Preserves null/None fields accurately — some models (e.g. DeepSeek
+    thinking mode) require content=None to remain None instead of "".
+    """
+    raw_content = row["content"]
     msg: Dict[str, Any] = {
         "role": row["role"],
-        "content": row["content"] or "",
+        "content": raw_content if raw_content is not None else None,
     }
     if row["tool_calls"] is not None:
         msg["tool_calls"] = json.loads(row["tool_calls"])

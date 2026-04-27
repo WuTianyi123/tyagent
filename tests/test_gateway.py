@@ -7,7 +7,7 @@ import pytest
 
 from tyagent.agent import AgentError
 from tyagent.config import AgentConfig, TyAgentConfig
-from tyagent.gateway import Gateway
+from tyagent.gateway import Gateway, _sanitize_message_chain
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import Session, SessionStore
 
@@ -303,3 +303,77 @@ class TestGatewayStop:
         gw.stop()
         assert gw._running is False
         gw.session_store.close()
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_message_chain — orphaned tool_calls cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeMessageChain:
+    def test_empty_chain(self):
+        assert _sanitize_message_chain([]) == []
+
+    def test_no_tool_calls(self):
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        result = _sanitize_message_chain(msgs)
+        assert result is msgs  # same object, no copy
+
+    def test_complete_tool_chain_unchanged(self):
+        msgs = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}]},
+            {"role": "tool", "content": "file1.txt", "tool_call_id": "tc1"},
+            {"role": "assistant", "content": "Done!"},
+        ]
+        result = _sanitize_message_chain(msgs)
+        assert result is msgs  # unchanged
+
+    def test_orphan_tool_calls_at_end(self):
+        msgs = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}]},
+        ]
+        result = _sanitize_message_chain(msgs)
+        assert result is not msgs  # new list
+        assert len(result) == 2
+        assert result[1]["role"] == "assistant"
+        assert "tool_calls" not in result[1]
+        assert result[1]["content"] == ""
+
+    def test_orphan_tool_calls_followed_by_user(self):
+        """The exact scenario from the bug report."""
+        msgs = [
+            {"role": "user", "content": "check status"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "systemctl", "arguments": "{}"}}]},
+            {"role": "tool", "content": "active (running)", "tool_call_id": "tc1"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc2", "type": "function", "function": {"name": "journalctl", "arguments": "{}"}}]},
+            {"role": "user", "content": "你好？"},
+        ]
+        result = _sanitize_message_chain(msgs)
+        assert result is not msgs
+        assert len(result) == 5
+        # The tool_calls should be stripped from message [3]
+        assert result[3]["role"] == "assistant"
+        assert "tool_calls" not in result[3]
+        # Earlier tool_calls should be preserved
+        assert result[1].get("tool_calls") is not None
+
+    def test_middle_orphan_stays_untouched(self):
+        """Only the LAST orphan is fixed — orphan in the middle is not
+        this function's concern (it would have been followed by user msg
+        which is valid from API perspective if no tool response exists)."""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "user", "content": "hi"},
+        ]
+        result = _sanitize_message_chain(msgs)
+        # Last orphan is the one at [0] (no tool follows) — should be fixed
+        assert "tool_calls" not in result[0]
+
+    def test_original_not_mutated(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        ]
+        _sanitize_message_chain(msgs)
+        assert "tool_calls" in msgs[0]  # original unchanged

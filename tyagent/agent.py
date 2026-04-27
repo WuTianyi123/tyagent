@@ -17,7 +17,7 @@ OnMessageCallback = Callable[..., Any]
 
 import httpx
 
-from tyagent.context import DEFAULT_MAX_CHARS, build_api_messages, should_compress
+from tyagent.context import DEFAULT_MAX_CHARS, build_api_messages, resolve_threshold, should_compress
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,12 @@ class TyAgent:
         self.system_prompt = system_prompt
         self.context_max_chars = context_max_chars
         self._client = httpx.AsyncClient(timeout=120.0)
+        # Real token usage from the last API response
+        self.last_usage: Optional[Dict[str, int]] = None
+        # Cached system message dict for prompt caching (built once per session)
+        self._system_msg: Optional[Dict[str, Any]] = None
+        # Boundary index for append-only api_messages mode
+        self._prev_msg_count: int = 0
 
     async def chat(
         self,
@@ -75,6 +81,10 @@ class TyAgent:
         *messages* list is NOT truncated — compression creates a temporary
         copy.
 
+        The last API response's token usage is stored in ``self.last_usage``
+        as a dict with keys ``prompt_tokens``, ``completion_tokens``,
+        ``total_tokens`` for the caller to use in compression decisions.
+
         Args:
             messages: List of message dicts with 'role' and 'content' keys.
                 Mutated in-place with assistant/tool messages.
@@ -95,16 +105,28 @@ class TyAgent:
             "User-Agent": "KimiCLI/1.30.0",
         }
 
-        # Inject system prompt if not present
+        # Inject cached system prompt (built once per session)
+        if self._system_msg is None:
+            self._system_msg = {"role": "system", "content": self.system_prompt}
         if not messages or messages[0].get("role") != "system":
-            messages.insert(0, {"role": "system", "content": self.system_prompt})
+            messages.insert(0, self._system_msg)
 
-        # Build the message list to send (may be compressed)
-        api_messages = (
-            build_api_messages(messages, max_chars=self.context_max_chars)
-            if should_compress(messages, max_chars=self.context_max_chars)
-            else messages
+        # Resolve compression threshold
+        threshold_tokens = resolve_threshold(
+            context_tokens=self.context_max_chars,
+            threshold_pct=None,
         )
+
+        # Build the message list to send (may be compressed).
+        # Always make a copy (never alias to messages) so we can use
+        # append-only extend() on subsequent tool turns.
+        self._prev_msg_count = 0
+        api_messages = (
+            build_api_messages(messages)
+            if should_compress(messages, threshold_tokens=threshold_tokens)
+            else list(messages)
+        )
+        self._prev_msg_count = len(messages)
 
         payload_base: Dict[str, Any] = {
             "model": self.model,
@@ -122,9 +144,17 @@ class TyAgent:
                 logger.warning("Max tool turns (%d) reached, returning last content", self.max_tool_turns)
                 break
 
-            # Refresh compressed view each turn (messages may have grown)
-            if tool_turn > 0 and should_compress(messages, max_chars=self.context_max_chars):
-                api_messages = build_api_messages(messages, max_chars=self.context_max_chars)
+            # Append-only: on subsequent turns, only add new messages
+            # since the last API call (never rebuild from scratch unless
+            # compression fires).
+            if tool_turn > 0:
+                prompt_tokens = self.last_usage.get("prompt_tokens") if self.last_usage else None
+                if should_compress(messages, prompt_tokens=prompt_tokens, threshold_tokens=threshold_tokens):
+                    api_messages = build_api_messages(messages)
+                else:
+                    # Append only new messages since boundary
+                    api_messages.extend(messages[self._prev_msg_count:])
+            self._prev_msg_count = len(messages)
             payload_base["messages"] = api_messages
 
             try:
@@ -135,6 +165,14 @@ class TyAgent:
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                # Save real token usage from API response
+                usage = data.get("usage")
+                if usage:
+                    self.last_usage = {
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
             except httpx.HTTPStatusError as exc:
                 logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
                 raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
@@ -165,11 +203,13 @@ class TyAgent:
                     kwargs["tool_calls"] = tool_calls
                 if reasoning_content:
                     kwargs["reasoning"] = reasoning_content
-                on_message("assistant", content or "", **kwargs)
+                on_message("assistant", content, **kwargs)
 
             # No tool calls -> we have the final answer
             if not tool_calls:
-                return content or ""
+                # Some models (e.g. DeepSeek) put the actual answer in
+                # reasoning_content when content is empty.
+                return (content or reasoning_content or "")
 
             # Execute tool calls and append results
             tool_turn += 1
@@ -223,7 +263,7 @@ class TyAgent:
                     on_message("tool", result, tool_call_id=tc_id)
 
         # If we broke out of the loop (max turns), return the last content we saw
-        return content or ""
+        return (content or reasoning_content or "")
 
     async def close(self) -> None:
         await self._client.aclose()

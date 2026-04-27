@@ -70,7 +70,7 @@ class Session:
                 "or SessionStore.add_message() instead."
             )
         msg_id = self._store.add_message(
-            self.session_key, role, content or "",
+            self.session_key, role, content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning=reasoning,
@@ -193,7 +193,7 @@ class SessionStore:
         Returns the message ID.
         """
         return self._db.add_message(
-            session_key, role, content or "",
+            session_key, role, content,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning=reasoning,

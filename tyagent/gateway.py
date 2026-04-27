@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
 from tyagent.config import PlatformConfig, TyAgentConfig
-from tyagent.context import build_api_messages
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from tyagent.session import SessionStore
 from tyagent.tools import memory_tool
@@ -23,6 +22,41 @@ from tyagent.tools import search_tool
 from tyagent.tools.registry import registry
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_message_chain(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Strip orphaned tool_calls from the end of the message chain.
+
+    If the last assistant message has ``tool_calls`` but is not followed
+    by a ``tool`` response message (e.g. the process was killed or
+    crashed mid-tool-loop), the orphaned tool_calls are removed so the
+    chain remains valid for the LLM API.
+
+    The original message objects are NOT mutated — the function returns
+    a new list with copies of affected messages.
+    """
+    if not messages:
+        return messages
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            # Check if the *next* message (if any) is a tool response
+            if i + 1 >= len(messages) or messages[i + 1].get("role") != "tool":
+                # Orphaned tool_calls — strip them
+                logger.info(
+                    "Sanitized orphaned tool_calls from assistant message [%d] "
+                    "(next message role=%s)",
+                    i,
+                    messages[i + 1].get("role", "(end of chain)") if i + 1 < len(messages) else "(end of chain)",
+                )
+                clean = dict(msg)
+                clean.pop("tool_calls", None)
+                return messages[:i] + [clean] + messages[i + 1 :]
+
+    return messages
 
 # Registry of platform adapter classes
 _PLATFORM_REGISTRY: Dict[str, Type[BasePlatformAdapter]] = {}
@@ -141,18 +175,18 @@ class Gateway:
         tool_defs = registry.get_definitions()
 
         try:
-            # Build compressed API message list for the agent
-            api_messages = build_api_messages(session.messages)
+            # Sanitize message chain (strip orphaned tool_calls at end)
+            sanitized = _sanitize_message_chain(session.messages)
 
-            # Inject persistent memory as a system message
+            # Inject persistent memory into the last user message content
+            # instead of adding a separate system message — this keeps the
+            # system prompt prefix stable for prompt caching.
             memory_block = self.memory_store.get_all_formatted()
-            if memory_block:
-                insert_at = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
-                api_messages = (
-                    api_messages[:insert_at]
-                    + [{"role": "system", "content": memory_block}]
-                    + api_messages[insert_at:]
-                )
+            if memory_block and sanitized and sanitized[-1].get("role") == "user":
+                # Make a shallow copy to avoid mutating the shared dict from session.messages
+                sanitized[-1] = dict(sanitized[-1])
+                existing = sanitized[-1].get("content") or ""
+                sanitized[-1]["content"] = existing + "\n\n[记忆上下文]\n" + memory_block
 
             # Define the persistence callback for tool loop messages
             def persist_message(role: str, content: str, **extras) -> None:
@@ -161,7 +195,7 @@ class Gateway:
                 )
 
             response = await self.agent.chat(
-                api_messages,
+                sanitized,
                 tools=tool_defs,
                 on_message=persist_message,
             )

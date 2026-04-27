@@ -1,113 +1,144 @@
 """Context compression for tyagent.
 
-When a conversation grows too long for the LLM's context window,
-this module builds a compressed API message list by deterministically
-dropping old tool messages while preserving conversation structure.
+Two compression strategies, applied in order when the context exceeds budget:
 
-Strategy:
-- Always keep the system prompt and all non-tool messages (user, assistant text)
-- Keep the LAST user message and ALL tool messages after it (active tool chain)
-- Drop tool messages that are BEFORE the last user message
-- Drop tool_calls from assistant messages that are BEFORE the last user message
+**Level 1 — Deterministic tool-dropping** (free, zero LLM calls):
+  - Drop old tool messages before the last user message
+  - Strip tool_calls from old assistant messages before the last user message
+  - Preserves system prompt, all user inputs, and all active tool chains
 
-This is deterministic — no LLM call needed, zero extra API cost.
-The original messages in the database are NEVER modified.
+**Level 2 — LLM summarization** (planned, not yet implemented):
+  - Summarize middle turns with an auxiliary model
+  - Protected head and tail regions
+
+Compression is triggered by real token counts from the LLM API response,
+with a character-based estimate as fallback for the first turn.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Rough token estimation: ~3.5 chars per token for mixed content.
-# Using 3.5 (slightly overestimates token count) as a conservative choice
-# to avoid hitting actual context window limits.
-_CHARS_PER_TOKEN = 3.5
+# Rough chars-per-token estimate for pre-flight (no API call yet).
+# Used ONLY on the very first turn before we have real token counts.
+# Hermes uses 4.0; tyagent targets DL/CLI agents with mixed CJK content.
+_CHARS_PER_TOKEN = 4.0
 
-# Default context budget: ~280k chars ≈ 70k tokens
-# Safe for most 128k+ context models (GPT-4o, Claude 3.5, DeepSeek, etc.)
-# Leaves headroom for system prompt, formatting overhead, and tool definitions.
-_DEFAULT_MAX_CHARS = 280_000
+# Default context window budget for unknown models (in tokens)
+_DEFAULT_CONTEXT_TOKENS = 128_000
+
+# Default trigger threshold (percentage of context window)
+# Compression fires when used tokens exceed this fraction.
+_DEFAULT_THRESHOLD_PCT = 0.60
+
+# Minimum threshold (in tokens): never compress below this
+_MINIMUM_THRESHOLD = 20_000
+
+
+def estimate_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+    """Rough token estimate for a message list (pre-flight only).
+
+    Uses 4 chars/token — intentionally conservative to avoid premature
+    compression. Used only before the first API call when no real
+    token count is available.
+    """
+    total_chars = sum(len(str(msg)) for msg in messages)
+    return int(total_chars // _CHARS_PER_TOKEN) + 1
 
 
 def _content_chars(messages: List[Dict[str, Any]]) -> int:
     """Count total characters in message content and tool_calls."""
     total = 0
     for msg in messages:
-        total += len(msg.get("content", "") or "")
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(part.get("text", "") or "")
         for tc in msg.get("tool_calls", []) or []:
             func = tc.get("function", {}) or {}
             total += len(tc.get("id", ""))
             total += len(tc.get("type", ""))
             total += len(func.get("name", ""))
             total += len(func.get("arguments", ""))
-    return total
-
-
-def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Rough token count estimation from message list.
-
-    Counts: content, reasoning_content, tool_calls arguments/name/id/type.
-    """
-    total_chars = 0
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        # Reasoning content also consumes tokens
         rc = msg.get("reasoning_content")
         if isinstance(rc, str):
-            total_chars += len(rc)
-        # Tool call metadata all consumes tokens
-        for tc in msg.get("tool_calls", []) or []:
-            func = tc.get("function", {}) or {}
-            total_chars += len(tc.get("id", ""))
-            total_chars += len(tc.get("type", ""))
-            total_chars += len(func.get("name", ""))
-            total_chars += len(func.get("arguments", ""))
-    return int(total_chars / _CHARS_PER_TOKEN)
+            total += len(rc)
+    return total
 
 
 def should_compress(
     messages: List[Dict[str, Any]],
-    max_tokens: int = 0,
-    max_chars: int = 0,
+    prompt_tokens: Optional[int] = None,
+    *,
+    threshold_tokens: int = 0,
 ) -> bool:
-    """Return True if the message list exceeds the budget."""
-    if max_tokens > 0:
-        return estimate_tokens(messages) > max_tokens
-    if max_chars > 0:
-        return _content_chars(messages) > max_chars
-    return False
+    """Return True if the message list exceeds the compression threshold.
+
+    Args:
+        messages: The full message list to check.
+        prompt_tokens: Real token count from the LLM API response.
+            When provided (after first API call), this is the authoritative
+            value — the character estimate is only a fallback.
+        threshold_tokens: Token budget at which compression triggers.
+            Defaults to 60% of a 128K window if not set.
+    """
+    if threshold_tokens <= 0:
+        threshold_tokens = int(_DEFAULT_CONTEXT_TOKENS * _DEFAULT_THRESHOLD_PCT)
+    if threshold_tokens < _MINIMUM_THRESHOLD:
+        threshold_tokens = _MINIMUM_THRESHOLD
+
+    if prompt_tokens is not None:
+        # Authoritative: use real token count from API
+        return prompt_tokens > threshold_tokens
+
+    # Fallback: character estimate (first turn)
+    estimated = estimate_tokens_rough(messages)
+    return estimated > threshold_tokens
+
+
+# Backward compat alias
+should_compress_old = should_compress
 
 
 def build_api_messages(
     messages: List[Dict[str, Any]],
-    max_chars: int = _DEFAULT_MAX_CHARS,
+    max_chars: int = 0,
 ) -> List[Dict[str, Any]]:
     """Build a compressed message list for the LLM API.
 
-    Strategy: drop tool messages before the last user message, but
-    keep the active tool chain (last user + everything after it).
+    **Level 1 compression** — deterministic tool-message dropping.
+    This is always safe: it only removes tool results and tool_calls
+    metadata that are no longer needed because the user has moved on
+    to a new topic/question.
 
-    The original message list is NOT modified.
+    Strategy:
+    - Always keep the system prompt and all non-tool messages
+      (user, assistant text)
+    - Keep the LAST user message and ALL tool messages after it
+      (active tool chain)
+    - Drop tool messages that are BEFORE the last user message
+    - Drop tool_calls from assistant messages that are BEFORE
+      the last user message
+    - Preserve reasoning_content
+
+    The original message list is NEVER modified.
 
     Args:
         messages: All messages from the session, in chronological order.
-        max_chars: Character budget for the final message list.
+        max_chars: Character budget (unused with token-based triggering;
+            kept for backward compat).
 
     Returns:
-        A compressed message list, or the original if already within budget.
+        A compressed message list, or the original if no compression needed.
     """
     n = len(messages)
     if n == 0:
-        return messages
-
-    # Check if already within budget (fast path)
-    total_chars = _content_chars(messages)
-    if total_chars <= max_chars:
         return messages
 
     # Find the last user message
@@ -123,6 +154,7 @@ def build_api_messages(
 
     # Build filtered list
     compressed: List[Dict[str, Any]] = []
+    old_tool_dropped = 0
 
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
@@ -132,9 +164,11 @@ def build_api_messages(
             compressed.append(msg)
         elif role == "tool":
             # Before last user message — drop tool messages
+            old_tool_dropped += 1
             continue
         elif role == "assistant":
-            # Before last user message — keep content+reasoning but drop tool_calls
+            # Before last user message — keep content+reasoning
+            # but drop tool_calls
             new_msg: Dict[str, Any] = {"role": "assistant"}
             content = msg.get("content")
             if content is not None:
@@ -149,32 +183,39 @@ def build_api_messages(
             # system, user — keep as-is
             compressed.append(msg)
 
-    # Log compression stats
-    original_chars = total_chars
-    compressed_chars = _content_chars(compressed)
-    logger.info(
-        "Context compressed: %d → %d messages, %dk → %dk chars "
-        "(last user at idx %d, dropped %d tool msgs before it)",
-        n, len(compressed),
-        original_chars // 1000, compressed_chars // 1000,
-        last_user_idx,
-        n - len(compressed),
-    )
-
-    # If somehow still over budget (very unlikely), log a warning
-    still_over = _content_chars(compressed)
-    if still_over > max_chars:
-        logger.warning(
-            "After compression, context still exceeds budget "
-            "(%dk > %dk). Consider splitting or increasing max_chars.",
-            still_over // 1000, max_chars // 1000,
+    if old_tool_dropped > 0:
+        logger.info(
+            "Context compressed (level 1): dropped %d old tool messages "
+            "before last user message at idx %d (%d → %d messages)",
+            old_tool_dropped, last_user_idx, n, len(compressed),
         )
 
     return compressed
 
 
-# Backward-compat alias for agent.py
-compress_messages = build_api_messages
+def resolve_threshold(
+    context_tokens: Optional[int] = None,
+    threshold_pct: Optional[float] = None,
+) -> int:
+    """Resolve a compression threshold from optional model config.
 
-# Public export of default budget
-DEFAULT_MAX_CHARS = _DEFAULT_MAX_CHARS
+    Args:
+        context_tokens: Model's context window size.
+            Default: 128_000.
+        threshold_pct: Fraction of context window to trigger compression.
+            Default: 0.60.
+
+    Returns:
+        Threshold in tokens.
+    """
+    ctx = context_tokens or _DEFAULT_CONTEXT_TOKENS
+    pct = threshold_pct if threshold_pct is not None else _DEFAULT_THRESHOLD_PCT
+    threshold = int(ctx * pct)
+    if threshold < _MINIMUM_THRESHOLD:
+        threshold = _MINIMUM_THRESHOLD
+    return threshold
+
+
+# Backward-compat aliases
+compress_messages = build_api_messages
+DEFAULT_MAX_CHARS = int(_DEFAULT_CONTEXT_TOKENS * _DEFAULT_THRESHOLD_PCT * _CHARS_PER_TOKEN)

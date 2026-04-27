@@ -7,7 +7,7 @@ from tyagent.context import (
     _content_chars,
     build_api_messages,
     compress_messages,
-    estimate_tokens,
+    estimate_tokens_rough,
     should_compress,
 )
 
@@ -51,11 +51,11 @@ class TestContentChars:
 
 class TestEstimateTokens:
     def test_empty(self):
-        assert estimate_tokens([]) == 0
+        assert estimate_tokens_rough([]) == 1  # +1 from int division rounding
 
     def test_single_message(self):
         msgs = [{"role": "user", "content": "Hello world"}]
-        tokens = estimate_tokens(msgs)
+        tokens = estimate_tokens_rough(msgs)
         assert tokens > 0
         assert tokens < 100
 
@@ -64,7 +64,7 @@ class TestEstimateTokens:
             {"role": "user", "content": "a" * 1000},
             {"role": "assistant", "content": "b" * 2000},
         ]
-        tokens = estimate_tokens(msgs)
+        tokens = estimate_tokens_rough(msgs)
         assert tokens > 500
 
     def test_tool_calls_counted(self):
@@ -81,12 +81,12 @@ class TestEstimateTokens:
                 ],
             }
         ]
-        tokens = estimate_tokens(msgs)
+        tokens = estimate_tokens_rough(msgs)
         assert tokens > 0
 
     def test_none_content(self):
         msgs = [{"role": "assistant", "content": None}]
-        assert estimate_tokens(msgs) == 0
+        assert estimate_tokens_rough(msgs) > 0  # str(None) adds chars
 
 
 # ---------------------------------------------------------------------------
@@ -96,23 +96,28 @@ class TestEstimateTokens:
 
 class TestShouldCompress:
     def test_short_messages_no_compress(self):
+        """With a high threshold, short messages should not compress."""
         msgs = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": "hi"},
         ]
-        assert should_compress(msgs, max_tokens=100000) is False
+        assert should_compress(msgs, threshold_tokens=100000) is False
 
-    def test_long_messages_should_compress(self):
-        msgs = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "x" * 200_000},
-        ]
-        assert should_compress(msgs, max_chars=100_000) is True
+    def test_real_tokens_triggers_compress(self):
+        """When real prompt_tokens exceed threshold, compress."""
+        assert should_compress([], prompt_tokens=50_000, threshold_tokens=40_000) is True
 
-    def test_token_budget(self):
-        msgs = [{"role": "user", "content": "a" * 30_000}]
-        assert should_compress(msgs, max_tokens=5000) is True
-        assert should_compress(msgs, max_tokens=20000) is False
+    def test_real_tokens_no_compress(self):
+        assert should_compress([], prompt_tokens=10_000, threshold_tokens=40_000) is False
+
+    def test_rough_estimate_triggers_when_no_real_tokens(self):
+        """Fallback: use character estimate when prompt_tokens is None."""
+        msgs = [{"role": "user", "content": "x" * 200_000}]
+        assert should_compress(msgs, threshold_tokens=10_000) is True
+
+    def test_rough_estimate_no_compress(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        assert should_compress(msgs, threshold_tokens=100_000) is False
 
 
 # ---------------------------------------------------------------------------
@@ -121,15 +126,15 @@ class TestShouldCompress:
 
 
 class TestBuildApiMessages:
-    def test_short_messages_not_compressed(self):
-        """Messages within budget should be returned as-is (same object)."""
+    def test_short_messages_no_tool_to_drop(self):
+        """Short messages without old tool results are returned as-is."""
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
         ]
-        result = build_api_messages(msgs, max_chars=1_000_000)
-        assert result is msgs  # same object if within budget
+        result = build_api_messages(msgs)
+        assert result == msgs  # same content, nothing to drop
 
     def test_empty_messages(self):
         assert build_api_messages([]) == []
@@ -146,7 +151,7 @@ class TestBuildApiMessages:
             {"role": "user", "content": "second question"},
             {"role": "assistant", "content": "Answer."},
         ]
-        result = build_api_messages(msgs, max_chars=10)  # force compression
+        result = build_api_messages(msgs)
 
         # system + first user kept
         assert result[0]["role"] == "system"
@@ -180,7 +185,7 @@ class TestBuildApiMessages:
             {"role": "tool", "content": "content", "tool_call_id": "tc1"},
             {"role": "assistant", "content": "Done."},
         ]
-        result = build_api_messages(msgs, max_chars=10)
+        result = build_api_messages(msgs)
 
         assert len(result) == 5  # all preserved — last user is at idx 1
         assert result[0]["role"] == "system"
@@ -196,7 +201,7 @@ class TestBuildApiMessages:
             {"role": "system", "content": "sys"},
             {"role": "assistant", "content": "hello?"},
         ]
-        result = build_api_messages(msgs, max_chars=10)
+        result = build_api_messages(msgs)
         assert result is msgs
 
     def test_all_roles_kept_except_tool_before_last_user(self):
@@ -214,7 +219,7 @@ class TestBuildApiMessages:
             {"role": "tool", "content": "r2", "tool_call_id": "t2"},
             {"role": "assistant", "content": "a4"},
         ]
-        result = build_api_messages(msgs, max_chars=10)
+        result = build_api_messages(msgs)
 
         # Messages kept: sys, u1, a1(no tc), a2, u2, a3(with tc), tool(r2), a4
         kept_roles = [m["role"] for m in result]
@@ -234,7 +239,7 @@ class TestBuildApiMessages:
             {"role": "assistant", "content": "answer", "reasoning_content": "thinking..."},
             {"role": "user", "content": "y" * 100_000},
         ]
-        result = build_api_messages(msgs, max_chars=50_000)
+        result = build_api_messages(msgs)
 
         assert result[2]["reasoning_content"] == "thinking..."
 
@@ -249,7 +254,7 @@ class TestBuildApiMessages:
             {"role": "user", "content": "y" * 100_000},
         ]
         original_len = len(msgs)
-        build_api_messages(msgs, max_chars=10_000)
+        build_api_messages(msgs)
         assert len(msgs) == original_len
         # tool_calls should still be there
         assert "tool_calls" in msgs[2]
@@ -264,11 +269,11 @@ class TestBuildApiMessages:
             msgs.append({"role": "tool", "content": f"r{i}", "tool_call_id": f"t{i}"})
             msgs.append({"role": "assistant", "content": f"a{i}"})
 
-        result = build_api_messages(msgs, max_chars=20_000)
+        result = build_api_messages(msgs)
         assert len(result) < len(msgs)
 
-    def test_within_budget_returns_same(self):
-        """Messages within budget should be returned as-is even with tool calls."""
+    def test_tool_chain_after_last_user_preserved(self):
+        """When all tool calls are after the last user, nothing is dropped."""
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
@@ -277,8 +282,8 @@ class TestBuildApiMessages:
             {"role": "tool", "content": "ok", "tool_call_id": "tc1"},
             {"role": "assistant", "content": "done"},
         ]
-        result = build_api_messages(msgs, max_chars=1_000_000)
-        assert result is msgs
+        result = build_api_messages(msgs)
+        assert result == msgs
 
     def test_warning_if_still_over_budget(self, caplog):
         import logging
@@ -286,7 +291,7 @@ class TestBuildApiMessages:
         msgs = [
             {"role": "user", "content": "a" * 100_000},
         ]
-        build_api_messages(msgs, max_chars=1)  # far too small
+        build_api_messages(msgs)  # far too small
         # Just one user message — no compression possible, logs warning
 
 
@@ -300,4 +305,6 @@ class TestConstants:
         assert compress_messages is build_api_messages
 
     def test_default_max_chars_exported(self):
-        assert DEFAULT_MAX_CHARS == 280_000
+        from tyagent.context import _DEFAULT_CONTEXT_TOKENS, _DEFAULT_THRESHOLD_PCT, _CHARS_PER_TOKEN
+        expected = int(_DEFAULT_CONTEXT_TOKENS * _DEFAULT_THRESHOLD_PCT * _CHARS_PER_TOKEN)
+        assert DEFAULT_MAX_CHARS == expected
