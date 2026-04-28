@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import signal
+import time
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -55,9 +58,27 @@ def cmd_gateway_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_gateway_restart(args: argparse.Namespace) -> int:
-    """Restart the gateway systemd service."""
-    from tyagent.service_manager import restart_service
-    return restart_service()
+    """Restart the gateway via SIGUSR1 (graceful restart)."""
+    from tyagent.service_manager import get_pid
+
+    pid = get_pid()
+    if pid is None:
+        print("Gateway is not running. Start it with 'tyagent gateway start'.")
+        return 1
+
+    print(f"Sending SIGUSR1 to gateway (PID {pid}) for graceful restart...")
+    os.kill(pid, signal.SIGUSR1)
+
+    # Wait briefly for the new process to start
+    time.sleep(2)
+
+    new_pid = get_pid()
+    if new_pid and new_pid != pid:
+        print(f"✓ Gateway restarted successfully (new PID {new_pid})")
+    else:
+        print("Gateway restart signal sent. Check status with 'tyagent gateway status'.")
+
+    return 0
 
 
 def cmd_gateway_status(args: argparse.Namespace) -> int:

@@ -103,6 +103,7 @@ Environment="PATH={':'.join(path_entries)}"
 {env_block}
 Restart=on-failure
 RestartSec=10
+RestartForceExitStatus=75
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -215,6 +216,20 @@ def restart_service() -> int:
     _run_systemctl(["restart", SERVICE_NAME], check=True, timeout=30)
     print(f"✓ Service restarted: {SERVICE_NAME}")
     return 0
+
+
+def get_pid() -> int | None:
+    """Get the PID of the running service, or None if not running."""
+    result = _run_systemctl(
+        ["show", "--property=MainPID", "--value", SERVICE_NAME],
+        timeout=5,
+    )
+    pid_str = result.stdout.strip()
+    try:
+        pid = int(pid_str)
+        return pid if pid > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 def status_service() -> int:
