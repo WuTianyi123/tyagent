@@ -118,6 +118,7 @@ class Gateway:
         self._draining = False
         self._active_sessions: set[str] = set()
         self._restart_drain_timeout: float = 60.0
+        self._session_to_adapter: Dict[str, str] = {}
 
     def _load_adapters(self) -> None:
         """Load and initialize platform adapters from config."""
@@ -266,6 +267,7 @@ class Gateway:
 
         # Track this session as actively processing
         self._active_sessions.add(session_key)
+        self._session_to_adapter[session_key] = adapter.platform_name
         try:
             # Sanitize message chain (strip orphaned tool_calls at end)
             sanitized = _sanitize_message_chain(session.messages)
@@ -339,6 +341,12 @@ class Gateway:
             response = "Sorry, something went wrong."
         finally:
             self._active_sessions.discard(session_key)
+            # Clear resume_pending flag after first resumed turn
+            try:
+                if self.session_store.is_resume_pending(session_key):
+                    self.session_store.clear_resume_pending(session_key)
+            except Exception:
+                pass
 
         # Send response (non-streaming path only)
         result = await adapter.send_message(
@@ -530,9 +538,10 @@ class Gateway:
         """
         if not self._active_sessions:
             return True
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while self._active_sessions:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
             await asyncio.sleep(0.5)
@@ -543,13 +552,10 @@ class Gateway:
         message = "⚠️ Gateway is restarting for an update. Active requests will complete before restart."
         for session_key in list(self._active_sessions):
             try:
-                # Parse adapter name and chat_id from session key (format: "adapter_name:chat_id")
-                parts = session_key.split(":", 1)
-                adapter_name = parts[0] if len(parts) > 1 else None
-                chat_id = parts[1] if len(parts) > 1 else session_key
-                adapter = self.adapters.get(adapter_name)
+                adapter_name = self._session_to_adapter.get(session_key)
+                adapter = self.adapters.get(adapter_name) if adapter_name else None
                 if adapter is not None:
-                    await adapter.send_message(chat_id, message)
+                    await adapter.send_message("", message)
             except Exception:
                 logger.exception("Failed to notify session %s", session_key)
 
