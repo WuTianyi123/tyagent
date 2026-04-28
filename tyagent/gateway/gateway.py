@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
@@ -112,6 +113,11 @@ class Gateway:
         search_tool.set_search_db(self.session_store.db)
         self._running = False
         self._shutdown_event = asyncio.Event()
+        # Graceful restart / drain support
+        self._restart_requested = False
+        self._draining = False
+        self._active_sessions: set[str] = set()
+        self._restart_drain_timeout: float = 60.0
 
     def _load_adapters(self) -> None:
         """Load and initialize platform adapters from config."""
@@ -196,7 +202,31 @@ class Gateway:
             return None
 
         session_key = adapter.build_session_key(event)
-        session = self.session_store.get(session_key)
+
+        # If draining (graceful restart), reject incoming messages
+        if self._draining:
+            logger.info("Rejecting message during drain for %s", session_key)
+            await adapter.send_message(
+                event.chat_id or "",
+                "⏳ Gateway is restarting. Please try again shortly.",
+                reply_to_message_id=event.message_id,
+            )
+            return None
+
+        # If session is suspended (crash recovery), archive it and create fresh
+        if self.session_store.is_suspended(session_key):
+            logger.info("Session %s was suspended — archiving and creating fresh session", session_key)
+            self.session_store.archive(session_key)
+            self.session_store.clear_resume_pending(session_key)
+            # Get a fresh session with reset metadata (including clearing "suspended")
+            session = self.session_store.get_or_create_after_archive(session_key)
+            await adapter.send_message(
+                event.chat_id or "",
+                "🔄 检测到异常中断，已为您恢复新会话。之前的对话已归档保留。",
+                reply_to_message_id=event.message_id,
+            )
+        else:
+            session = self.session_store.get(session_key)
 
         # Handle reset commands (normalize triggers to strip leading /)
         normalized_triggers = {t.lstrip("/").lower() for t in self.config.reset_triggers}
@@ -234,6 +264,8 @@ class Gateway:
         # Build tool definitions
         tool_defs = registry.get_definitions()
 
+        # Track this session as actively processing
+        self._active_sessions.add(session_key)
         try:
             # Sanitize message chain (strip orphaned tool_calls at end)
             sanitized = _sanitize_message_chain(session.messages)
@@ -305,6 +337,8 @@ class Gateway:
         except Exception:
             logger.exception("Unexpected agent error")
             response = "Sorry, something went wrong."
+        finally:
+            self._active_sessions.discard(session_key)
 
         # Send response (non-streaming path only)
         result = await adapter.send_message(
@@ -347,6 +381,8 @@ class Gateway:
     async def start(self) -> None:
         """Start all adapters and run the gateway."""
         self._load_adapters()
+        self._setup_signal_handlers()
+        self._check_recovery_on_startup()
         if not self.adapters:
             logger.error("No adapters loaded. Check your configuration.")
             return
@@ -423,7 +459,7 @@ class Gateway:
         self._shutdown_event.set()
 
     def _setup_signal_handlers(self) -> None:
-        """Setup graceful shutdown on SIGINT/SIGTERM."""
+        """Setup graceful shutdown on SIGINT/SIGTERM/SIGUSR1."""
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -431,6 +467,115 @@ class Gateway:
             except NotImplementedError:
                 # Windows doesn't support add_signal_handler
                 pass
+        try:
+            loop.add_signal_handler(signal.SIGUSR1, self._on_sigusr1)
+        except NotImplementedError:
+            pass
+
+    def _on_sigusr1(self) -> None:
+        """Handle SIGUSR1 — start graceful restart."""
+        if self._restart_requested:
+            logger.warning("SIGUSR1 already received, ignoring duplicate")
+            return
+        logger.info("SIGUSR1 received — initiating graceful restart")
+        self._restart_requested = True
+        self._draining = True
+        loop = asyncio.get_running_loop()
+        loop.create_task(self._do_graceful_restart())
+
+    async def _do_graceful_restart(self) -> None:
+        """Perform graceful restart: notify, drain, mark sessions, exit."""
+        logger.info("Graceful restart: notifying active sessions...")
+        await self._notify_active_sessions_of_restart()
+
+        logger.info(
+            "Graceful restart: draining up to %.0f seconds (%d active sessions)",
+            self._restart_drain_timeout,
+            len(self._active_sessions),
+        )
+        drained = await self._drain_active_agents(self._restart_drain_timeout)
+
+        if not drained:
+            logger.warning(
+                "Drain timeout reached — forcing restart with %d active session(s)",
+                len(self._active_sessions),
+            )
+
+        # Mark pending sessions for resume, so the new process can pick them up
+        for session_key in list(self._active_sessions):
+            try:
+                self.session_store.mark_resume_pending(session_key, reason="restart_timeout")
+            except Exception:
+                logger.exception("Failed to mark resume_pending for %s", session_key)
+
+        # Write .clean_shutdown marker to indicate intentional restart
+        try:
+            marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text("clean", encoding="utf-8")
+            logger.info("Wrote .clean_shutdown marker at %s", marker_path)
+        except Exception as exc:
+            logger.error("Failed to write .clean_shutdown marker: %s", exc)
+
+        logger.info("Graceful restart complete — exiting with code 75")
+        os._exit(75)
+
+    async def _drain_active_agents(self, timeout: float) -> bool:
+        """Wait for all active sessions to complete, up to timeout seconds.
+
+        Returns True if all sessions drained, False on timeout.
+        """
+        if not self._active_sessions:
+            return True
+        deadline = asyncio.get_event_loop().time() + timeout
+        while self._active_sessions:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(0.5)
+        return True
+
+    def _notify_active_sessions_of_restart(self) -> None:
+        """Send restart notification to all active sessions."""
+        message = "⚠️ Gateway is restarting for an update. Active requests will complete before restart."
+        for session_key in list(self._active_sessions):
+            # Parse adapter name from session key (format: "adapter_name:...")
+            adapter_name = session_key.split(":", 1)[0] if ":" in session_key else None
+            adapter = self.adapters.get(adapter_name)
+            if adapter is not None:
+                try:
+                    # Schedule send in the event loop
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(adapter.send_message(session_key, message))
+                except Exception:
+                    logger.exception("Failed to notify session %s", session_key)
+
+    def _check_recovery_on_startup(self) -> None:
+        """Check for .clean_shutdown marker and handle session recovery.
+
+        If the marker exists, it means the previous shutdown was intentional
+        (graceful restart), so we skip suspending sessions. If absent, we
+        assume an unclean shutdown and suspend recently-active sessions.
+        """
+        marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+        if marker_path.exists():
+            logger.info("Clean shutdown marker found — previous restart was intentional")
+            try:
+                marker_path.unlink()
+                logger.debug("Removed .clean_shutdown marker")
+            except OSError as exc:
+                logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
+            return
+
+        logger.info("No clean shutdown marker — assuming unclean shutdown, suspending recent sessions")
+        try:
+            suspended = self.session_store.suspend_recently_active(max_age_seconds=120)
+            if suspended:
+                logger.warning("Suspended %d recently-active session(s) due to unclean shutdown", suspended)
+            else:
+                logger.debug("No recently-active sessions to suspend")
+        except Exception:
+            logger.exception("Failed to suspend recent sessions on startup")
 
 
 async def run_gateway(config_path: Optional[str] = None) -> None:

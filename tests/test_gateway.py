@@ -1,6 +1,7 @@
 """Unit tests for tyagent.gateway — Gateway message routing and lifecycle."""
 
 import asyncio
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -384,3 +385,178 @@ class TestSanitizeMessageChain:
         ]
         _sanitize_message_chain(msgs)
         assert "tool_calls" in msgs[0]  # original unchanged
+
+
+# ---------------------------------------------------------------------------
+# Gateway graceful drain + SIGUSR1 + session recovery (Task 2)
+# ---------------------------------------------------------------------------
+
+
+class TestGatewayDrainAndRestart:
+    def test_init_has_drain_attributes(self, tmp_path):
+        """Gateway.__init__ sets drain/restart attributes."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        assert hasattr(gw, "_restart_requested")
+        assert hasattr(gw, "_draining")
+        assert hasattr(gw, "_active_sessions")
+        assert isinstance(gw._active_sessions, set)
+        assert hasattr(gw, "_restart_drain_timeout")
+        assert gw._restart_drain_timeout == 60.0
+        assert gw._restart_requested is False
+        assert gw._draining is False
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_setup_signal_handlers_registers_sigusr1(self, tmp_path):
+        """_setup_signal_handlers registers SIGUSR1 via loop.add_signal_handler."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        with patch.object(asyncio.get_event_loop(), "add_signal_handler") as mock_add:
+            gw._setup_signal_handlers()
+            # Should be called for SIGINT, SIGTERM (from existing code), and SIGUSR1
+            sigs_called = [call.args[0] for call in mock_add.call_args_list]
+            assert signal.SIGUSR1 in sigs_called
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_on_message_during_drain_returns_none(self, tmp_path):
+        """When draining, _on_message sends 'restarting' and returns None."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        agent = MagicMock()
+        agent.chat = AsyncMock()
+        gw = Gateway(config, agent=agent)
+        adapter = _make_adapter()
+        gw.adapters["feishu"] = adapter
+        gw._draining = True
+
+        event = _make_event(text="hello")
+        result = await gw._on_message(event)
+
+        assert result is None
+        adapter.send_message.assert_called_once()
+        sent_text = adapter.send_message.call_args[0][1]
+        assert "restarting" in sent_text.lower()
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_on_message_suspended_session_archives_and_creates_fresh(self, tmp_path):
+        """Suspended session is archived, fresh created, user notified."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        agent = MagicMock()
+        agent.chat = AsyncMock(return_value="I'm back!")
+        agent.model = "test-model"
+        gw = Gateway(config, agent=agent)
+        adapter = _make_adapter()
+        gw.adapters["feishu"] = adapter
+
+        # Create session then suspend it
+        session = gw.session_store.get("feishu:chat1")
+        session.add_message("user", "old msg")
+        gw.session_store.suspend_session("feishu:chat1", reason="crash_recovery")
+
+        event = _make_event(text="hello")
+        result = await gw._on_message(event)
+
+        # Should have sent a recovery message first
+        recovery_calls = adapter.send_message.call_args_list
+        assert len(recovery_calls) >= 1
+        # Check that a recovery/notification message was sent (Chinese text about recovery)
+        first_text = recovery_calls[0][0][1]
+        assert "异常中断" in first_text or "恢复" in first_text
+
+        # Session should no longer be suspended
+        assert not gw.session_store.is_suspended("feishu:chat1")
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_active_session_tracking(self, tmp_path):
+        """session_key is added to _active_sessions during agent.chat()."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        agent = MagicMock()
+
+        async def delayed_chat(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return "done"
+
+        agent.chat = AsyncMock(side_effect=delayed_chat)
+        agent.model = "test-model"
+        gw = Gateway(config, agent=agent)
+        adapter = _make_adapter()
+        gw.adapters["feishu"] = adapter
+
+        async def check_active():
+            event = _make_event(text="hello")
+            # Start _on_message in background since it's async
+            async def run():
+                return await gw._on_message(event)
+            task = asyncio.create_task(run())
+            await asyncio.sleep(0.01)
+            # During agent.chat(), session_key should be in active_sessions
+            assert "feishu:chat1" in gw._active_sessions
+            await task
+            # After finish, should be removed
+            assert "feishu:chat1" not in gw._active_sessions
+
+        await check_active()
+        gw.session_store.close()
+
+    def test_check_recovery_clean_shutdown_file_exists(self, tmp_path):
+        """If .clean_shutdown exists, _check_recovery_on_startup removes the file."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+
+        # Create the marker file
+        home_dir = Path.home() / ".tyagent"
+        home_dir.mkdir(parents=True, exist_ok=True)
+        marker = home_dir / ".clean_shutdown"
+        marker.write_text("clean")
+
+        try:
+            gw._check_recovery_on_startup()
+            # File should be removed
+            assert not marker.exists()
+        finally:
+            if marker.exists():
+                marker.unlink()
+
+    def test_check_recovery_clean_shutdown_file_absent(self, tmp_path):
+        """If no .clean_shutdown, sessions should be suspended."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+
+        # Ensure no marker file
+        home_dir = Path.home() / ".tyagent"
+        marker = home_dir / ".clean_shutdown"
+        if marker.exists():
+            marker.unlink()
+
+        # Create a session and mark it recently active
+        session = gw.session_store.get("test:key")
+        session.add_message("user", "hello")
+
+        gw._check_recovery_on_startup()
+
+        # Session should be suspended if it was recently active
+        assert gw.session_store.is_suspended("test:key")
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_notifies_and_clears_sessions(self, tmp_path):
+        """_notify_active_sessions_of_restart sends message to active sessions."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        agent = MagicMock()
+        gw = Gateway(config, agent=agent)
+        adapter = _make_adapter()
+        gw.adapters["feishu"] = adapter
+
+        gw._active_sessions.add("feishu:sess1")
+        gw._active_sessions.add("feishu:sess2")
+
+        gw._notify_active_sessions_of_restart()
+        # Let event loop process the created tasks
+        await asyncio.sleep(0.05)
+        assert adapter.send_message.call_count == 2
+        sent_text = adapter.send_message.call_args[0][1]
+        assert "restarting" in sent_text.lower()
+        gw.session_store.close()
