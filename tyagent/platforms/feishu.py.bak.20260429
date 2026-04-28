@@ -103,13 +103,6 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 
-# Match a complete markdown table: header row + separator row + optional data rows.
-# A table ends at a blank line, a non-table line, or end of text.
-_TABLE_BLOCK_RE = re.compile(
-    r"^(\|.+\|\n\|[-|: ]+\|\n?)(?:\|.+\|\n?)*",
-    re.MULTILINE,
-)
-
 
 def _escape_markdown_text(text: str) -> str:
     """Escape markdown special characters so they render literally."""
@@ -189,21 +182,6 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     return rows or [[{"tag": "md", "text": content}]]
 
 
-def _convert_tables_to_code_blocks(text: str) -> str:
-    """Replace complete markdown table blocks with fenced code blocks.
-
-    Feishu post 'md' tags do not render markdown tables (they show as blank).
-    Wrapping tables in a code fence preserves the visual structure as monospace
-    text while keeping the message as 'post' type so other markdown (bold, lists,
-    code blocks) renders correctly.
-    """
-    def _wrap(m: re.Match) -> str:
-        table = m.group(0).rstrip("\n")
-        return f"```\n{table}\n```"
-
-    return _TABLE_BLOCK_RE.sub(_wrap, text)
-
-
 def _build_outbound_payload(text: str) -> tuple[str, str]:
     """Determine msg_type and payload for sending text to Feishu.
 
@@ -211,12 +189,11 @@ def _build_outbound_payload(text: str) -> tuple[str, str]:
     so Feishu renders it (bold, italic, code blocks, etc.).
     Otherwise send as plain 'text' for efficiency.
     """
-    # Feishu post-type 'md' elements do not render markdown tables; convert
-    # table blocks to fenced code blocks so they render as monospace text
-    # while keeping the message as 'post' for other markdown formatting.
+    # Feishu post-type 'md' elements do not render markdown tables; sending
+    # table content as post causes the message to appear blank on the client.
+    # Force plain text for anything that looks like a markdown table.
     if _MARKDOWN_TABLE_RE.search(text):
-        text = _convert_tables_to_code_blocks(text)
-        return "post", _build_markdown_post_payload(text)
+        return "text", json.dumps({"text": text}, ensure_ascii=False)
     if _MARKDOWN_HINT_RE.search(text):
         return "post", _build_markdown_post_payload(text)
     return "text", json.dumps({"text": text}, ensure_ascii=False)

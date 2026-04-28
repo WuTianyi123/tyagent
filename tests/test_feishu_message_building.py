@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tyagent.platforms.feishu import (
     _build_markdown_post_rows,
     _build_outbound_payload,
+    _convert_tables_to_code_blocks,
     _extract_post_text,
     _MARKDOWN_HINT_RE,
     _MARKDOWN_TABLE_RE,
@@ -36,20 +37,28 @@ def test_no_false_positive_on_bold():
 
 
 def test_outbound_payload_table_forces_text():
-    """Table content must use text type, not post."""
+    """Table content should use post type with table converted to code block."""
     table = "| a | b |\n|---|---|\n| 1 | 2 |"
     msg_type, payload = _build_outbound_payload(table)
-    assert msg_type == "text", f"Table should force text, got {msg_type}"
+    assert msg_type == "post", f"Table should use post, got {msg_type}"
     data = json.loads(payload)
-    assert "text" in data
-    assert data["text"] == table
+    assert "zh_cn" in data
+    # The table should be wrapped in a code fence inside the post content
+    content_str = json.dumps(data, ensure_ascii=False)
+    assert "```" in content_str, "Table should be wrapped in code fence"
+    assert "| a | b |" in content_str
 
 
 def test_outbound_payload_table_with_bold_forces_text():
-    """Table + bold should still force text (table takes precedence)."""
+    """Table + bold should use post type with table in code block."""
     content = "| a | b |\n|---|---|\n| 1 | 2 |\n\n**bold**"
     msg_type, payload = _build_outbound_payload(content)
-    assert msg_type == "text", f"Table+bold should force text, got {msg_type}"
+    assert msg_type == "post", f"Table+bold should use post, got {msg_type}"
+    data = json.loads(payload)
+    assert "zh_cn" in data
+    content_str = json.dumps(data, ensure_ascii=False)
+    assert "```" in content_str, "Table should be wrapped in code fence"
+    assert "**bold**" in content_str, "Bold markdown should still be present"
 
 
 def test_outbound_payload_bold_uses_post():
@@ -66,6 +75,54 @@ def test_outbound_payload_plain_text():
     plain = "Hello world"
     msg_type, payload = _build_outbound_payload(plain)
     assert msg_type == "text", f"Plain text should use text, got {msg_type}"
+
+
+def test_convert_tables_to_code_blocks_basic():
+    """Simple table should be wrapped in a code fence."""
+    text = "| C1 | C2 |\n|---|---|\n| A | B |"
+    result = _convert_tables_to_code_blocks(text)
+    assert result.startswith("```\n"), "Should start with code fence"
+    assert result.endswith("\n```"), "Should end with code fence"
+    assert "| C1 | C2 |" in result
+
+
+def test_convert_tables_to_code_blocks_with_surrounding_text():
+    """Table embedded in surrounding text."""
+    text = "开头文字\n\n| C1 | C2 |\n|---|---|\n| A | B |\n\n结尾文字"
+    result = _convert_tables_to_code_blocks(text)
+    assert "开头文字" in result
+    assert "```\n| C1 | C2 |" in result, "Table should be code-fenced"
+    assert "结尾文字" in result
+
+
+def test_convert_tables_to_code_blocks_multiple_tables():
+    """Multiple tables should each be wrapped."""
+    text = "| T1 |\n|---|\n| A |\n\n| T2 |\n|---|\n| B |"
+    result = _convert_tables_to_code_blocks(text)
+    assert result.count("```") == 4, "Two tables should create 2x ``` pairs, got %d" % result.count("```")
+
+
+def test_convert_tables_to_code_blocks_table_with_bold():
+    """Bold markdown outside the table should remain unchanged."""
+    text = "**粗体**\n\n| C1 | C2 |\n|---|---|\n| A | B |\n\n更多文字"
+    result = _convert_tables_to_code_blocks(text)
+    assert "**粗体**" in result
+    assert "```\n| C1 | C2 |" in result
+
+
+def test_convert_tables_to_code_blocks_no_table():
+    """Text without a table should be unchanged."""
+    text = "普通文字\n\n**粗体**\n- 列表"
+    result = _convert_tables_to_code_blocks(text)
+    assert result == text, "No-table text should be unchanged"
+
+
+def test_convert_tables_to_code_blocks_trailing_newline():
+    """Table at end of text without trailing newline."""
+    text = "前文\n\n| C1 | C2 |\n|---|---|\n| A | B |"
+    result = _convert_tables_to_code_blocks(text)
+    assert "前文" in result
+    assert "```\n| C1 | C2 |" in result
 
 
 def test_fence_boundary_4_backticks():
@@ -168,6 +225,12 @@ if __name__ == "__main__":
         test_outbound_payload_table_with_bold_forces_text,
         test_outbound_payload_bold_uses_post,
         test_outbound_payload_plain_text,
+        test_convert_tables_to_code_blocks_basic,
+        test_convert_tables_to_code_blocks_with_surrounding_text,
+        test_convert_tables_to_code_blocks_multiple_tables,
+        test_convert_tables_to_code_blocks_table_with_bold,
+        test_convert_tables_to_code_blocks_no_table,
+        test_convert_tables_to_code_blocks_trailing_newline,
         test_fence_boundary_4_backticks,
         test_fence_boundary_tilde,
         test_fence_boundary_mixed_fences,

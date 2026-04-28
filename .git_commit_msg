@@ -1,0 +1,18 @@
+fix: convert markdown tables to code blocks in feishu post messages
+
+Root cause: _build_outbound_payload forced 'text' msg_type when tables
+were detected, causing:
+- Path A (fatal): first send 'post', later content has table -> edit
+  sends msg_type='post' with text payload -> API 230001 -> edit broken
+- Path B (ugly): first send 'text', table rendered as raw | chars
+
+Fix:
+1. _convert_tables_to_code_blocks(): replace complete markdown table
+   blocks with ```-fenced code blocks
+2. _build_outbound_payload(): detect tables -> convert to code blocks
+   -> return 'post' type (preserving bold/lists/code block rendering)
+3. consumer.py safety net: on edit failure fallback to send_message,
+   re-enable editing for the new message instead of permanently
+   disabling it
+
+Tests: 13 -> 19 (6 new table conversion tests), all pass

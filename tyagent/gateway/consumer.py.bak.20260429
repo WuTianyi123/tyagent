@@ -210,13 +210,11 @@ class StreamConsumer:
                 return
             self._edit_supported = False
 
-        # Fallback: send new message and re-enable editing for the new message
+        # Fallback: send new message
         result = await self.adapter.send_message(self.chat_id, text)
         if result.success:
             self._message_id = result.message_id
             self._already_sent = True
-            self._edit_supported = True
-            self._flood_strikes = 0
 
     @staticmethod
     def _is_flood_error(error: Optional[str]) -> bool:
