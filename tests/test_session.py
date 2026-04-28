@@ -241,3 +241,131 @@ class TestPruneOldSessions:
         assert store.prune_old_sessions(max_age_days=90) == 0
         assert len(store.all_session_keys()) == 2
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume-pending / suspend recovery
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryMethods:
+    def test_mark_resume_pending(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("rk1")
+        result = store.mark_resume_pending("rk1", reason="restart_timeout")
+        assert result is True
+        assert store.is_resume_pending("rk1") is True
+        s = store.get("rk1")
+        assert s.metadata.get("resume_pending") is True
+        assert s.metadata.get("resume_reason") == "restart_timeout"
+        assert "resume_marked_at" in s.metadata
+        store.close()
+
+    def test_mark_resume_pending_on_suspended_returns_false(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("sk1")
+        store.suspend_session("sk1", reason="crash_recovery")
+        result = store.mark_resume_pending("sk1", reason="restart_timeout")
+        assert result is False
+        # Should still be suspended, not resume_pending
+        assert store.is_suspended("sk1") is True
+        assert store.is_resume_pending("sk1") is False
+        store.close()
+
+    def test_clear_resume_pending(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("rk2")
+        store.mark_resume_pending("rk2")
+        assert store.is_resume_pending("rk2") is True
+        result = store.clear_resume_pending("rk2")
+        assert result is True
+        assert store.is_resume_pending("rk2") is False
+        s = store.get("rk2")
+        assert "resume_pending" not in s.metadata
+        assert "resume_reason" not in s.metadata
+        assert "resume_marked_at" not in s.metadata
+        store.close()
+
+    def test_clear_resume_pending_not_set(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("rk3")
+        result = store.clear_resume_pending("rk3")
+        assert result is False
+        store.close()
+
+    def test_suspend_session(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("sk2")
+        result = store.suspend_session("sk2", reason="crash_recovery")
+        assert result is True
+        assert store.is_suspended("sk2") is True
+        s = store.get("sk2")
+        assert s.metadata.get("suspended") is True
+        assert s.metadata.get("suspend_reason") == "crash_recovery"
+        assert "suspend_at" in s.metadata
+        store.close()
+
+    def test_suspend_recently_active(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("active1")
+        store.get("old1")
+        # Use a large max_age to cover sessions just created
+        count = store.suspend_recently_active(max_age_seconds=1000)
+        assert count >= 1  # at least one session was active recently
+        s = store.get("active1")
+        assert s.metadata.get("suspended") is True
+        store.close()
+
+    def test_suspend_recently_active_skips_resume_pending(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("skip1")
+        store.mark_resume_pending("skip1", reason="restart_timeout")
+        store.get("target1")
+        count = store.suspend_recently_active(max_age_seconds=1000)
+        # skip1 should NOT be suspended (has resume_pending)
+        assert store.is_suspended("skip1") is False
+        # target1 should be suspended
+        assert store.is_suspended("target1") is True
+        store.close()
+
+    def test_suspend_recently_active_skips_already_suspended(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("already_suspended")
+        store.suspend_session("already_suspended")
+        store.get("fresh1")
+        count = store.suspend_recently_active(max_age_seconds=1000)
+        assert store.is_suspended("already_suspended") is True
+        assert store.is_suspended("fresh1") is True
+        store.close()
+
+    def test_is_suspended(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("ck1")
+        assert store.is_suspended("ck1") is False
+        store.suspend_session("ck1")
+        assert store.is_suspended("ck1") is True
+        store.close()
+
+    def test_is_resume_pending(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("ck2")
+        assert store.is_resume_pending("ck2") is False
+        store.mark_resume_pending("ck2")
+        assert store.is_resume_pending("ck2") is True
+        store.close()
+
+    def test_suspend_default_reason(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("def_reason")
+        store.suspend_session("def_reason")
+        s = store.get("def_reason")
+        assert s.metadata.get("suspend_reason") == "crash_recovery"
+        store.close()
+
+    def test_mark_resume_pending_default_reason(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path)
+        store.get("def_resume")
+        store.mark_resume_pending("def_resume")
+        s = store.get("def_resume")
+        assert s.metadata.get("resume_reason") == "restart_timeout"
+        store.close()

@@ -250,6 +250,87 @@ class SessionStore:
         cutoff = time.time() - (max_age_days * 86400)
         return self._db.delete_sessions_older_than(cutoff)
 
+    # ------------------------------------------------------------------
+    # Resume-pending / suspend recovery
+    # ------------------------------------------------------------------
+
+    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
+        """Mark a session as ready for resume, unless it's already suspended.
+
+        Returns True if resume_pending was set, False if session is suspended.
+        """
+        session_dict = self._db.get_or_create_session(session_key)[0]
+        metadata = session_dict["metadata"]
+        if metadata.get("suspended"):
+            return False
+        metadata["resume_pending"] = True
+        metadata["resume_reason"] = reason
+        metadata["resume_marked_at"] = time.time()
+        self._db._update_session_metadata(session_key, metadata)
+        return True
+
+    def clear_resume_pending(self, session_key: str) -> bool:
+        """Clear resume_pending flags from session metadata.
+
+        Returns True if the flag was present and cleared, False otherwise.
+        """
+        session_dict = self._db.get_or_create_session(session_key)[0]
+        metadata = session_dict["metadata"]
+        if "resume_pending" not in metadata:
+            return False
+        metadata.pop("resume_pending", None)
+        metadata.pop("resume_reason", None)
+        metadata.pop("resume_marked_at", None)
+        self._db._update_session_metadata(session_key, metadata)
+        return True
+
+    def suspend_session(self, session_key: str, reason: str = "crash_recovery") -> bool:
+        """Suspend a session, marking it as explicitly suspended.
+
+        Returns True.
+        """
+        session_dict = self._db.get_or_create_session(session_key)[0]
+        metadata = session_dict["metadata"]
+        metadata["suspended"] = True
+        metadata["suspend_reason"] = reason
+        metadata["suspend_at"] = time.time()
+        self._db._update_session_metadata(session_key, metadata)
+        return True
+
+    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
+        """Suspend all recently active sessions that are not already suspended or resume_pending.
+
+        Args:
+            max_age_seconds: Sessions with updated_at within this many seconds
+                            from now are considered "recently active".
+
+        Returns:
+            Number of sessions suspended.
+        """
+        cutoff = time.time() - max_age_seconds
+        count = 0
+        for session_dict in self._db.get_all_session_dicts():
+            metadata = session_dict["metadata"]
+            if metadata.get("resume_pending") or metadata.get("suspended"):
+                continue
+            if session_dict["updated_at"] >= cutoff:
+                metadata["suspended"] = True
+                metadata["suspend_reason"] = "crash_recovery"
+                metadata["suspend_at"] = time.time()
+                self._db._update_session_metadata(session_dict["session_key"], metadata)
+                count += 1
+        return count
+
+    def is_suspended(self, session_key: str) -> bool:
+        """Check if a session is currently suspended."""
+        session_dict = self._db.get_or_create_session(session_key)[0]
+        return bool(session_dict["metadata"].get("suspended"))
+
+    def is_resume_pending(self, session_key: str) -> bool:
+        """Check if a session has a pending resume flag."""
+        session_dict = self._db.get_or_create_session(session_key)[0]
+        return bool(session_dict["metadata"].get("resume_pending"))
+
     def integrity_check(self) -> List[str]:
         """Check database integrity. Returns list of errors (empty if OK)."""
         return self._db.integrity_check()

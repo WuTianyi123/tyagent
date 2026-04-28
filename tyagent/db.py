@@ -324,6 +324,27 @@ class Database:
             )
             return [row["session_key"] for row in cur.fetchall()]
 
+    def get_all_session_dicts(self) -> List[Dict[str, Any]]:
+        """Return all sessions as dicts with metadata parsed, ordered by updated_at DESC."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT session_key, created_at, updated_at, metadata "
+                "FROM sessions ORDER BY updated_at DESC"
+            )
+            return [_row_to_session(row) for row in cur.fetchall()]
+
+    def _update_session_metadata(self, session_key: str, metadata: dict) -> None:
+        """Replace the metadata of a session with the given dict.
+
+        Serializes metadata as JSON. Also updates updated_at to the current time.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = ? WHERE session_key = ?",
+                (json.dumps(metadata, ensure_ascii=False), time.time(), session_key),
+            )
+            self._conn.commit()
+
     def delete_session(self, session_key: str) -> None:
         """Delete a session and its messages (including FTS index)."""
         with self._lock:
