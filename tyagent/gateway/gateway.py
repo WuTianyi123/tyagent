@@ -485,37 +485,40 @@ class Gateway:
 
     async def _do_graceful_restart(self) -> None:
         """Perform graceful restart: notify, drain, mark sessions, exit."""
-        logger.info("Graceful restart: notifying active sessions...")
-        await self._notify_active_sessions_of_restart()
+        try:
+            logger.info("Graceful restart: notifying active sessions...")
+            await self._notify_active_sessions_of_restart()
 
-        logger.info(
-            "Graceful restart: draining up to %.0f seconds (%d active sessions)",
-            self._restart_drain_timeout,
-            len(self._active_sessions),
-        )
-        drained = await self._drain_active_agents(self._restart_drain_timeout)
-
-        if not drained:
-            logger.warning(
-                "Drain timeout reached — forcing restart with %d active session(s)",
+            logger.info(
+                "Graceful restart: draining up to %.0f seconds (%d active sessions)",
+                self._restart_drain_timeout,
                 len(self._active_sessions),
             )
+            drained = await self._drain_active_agents(self._restart_drain_timeout)
 
-        # Mark pending sessions for resume, so the new process can pick them up
-        for session_key in list(self._active_sessions):
+            if not drained:
+                logger.warning(
+                    "Drain timeout reached — forcing restart with %d active session(s)",
+                    len(self._active_sessions),
+                )
+
+            # Mark pending sessions for resume, so the new process can pick them up
+            for session_key in list(self._active_sessions):
+                try:
+                    self.session_store.mark_resume_pending(session_key, reason="restart_timeout")
+                except Exception:
+                    logger.exception("Failed to mark resume_pending for %s", session_key)
+
+            # Write .clean_shutdown marker to indicate intentional restart
             try:
-                self.session_store.mark_resume_pending(session_key, reason="restart_timeout")
-            except Exception:
-                logger.exception("Failed to mark resume_pending for %s", session_key)
-
-        # Write .clean_shutdown marker to indicate intentional restart
-        try:
-            marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text("clean", encoding="utf-8")
-            logger.info("Wrote .clean_shutdown marker at %s", marker_path)
-        except Exception as exc:
-            logger.error("Failed to write .clean_shutdown marker: %s", exc)
+                marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
+                marker_path.write_text("clean", encoding="utf-8")
+                logger.info("Wrote .clean_shutdown marker at %s", marker_path)
+            except Exception as exc:
+                logger.error("Failed to write .clean_shutdown marker: %s", exc)
+        except Exception:
+            logger.exception("Graceful restart failed unexpectedly — exiting with code 75 anyway")
 
         logger.info("Graceful restart complete — exiting with code 75")
         os._exit(75)
@@ -535,20 +538,20 @@ class Gateway:
             await asyncio.sleep(0.5)
         return True
 
-    def _notify_active_sessions_of_restart(self) -> None:
+    async def _notify_active_sessions_of_restart(self) -> None:
         """Send restart notification to all active sessions."""
         message = "⚠️ Gateway is restarting for an update. Active requests will complete before restart."
         for session_key in list(self._active_sessions):
-            # Parse adapter name from session key (format: "adapter_name:...")
-            adapter_name = session_key.split(":", 1)[0] if ":" in session_key else None
-            adapter = self.adapters.get(adapter_name)
-            if adapter is not None:
-                try:
-                    # Schedule send in the event loop
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(adapter.send_message(session_key, message))
-                except Exception:
-                    logger.exception("Failed to notify session %s", session_key)
+            try:
+                # Parse adapter name and chat_id from session key (format: "adapter_name:chat_id")
+                parts = session_key.split(":", 1)
+                adapter_name = parts[0] if len(parts) > 1 else None
+                chat_id = parts[1] if len(parts) > 1 else session_key
+                adapter = self.adapters.get(adapter_name)
+                if adapter is not None:
+                    await adapter.send_message(chat_id, message)
+            except Exception:
+                logger.exception("Failed to notify session %s", session_key)
 
     def _check_recovery_on_startup(self) -> None:
         """Check for .clean_shutdown marker and handle session recovery.
