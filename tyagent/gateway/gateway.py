@@ -348,8 +348,8 @@ class Gateway:
             try:
                 if self.session_store.is_resume_pending(session_key):
                     self.session_store.clear_resume_pending(session_key)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to clear resume_pending for %s: %s", session_key, exc)
 
         # Send response (non-streaming path only)
         result = await adapter.send_message(
