@@ -554,6 +554,8 @@ class TestGatewayDrainAndRestart:
         gw._active_sessions.add("feishu:sess2")
         gw._session_to_adapter["feishu:sess1"] = "feishu"
         gw._session_to_adapter["feishu:sess2"] = "feishu"
+        gw._active_chat_ids["feishu:sess1"] = "chat1"
+        gw._active_chat_ids["feishu:sess2"] = "chat2"
 
         await gw._notify_active_sessions_of_restart()
         assert adapter.send_message.call_count == 2

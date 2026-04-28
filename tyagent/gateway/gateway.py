@@ -119,6 +119,7 @@ class Gateway:
         self._active_sessions: set[str] = set()
         self._restart_drain_timeout: float = 60.0
         self._session_to_adapter: Dict[str, str] = {}
+        self._active_chat_ids: Dict[str, str] = {}
 
     def _load_adapters(self) -> None:
         """Load and initialize platform adapters from config."""
@@ -268,6 +269,7 @@ class Gateway:
         # Track this session as actively processing
         self._active_sessions.add(session_key)
         self._session_to_adapter[session_key] = adapter.platform_name
+        self._active_chat_ids[session_key] = event.chat_id or ""
         try:
             # Sanitize message chain (strip orphaned tool_calls at end)
             sanitized = _sanitize_message_chain(session.messages)
@@ -341,6 +343,7 @@ class Gateway:
             response = "Sorry, something went wrong."
         finally:
             self._active_sessions.discard(session_key)
+            self._active_chat_ids.pop(session_key, None)
             # Clear resume_pending flag after first resumed turn
             try:
                 if self.session_store.is_resume_pending(session_key):
@@ -553,9 +556,10 @@ class Gateway:
         for session_key in list(self._active_sessions):
             try:
                 adapter_name = self._session_to_adapter.get(session_key)
+                chat_id = self._active_chat_ids.get(session_key, "")
                 adapter = self.adapters.get(adapter_name) if adapter_name else None
-                if adapter is not None:
-                    await adapter.send_message("", message)
+                if adapter is not None and chat_id:
+                    await adapter.send_message(chat_id, message)
             except Exception:
                 logger.exception("Failed to notify session %s", session_key)
 
