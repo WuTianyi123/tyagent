@@ -639,5 +639,5 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
         raise
 
     gateway = Gateway(config)
-    gateway._setup_signal_handlers()
+    # _setup_signal_handlers is called inside gateway.start()
     await gateway.start()

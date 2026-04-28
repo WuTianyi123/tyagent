@@ -333,7 +333,7 @@ class Database:
             )
             return [_row_to_session(row) for row in cur.fetchall()]
 
-    def _update_session_metadata(self, session_key: str, metadata: dict) -> None:
+    def update_session_metadata(self, session_key: str, metadata: dict) -> None:
         """Replace the metadata of a session with the given dict.
 
         Serializes metadata as JSON. Also updates updated_at to the current time.

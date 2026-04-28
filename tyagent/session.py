@@ -257,16 +257,19 @@ class SessionStore:
     def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
         """Mark a session as ready for resume, unless it's already suspended.
 
-        Returns True if resume_pending was set, False if session is suspended.
+        Returns True if resume_pending was set, False if session doesn't exist or is suspended.
         """
-        session_dict = self._db.get_or_create_session(session_key)[0]
+        all_keys = self._db.get_all_session_keys()
+        if session_key not in all_keys:
+            return False
+        session_dict, _ = self._db.get_or_create_session(session_key)
         metadata = session_dict["metadata"]
         if metadata.get("suspended"):
             return False
         metadata["resume_pending"] = True
         metadata["resume_reason"] = reason
         metadata["resume_marked_at"] = time.time()
-        self._db._update_session_metadata(session_key, metadata)
+        self._db.update_session_metadata(session_key, metadata)
         return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
@@ -281,7 +284,7 @@ class SessionStore:
         metadata.pop("resume_pending", None)
         metadata.pop("resume_reason", None)
         metadata.pop("resume_marked_at", None)
-        self._db._update_session_metadata(session_key, metadata)
+        self._db.update_session_metadata(session_key, metadata)
         return True
 
     def suspend_session(self, session_key: str, reason: str = "crash_recovery") -> bool:
@@ -294,7 +297,7 @@ class SessionStore:
         metadata["suspended"] = True
         metadata["suspend_reason"] = reason
         metadata["suspend_at"] = time.time()
-        self._db._update_session_metadata(session_key, metadata)
+        self._db.update_session_metadata(session_key, metadata)
         return True
 
     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
@@ -317,7 +320,7 @@ class SessionStore:
                 metadata["suspended"] = True
                 metadata["suspend_reason"] = "crash_recovery"
                 metadata["suspend_at"] = time.time()
-                self._db._update_session_metadata(session_dict["session_key"], metadata)
+                self._db.update_session_metadata(session_dict["session_key"], metadata)
                 count += 1
         return count
 
