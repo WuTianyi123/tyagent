@@ -92,10 +92,10 @@ class StreamConsumer:
                         item = self._queue.get_nowait()
                         if item is _DONE:
                             got_done = True
-                            break
+                            continue  # drain remaining items first
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
-                            break
+                            continue  # drain remaining items first
                         self._accumulated += item
                     except queue.Empty:
                         break
