@@ -178,7 +178,15 @@ class TyAgent:
                         "POST", f"{self.base_url}/chat/completions",
                         json=payload, headers=headers,
                     ) as resp:
-                        resp.raise_for_status()
+                        # Read error body before context closes — streaming
+                        # responses can't be read outside the async with block.
+                        if resp.status_code >= 400:
+                            error_body = b""
+                            async for chunk in resp.aiter_raw(chunk_size=4096):
+                                error_body += chunk
+                            body_str = error_body.decode("utf-8", errors="replace")[:2000]
+                            logger.error("LLM API error: %s - %s", resp.status_code, body_str)
+                            raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
 
                         content_parts: List[str] = []
                         tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -243,8 +251,16 @@ class TyAgent:
                                 "total_tokens": usage_obj.get("total_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "total_tokens", 0),
                             }
                 except httpx.HTTPStatusError as exc:
-                    logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
-                    raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
+                    # Streaming path — errors handled inside async with block above.
+                    # This catches errors from non-streaming path only.
+                    try:
+                        body = exc.response.text
+                    except Exception:
+                        body = f"<unable to read response body>"
+                    logger.error("LLM API error: %s - %s", exc.response.status_code, body)
+                    raise AgentError(f"LLM API returned {exc.response.status_code}: {body}") from exc
+                except AgentError:
+                    raise  # Already has the error body from inside async with
                 except Exception as exc:
                     logger.exception("LLM request failed")
                     raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
@@ -267,8 +283,16 @@ class TyAgent:
                             "total_tokens": usage.get("total_tokens", 0),
                         }
                 except httpx.HTTPStatusError as exc:
-                    logger.error("LLM API error: %s - %s", exc.response.status_code, exc.response.text)
-                    raise AgentError(f"LLM API returned status {exc.response.status_code}") from exc
+                    # Streaming path — errors handled inside async with block above.
+                    # This catches errors from non-streaming path only.
+                    try:
+                        body = exc.response.text
+                    except Exception:
+                        body = f"<unable to read response body>"
+                    logger.error("LLM API error: %s - %s", exc.response.status_code, body)
+                    raise AgentError(f"LLM API returned {exc.response.status_code}: {body}") from exc
+                except AgentError:
+                    raise  # Already has the error body from inside async with
                 except Exception as exc:
                     logger.exception("LLM request failed")
                     raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc

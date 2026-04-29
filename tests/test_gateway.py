@@ -325,7 +325,7 @@ class TestSanitizeMessageChain:
     def test_no_tool_calls(self):
         msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
         result = _sanitize_message_chain(msgs)
-        assert result is msgs  # same object, no copy
+        assert result == msgs
 
     def test_complete_tool_chain_unchanged(self):
         msgs = [
@@ -335,7 +335,7 @@ class TestSanitizeMessageChain:
             {"role": "assistant", "content": "Done!"},
         ]
         result = _sanitize_message_chain(msgs)
-        assert result is msgs  # unchanged
+        assert result == msgs
 
     def test_orphan_tool_calls_at_end(self):
         msgs = [
@@ -344,10 +344,15 @@ class TestSanitizeMessageChain:
         ]
         result = _sanitize_message_chain(msgs)
         assert result is not msgs  # new list
-        assert len(result) == 2
+        # Assistant + synthetic tool response inserted = 3 messages
+        assert len(result) == 3
         assert result[1]["role"] == "assistant"
-        assert "tool_calls" not in result[1]
+        assert "tool_calls" in result[1]  # preserved
         assert result[1]["content"] == ""
+        # Synthetic tool response
+        assert result[2]["role"] == "tool"
+        assert result[2]["tool_call_id"] == "tc1"
+        assert "interrupted" in result[2]["content"]
 
     def test_orphan_tool_calls_followed_by_user(self):
         """The exact scenario from the bug report."""
@@ -360,24 +365,35 @@ class TestSanitizeMessageChain:
         ]
         result = _sanitize_message_chain(msgs)
         assert result is not msgs
-        assert len(result) == 5
-        # The tool_calls should be stripped from message [3]
+        # 5 original + 1 synthetic tool response = 6
+        assert len(result) == 6
+        # The assistant with orphaned tool_calls at [3] is preserved
         assert result[3]["role"] == "assistant"
-        assert "tool_calls" not in result[3]
+        assert "tool_calls" in result[3]
+        # Synthetic tool response inserted after the orphaned assistant
+        assert result[4]["role"] == "tool"
+        assert result[4]["tool_call_id"] == "tc2"
+        assert "interrupted" in result[4]["content"]
         # Earlier tool_calls should be preserved
         assert result[1].get("tool_calls") is not None
 
     def test_middle_orphan_stays_untouched(self):
         """Only the LAST orphan is fixed — orphan in the middle is not
         this function's concern (it would have been followed by user msg
-        which is valid from API perspective if no tool response exists)."""
+        which is valid from API perspective if no tool response exists).
+        Now we insert synthetic tool responses instead of stripping."""
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
             {"role": "user", "content": "hi"},
         ]
         result = _sanitize_message_chain(msgs)
-        # Last orphan is the one at [0] (no tool follows) — should be fixed
-        assert "tool_calls" not in result[0]
+        # Synthetic tool response inserted after the only orphan
+        assert len(result) == 3
+        assert result[0]["role"] == "assistant"
+        assert "tool_calls" in result[0]
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "t1"
+        assert result[2]["role"] == "user"
 
     def test_original_not_mutated(self):
         msgs = [

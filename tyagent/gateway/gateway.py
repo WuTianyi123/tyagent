@@ -30,12 +30,12 @@ logger = logging.getLogger(__name__)
 def _sanitize_message_chain(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Strip orphaned tool_calls from the end of the message chain.
+    """Iteratively fix message chain so it stays valid for the LLM API.
 
-    If the last assistant message has ``tool_calls`` but is not followed
-    by a ``tool`` response message (e.g. the process was killed or
-    crashed mid-tool-loop), the orphaned tool_calls are removed so the
-    chain remains valid for the LLM API.
+    Applies fixes in a loop until the chain is fully clean:
+
+    1. Removes assistant messages with neither content nor tool_calls
+    2. Inserts synthetic tool responses after orphaned tool_calls
 
     The original message objects are NOT mutated — the function returns
     a new list with copies of affected messages.
@@ -43,23 +43,47 @@ def _sanitize_message_chain(
     if not messages:
         return messages
 
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            # Check if the *next* message (if any) is a tool response
-            if i + 1 >= len(messages) or messages[i + 1].get("role") != "tool":
-                # Orphaned tool_calls — strip them
-                logger.info(
-                    "Sanitized orphaned tool_calls from assistant message [%d] "
-                    "(next message role=%s)",
-                    i,
-                    messages[i + 1].get("role", "(end of chain)") if i + 1 < len(messages) else "(end of chain)",
-                )
-                clean = dict(msg)
-                clean.pop("tool_calls", None)
-                return messages[:i] + [clean] + messages[i + 1 :]
+    result = list(messages)  # shallow copy
+    while True:
+        changed = False
+        for i in range(len(result) - 1, -1, -1):
+            msg = result[i]
 
-    return messages
+            # Fix 1: empty assistant message → remove
+            if msg.get("role") == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
+                logger.info(
+                    "Sanitized empty assistant message [%d] (no content, no tool_calls) — removing", i
+                )
+                result = result[:i] + result[i + 1:]
+                changed = True
+                break  # re-scan from end after mutation
+
+            # Fix 2: orphaned tool_calls → insert synthetic tool responses
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                if i + 1 >= len(result) or result[i + 1].get("role") != "tool":
+                    logger.info(
+                        "Sanitized orphaned tool_calls from assistant message [%d] "
+                        "(next message role=%s) — inserting synthetic tool responses",
+                        i,
+                        result[i + 1].get("role", "(end of chain)") if i + 1 < len(result) else "(end of chain)",
+                    )
+                    tool_calls = msg["tool_calls"]
+                    synthetic = []
+                    for tc in tool_calls:
+                        tc_id = tc.get("id", "unknown") if isinstance(tc, dict) else getattr(tc, "id", "unknown")
+                        synthetic.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": "(tool call interrupted — gateway restarted or crashed)",
+                        })
+                    result = result[:i + 1] + synthetic + result[i + 1:]
+                    changed = True
+                    break  # re-scan after mutation
+
+        if not changed:
+            break
+
+    return result
 
 # Registry of platform adapter classes
 _PLATFORM_REGISTRY: Dict[str, Type[BasePlatformAdapter]] = {}
@@ -258,6 +282,16 @@ class Gateway:
             )
             return "Status sent"
 
+        # Handle /restart command
+        if event.is_command() and event.get_command() == "restart":
+            await adapter.send_message(
+                event.chat_id or "",
+                "🔄 正在重启 gateway...",
+                reply_to_message_id=event.message_id,
+            )
+            os.kill(os.getpid(), signal.SIGUSR1)
+            return "Gateway restart initiated"
+
         # Build message for LLM
         user_message = event.text
         if event.media_urls:
@@ -344,7 +378,7 @@ class Gateway:
             self._sync_messages_to_session(session, sanitized, original_msg_count)
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
-            response = "Sorry, I encountered an error processing your request."
+            response = f"❌ 错误: {exc}"
         except Exception:
             logger.exception("Unexpected agent error")
             response = "Sorry, something went wrong."

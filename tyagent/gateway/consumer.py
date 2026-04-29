@@ -213,6 +213,7 @@ class StreamConsumer:
                 self._flood_strikes = 0
                 self._current_edit_interval = self._edit_interval
                 self._already_sent = True
+                logger.debug("Edit message successful (msg=%s)", self._message_id)
                 return True
             if self._is_flood_error(result.error):
                 self._flood_strikes += 1
@@ -221,25 +222,16 @@ class StreamConsumer:
                 if self._flood_strikes >= self._MAX_FLOOD_STRIKES:
                     self._edit_supported = False
                     logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)
-                    # Fall through to send_message fallback
+                    return False  # Content remains accumulated, sent on got_done
                 else:
                     return False  # Transient backoff, content not delivered
             self._edit_supported = False
-
-        # Fallback: send new message and re-enable editing for the new message
-        result = await self.adapter.send_message(self.chat_id, text)
-        if result.success:
-            self._message_id = result.message_id
-            self._already_sent = True
-            self._edit_supported = True
-            self._flood_strikes = 0
-            self._current_edit_interval = self._edit_interval
-            # Sync msg_type from the new message so subsequent edits use
-            # the correct type for this message (mirrors run() logic).
-            if hasattr(result, "msg_type") and result.msg_type:
-                self._msg_type = result.msg_type
-            return True
-        return False
+            logger.warning(
+                "Edit message failed (non-flood, not retryable): error=%s — "
+                "progressive edit disabled, final content sent on stream end",
+                result.error,
+            )
+            return False  # Content remains accumulated, sent on got_done
 
     @staticmethod
     def _is_flood_error(error: Optional[str]) -> bool:

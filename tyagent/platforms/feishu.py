@@ -1249,8 +1249,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 if resp.code == 0:
                     data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
                     msg_id = data.get("data", {}).get("message_id", "")
+                    logger.info("[Feishu] Message sent successfully (type=%s, msg_id=%s)", msg_type, msg_id)
                     return SendResult(success=True, message_id=msg_id, msg_type=msg_type)
                 else:
+                    logger.warning("[Feishu] Message send failed (type=%s): %s: %s", msg_type, resp.code, resp.msg)
                     return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
             except Exception as exc:
                 logger.exception("Failed to send Feishu message")
@@ -1326,7 +1328,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 resp = self._client.im.v1.message.patch(req)
                 if resp.code == 0:
+                    logger.info("[Feishu] Message edited successfully (msg_id=%s)", message_id)
                     return SendResult(success=True, message_id=message_id)
+                logger.warning("[Feishu] Message edit failed (msg_id=%s, type=%s): %s: %s",
+                               message_id, msg_type, resp.code, resp.msg)
                 return SendResult(success=False, error=f"{resp.code}: {resp.msg}")
             except Exception as exc:
                 logger.exception("Failed to edit Feishu message")

@@ -1,8 +1,0 @@
-fix: _sync_messages_to_session passes reasoning_content but Session.add_message expects reasoning
-
-DeepSeek responses include "reasoning_content" in the assistant message dict.
-_sync_messages_to_session was forwarding it directly as a kwarg, but
-Session.add_message() takes "reasoning" not "reasoning_content".
-
-Also fix non-streaming path by confirming agent.py already maps
-reasoning_content -> reasoning in persist_message callback.
