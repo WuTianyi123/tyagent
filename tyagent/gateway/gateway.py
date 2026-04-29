@@ -305,7 +305,6 @@ class Gateway:
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(
                     session_key, role, content,
-                    session_id=session.metadata.get("current_session_id", ""),
                     **extras
                 )
 

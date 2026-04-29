@@ -194,9 +194,7 @@ class SessionStore:
         """
         if not session_key:
             raise SessionError("session_key must not be empty")
-        session_dict, _ = self._db.get_or_create_session(session_key)
         with self._metadata_lock:
-            # Re-read under lock to ensure consistency with other threads
             session_dict, _ = self._db.get_or_create_session(session_key)
             metadata = session_dict["metadata"]
             if "current_session_id" not in metadata:
@@ -227,8 +225,9 @@ class SessionStore:
         Returns the message ID.
         """
         if not session_id:
-            session_dict, _ = self._db.get_or_create_session(session_key)
-            session_id = session_dict["metadata"].get("current_session_id", "")
+            with self._metadata_lock:
+                session_dict, _ = self._db.get_or_create_session(session_key)
+                session_id = session_dict["metadata"].get("current_session_id", "")
         return self._db.add_message(
             session_key, role, content,
             session_id=session_id,
@@ -288,7 +287,7 @@ class SessionStore:
         the same session_key). The session metadata is reset to empty.
         A new current_session_id is generated for isolation.
         """
-        session_dict = self._db.get_or_create_session_after_archive(session_key)
+        self._db.get_or_create_session_after_archive(session_key)
         with self._metadata_lock:
             sd, _ = self._db.get_or_create_session(session_key)
             metadata = sd["metadata"]

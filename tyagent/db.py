@@ -170,9 +170,15 @@ class Database:
 
             if version < 3:
                 logger.info("Upgrading database schema to v3 (session_id)")
-                self._conn.executescript(
-                    "ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT '';"
-                )
+                try:
+                    self._conn.execute(
+                        "ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" in str(exc).lower():
+                        logger.warning("session_id column already exists, skipping ALTER TABLE")
+                    else:
+                        raise
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_session "
                     "ON messages(session_key, session_id)"
