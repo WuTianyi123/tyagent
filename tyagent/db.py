@@ -21,7 +21,7 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # Chinese-capable FTS via jieba
@@ -166,6 +166,7 @@ class Database:
                 self._conn.commit()
                 # Backfill existing messages into the FTS index
                 self._backfill_fts()
+                version = 2
 
             if version < 3:
                 logger.info("Upgrading database schema to v3 (session_id)")
@@ -380,7 +381,7 @@ class Database:
 
     def _delete_messages_for_session(self, session_key: str) -> None:
         """Delete messages (incl. FTS index) for a session, keeping session row.
-        Caller must hold self._lock.
+        Caller must hold self._lock. Does NOT commit — caller manages commit.
         """
         self._conn.execute(
             "DELETE FROM messages_fts WHERE rowid IN "
@@ -390,7 +391,6 @@ class Database:
         self._conn.execute(
             "DELETE FROM messages WHERE session_key = ?", (session_key,)
         )
-        self._conn.commit()
 
     def delete_sessions_older_than(self, cutoff: float) -> int:
         """Delete all sessions with updated_at older than cutoff.
@@ -640,9 +640,9 @@ class Database:
 
                 self._conn.execute(
                     "INSERT INTO messages "
-                    "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (session_key, role, content, tool_calls_json, tc_id, reasoning, msg_ts),
+                    "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_key, role, content, tool_calls_json, tc_id, reasoning, msg_ts, f"v0_{session_key}"),
                 )
 
                 # Index into FTS5

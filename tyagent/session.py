@@ -12,6 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Union
 
 from tyagent.db import Database
@@ -140,6 +141,7 @@ class SessionStore:
             self._temp_dir = Path(tempfile.mkdtemp(prefix="tyagent_session_"))
             self._db_dir = self._temp_dir
         self._db = Database(self._db_dir / "sessions.db")
+        self._metadata_lock = Lock()
 
     def close(self) -> None:
         """Close the database and clean up temporary directories if any."""
@@ -194,12 +196,15 @@ class SessionStore:
             raise SessionError("session_key must not be empty")
         session_dict, created = self._db.get_or_create_session(session_key)
         if created:
-            # Initialize current_session_id for session isolation
-            import uuid
-            metadata = session_dict["metadata"]
-            metadata["current_session_id"] = uuid.uuid4().hex[:16]
-            self._db.update_session_metadata(session_key, metadata)
-            session_dict["metadata"] = metadata
+            with self._metadata_lock:
+                # Re-read in case another thread already initialized metadata
+                session_dict, _ = self._db.get_or_create_session(session_key)
+                metadata = session_dict["metadata"]
+                if "current_session_id" not in metadata:
+                    import uuid
+                    metadata["current_session_id"] = uuid.uuid4().hex[:16]
+                    self._db.update_session_metadata(session_key, metadata)
+                    session_dict["metadata"] = metadata
         return self._build_session(session_dict)
 
     def add_message(
@@ -264,14 +269,18 @@ class SessionStore:
         in the database with the previous session_id.
         """
         import uuid
-        session_dict, _ = self._db.get_or_create_session(session_key)
-        metadata = session_dict["metadata"]
-        # Save previous session_id for historical reference
-        old_sid = metadata.get("current_session_id", "")
-        if old_sid:
-            metadata["prev_session_id"] = old_sid
-        metadata["current_session_id"] = uuid.uuid4().hex[:16]
-        self._db.update_session_metadata(session_key, metadata)
+        with self._metadata_lock:
+            session_dict, _ = self._db.get_or_create_session(session_key)
+            metadata = session_dict["metadata"]
+            # Save previous session_id for historical reference
+            old_sid = metadata.get("current_session_id", "")
+            if old_sid:
+                metadata["prev_session_id"] = old_sid
+            else:
+                # Migrated data: no current_session_id yet, use v0 backfill id
+                metadata["prev_session_id"] = f"v0_{session_key}"
+            metadata["current_session_id"] = uuid.uuid4().hex[:16]
+            self._db.update_session_metadata(session_key, metadata)
 
     def get_or_create_after_archive(self, session_key: str) -> Session:
         """Get a fresh session after archiving the old one.
@@ -321,14 +330,15 @@ class SessionStore:
         all_keys = self._db.get_all_session_keys()
         if session_key not in all_keys:
             return False
-        session_dict, _ = self._db.get_or_create_session(session_key)
-        metadata = session_dict["metadata"]
-        if metadata.get("suspended"):
-            return False
-        metadata["resume_pending"] = True
-        metadata["resume_reason"] = reason
-        metadata["resume_marked_at"] = time.time()
-        self._db.update_session_metadata(session_key, metadata)
+        with self._metadata_lock:
+            session_dict, _ = self._db.get_or_create_session(session_key)
+            metadata = session_dict["metadata"]
+            if metadata.get("suspended"):
+                return False
+            metadata["resume_pending"] = True
+            metadata["resume_reason"] = reason
+            metadata["resume_marked_at"] = time.time()
+            self._db.update_session_metadata(session_key, metadata)
         return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
@@ -336,14 +346,15 @@ class SessionStore:
 
         Returns True if the flag was present and cleared, False otherwise.
         """
-        session_dict = self._db.get_or_create_session(session_key)[0]
-        metadata = session_dict["metadata"]
-        if "resume_pending" not in metadata:
-            return False
-        metadata.pop("resume_pending", None)
-        metadata.pop("resume_reason", None)
-        metadata.pop("resume_marked_at", None)
-        self._db.update_session_metadata(session_key, metadata)
+        with self._metadata_lock:
+            session_dict = self._db.get_or_create_session(session_key)[0]
+            metadata = session_dict["metadata"]
+            if "resume_pending" not in metadata:
+                return False
+            metadata.pop("resume_pending", None)
+            metadata.pop("resume_reason", None)
+            metadata.pop("resume_marked_at", None)
+            self._db.update_session_metadata(session_key, metadata)
         return True
 
     def suspend_session(self, session_key: str, reason: str = "crash_recovery") -> bool:
@@ -351,12 +362,13 @@ class SessionStore:
 
         Returns True.
         """
-        session_dict = self._db.get_or_create_session(session_key)[0]
-        metadata = session_dict["metadata"]
-        metadata["suspended"] = True
-        metadata["suspend_reason"] = reason
-        metadata["suspend_at"] = time.time()
-        self._db.update_session_metadata(session_key, metadata)
+        with self._metadata_lock:
+            session_dict = self._db.get_or_create_session(session_key)[0]
+            metadata = session_dict["metadata"]
+            metadata["suspended"] = True
+            metadata["suspend_reason"] = reason
+            metadata["suspend_at"] = time.time()
+            self._db.update_session_metadata(session_key, metadata)
         return True
 
     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
@@ -376,10 +388,16 @@ class SessionStore:
             if metadata.get("resume_pending") or metadata.get("suspended"):
                 continue
             if session_dict["updated_at"] >= cutoff:
-                metadata["suspended"] = True
-                metadata["suspend_reason"] = "crash_recovery"
-                metadata["suspend_at"] = time.time()
-                self._db.update_session_metadata(session_dict["session_key"], metadata)
+                with self._metadata_lock:
+                    # Re-read to avoid TOCTOU with other threads
+                    sd, _ = self._db.get_or_create_session(session_dict["session_key"])
+                    m = sd["metadata"]
+                    if m.get("resume_pending") or m.get("suspended"):
+                        continue
+                    m["suspended"] = True
+                    m["suspend_reason"] = "crash_recovery"
+                    m["suspend_at"] = time.time()
+                    self._db.update_session_metadata(sd["session_key"], m)
                 count += 1
         return count
 

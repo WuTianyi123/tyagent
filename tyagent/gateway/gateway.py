@@ -275,6 +275,7 @@ class Gateway:
         if event.is_command() and event.get_command() in normalized_triggers:
             self.session_store.archive(session_key)
             self.session_store.freshen_session(session_key)
+            session = self.session_store.get(session_key)
             await adapter.send_message(
                 event.chat_id or "",
                 "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
@@ -428,7 +429,7 @@ class Gateway:
             "📊 **tyagent Status**",
             "",
             f"**Session:** `{session_key}`",
-            f"**Messages:** {self.session_store.get_message_count(session_key)}",
+            f"**Messages:** {self.session_store.get_message_count(session_key, session_id=session.metadata.get('current_session_id', ''))}",
             f"**Created:** {created}",
             f"**Last Activity:** {updated}",
             "",
