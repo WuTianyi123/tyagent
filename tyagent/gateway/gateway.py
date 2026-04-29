@@ -60,23 +60,30 @@ def _sanitize_message_chain(
 
             # Fix 2: orphaned tool_calls → insert synthetic tool responses
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                if i + 1 >= len(result) or result[i + 1].get("role") != "tool":
+                # Count how many tool responses follow this assistant message.
+                # If fewer than tool_calls, insert synthetic responses for the missing ones.
+                tool_calls = msg["tool_calls"]
+                n_expected = len(tool_calls)
+                n_actual = 0
+                j = i + 1
+                while j < len(result) and result[j].get("role") == "tool":
+                    n_actual += 1
+                    j += 1
+                if n_actual < n_expected:
                     logger.info(
                         "Sanitized orphaned tool_calls from assistant message [%d] "
-                        "(next message role=%s) — inserting synthetic tool responses",
-                        i,
-                        result[i + 1].get("role", "(end of chain)") if i + 1 < len(result) else "(end of chain)",
+                        "(%d tool_calls, only %d tool responses) — inserting %d synthetic",
+                        i, n_expected, n_actual, n_expected - n_actual,
                     )
-                    tool_calls = msg["tool_calls"]
                     synthetic = []
-                    for tc in tool_calls:
+                    for tc in tool_calls[n_actual:]:  # only the missing ones
                         tc_id = tc.get("id", "unknown") if isinstance(tc, dict) else getattr(tc, "id", "unknown")
                         synthetic.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "content": "(tool call interrupted — gateway restarted or crashed)",
                         })
-                    result = result[:i + 1] + synthetic + result[i + 1:]
+                    result = result[:i + 1 + n_actual] + synthetic + result[i + 1 + n_actual:]
                     changed = True
                     break  # re-scan after mutation
 
