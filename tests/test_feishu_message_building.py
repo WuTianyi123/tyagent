@@ -125,6 +125,56 @@ def test_convert_tables_to_code_blocks_trailing_newline():
     assert "```\n| C1 | C2 |" in result
 
 
+def test_convert_tables_to_code_blocks_and_fence_interaction():
+    """Table after a fenced code block — both fences should coexist."""
+    text = "前文\n\n```python\nprint(1)\n```\n\n| C1 | C2 |\n|---|---|\n| A | B |\n\n后文"
+    converted = _convert_tables_to_code_blocks(text)
+    # Table should be code-fenced
+    assert "```\n| C1 | C2 |" in converted
+    # Original code block should remain intact
+    assert "```python\nprint(1)" in converted
+    # The combined content should pass through markdown post builder cleanly
+    rows = _build_markdown_post_rows(converted)
+    # 5 rows: 前文, code fence open/close, fence separator row, table code, 后文
+    assert len(rows) >= 4, f"Expected 4+ rows, got {len(rows)}: {rows}"
+    assert "前文" in rows[0][0]["text"]
+    assert "print(1)" in rows[1][0]["text"] or any("print(1)" in r[0]["text"] for r in rows)
+    assert "| C1 | C2 |" in " ".join(r[0]["text"] for r in rows), "Table should exist in some row"
+
+
+def test_convert_tables_to_code_blocks_table_after_code_block():
+    """Table immediately after a code block (no blank line)."""
+    text = "```\ncode\n```\n| C1 | C2 |\n|---|---|\n| A | B |"
+    converted = _convert_tables_to_code_blocks(text)
+    assert "```\ncode\n```" in converted
+    assert "```\n| C1 | C2 |" in converted
+    # _build_markdown_post_rows should handle adjacent fences correctly
+    rows = _build_markdown_post_rows(converted)
+    table_seen = any("| C1 | C2 |" in r[0]["text"] for r in rows)
+    code_seen = any("code" in r[0]["text"] for r in rows)
+    assert code_seen, "Code block content should be present"
+    assert table_seen, "Table content should be present"
+
+
+def test_convert_tables_to_code_blocks_code_before_table():
+    """Code block after a markdown table — table should still be fenced."""
+    text = "| C1 | C2 |\n|---|---|\n| A | B |\n\n```\ncode\n```"
+    converted = _convert_tables_to_code_blocks(text)
+    # Table should be fully wrapped: header + separator + data rows
+    assert "```\n| C1 | C2 |\n" in converted, "Table header should be inside code fence"
+    assert "| A | B |\n```" in converted, "Data rows should end the table code fence"
+    # Existing code block should still be intact
+    assert "```\ncode\n```" in converted
+    # Both should coexist: two separate code blocks
+    assert converted.count("```") == 4, f"Two code blocks should have 2x ``` pairs, got {converted.count('```')}"
+    # _build_markdown_post_rows should handle both fences correctly
+    result = _build_markdown_post_rows(converted)
+    table_seen = any("| C1 | C2 |" in r[0]["text"] for r in result)
+    code_seen = any("code" in r[0]["text"] for r in result)
+    assert table_seen
+    assert code_seen
+
+
 def test_fence_boundary_4_backticks():
     """4-backtick fence should not be closed by inner 3-backtick line."""
     content = "text before\n````python\ninner ```\n````\ntext after"
@@ -231,6 +281,9 @@ if __name__ == "__main__":
         test_convert_tables_to_code_blocks_table_with_bold,
         test_convert_tables_to_code_blocks_no_table,
         test_convert_tables_to_code_blocks_trailing_newline,
+        test_convert_tables_to_code_blocks_and_fence_interaction,
+        test_convert_tables_to_code_blocks_table_after_code_block,
+        test_convert_tables_to_code_blocks_code_before_table,
         test_fence_boundary_4_backticks,
         test_fence_boundary_tilde,
         test_fence_boundary_mixed_fences,

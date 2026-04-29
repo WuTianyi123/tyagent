@@ -99,14 +99,12 @@ _MARKDOWN_HINT_RE = re.compile(
 # Detect markdown tables: a line starting with | followed by a separator line.
 # Feishu post-type 'md' elements do not render tables, so we force text mode.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
-_MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
-_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 
 # Match a complete markdown table: header row + separator row + optional data rows.
 # A table ends at a blank line, a non-table line, or end of text.
 _TABLE_BLOCK_RE = re.compile(
-    r"^(\|.+\|\n\|[-|: ]+\|\n?)(?:\|.+\|\n?)*",
+    r"^(\|(?:[^|\n]+\|)+\n\|[-|: ]+\|\n?)(?:\|(?:[^|\n]+\|)+\n?)*",
     re.MULTILINE,
 )
 
