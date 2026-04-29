@@ -1,10 +1,24 @@
-fix: address review findings round 4 — three medium issues
+fix: complete streaming editing reliability overhaul
 
-1. edit_message: add table→code-block conversion in post branch
-   (mirrors _build_outbound_payload's logic for explicit msg_type="post")
-2. consumer.py: sync _msg_type after fallback send_message
-   (prevents stale msg_type on the new message)
-3. _TABLE_BLOCK_RE: support empty cells ([^|\n]+ → [^|\n]*)
-4. Add 5 new edge-case tests: single column, empty cells, empty data rows
+Four problems addressed in this session:
 
-Tests: 22 → 27 (all pass)
+1. Table content renders blank / msg_type mismatch on edit (P2)
+   - _build_outbound_payload: detect tables -> convert to ``` code blocks -> return "post"
+     (instead of forcing "text" and losing bold/lists/code formatting)
+   - edit_message post branch mirrors the table conversion logic
+   - _TABLE_BLOCK_RE supports empty cells ([^|\n]+ -> [^|\n]*)
+   - Removed dead code _MARKDOWN_FENCE_OPEN_RE / _MARKDOWN_FENCE_CLOSE_RE
+
+2. _edit_supported permanently disabled after edit failure (P1)
+   - _try_edit fallback: send new message, re-enable editing, sync _msg_type
+   - Flood control: < MAX backoff (return False), >= MAX fall through to send_message
+   - _try_edit returns bool so got_done / CancelledError paths can re-fallback
+
+3. reply_to_message_id not passed in streaming (already fixed)
+   - StreamConsumer.__init__ accepts reply_to_message_id
+   - Both send_message calls pass it
+
+4. consumer_task exception swallowing (already fixed)
+   - CancelledError silently caught, other exceptions re-raised
+
+Tests: 13 -> 27 (all pass), 405 total

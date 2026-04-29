@@ -152,7 +152,13 @@ class StreamConsumer:
                     # Final send without cursor
                     if self._accumulated:
                         if self._message_id:
-                            await self._try_edit(self._accumulated)
+                            delivered = await self._try_edit(self._accumulated)
+                            if not delivered:
+                                # Flood backoff skipped content — send as new message
+                                result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
+                                if result.success:
+                                    self._message_id = result.message_id
+                                    self._already_sent = True
                         elif not self._already_sent:
                             result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
                             if result.success:
@@ -166,7 +172,11 @@ class StreamConsumer:
         except asyncio.CancelledError:
             if self._accumulated and self._message_id:
                 try:
-                    await self._try_edit(self._accumulated)
+                    delivered = await self._try_edit(self._accumulated)
+                    if not delivered:
+                        result = await self.adapter.send_message(self.chat_id, self._accumulated)
+                        if result.success:
+                            self._message_id = result.message_id
                 except Exception:
                     pass
             self.final_content = self._accumulated
@@ -176,8 +186,12 @@ class StreamConsumer:
             self.final_content = self._accumulated
             return self.final_content
 
-    async def _try_edit(self, text: str, *, add_cursor: bool = False, safe_limit: int = 0) -> None:
-        """Try to edit platform message with flood control protection."""
+    async def _try_edit(self, text: str, *, add_cursor: bool = False, safe_limit: int = 0) -> bool:
+        """Try to edit platform message with flood control protection.
+
+        Returns True if content was delivered (via edit or fallback send_message),
+        False if content could not be delivered (transient flood backoff or failed fallback).
+        """
         if safe_limit > 0 and len(text) > safe_limit:
             logger.warning(
                 "_try_edit text exceeds safe limit (%d > %d), truncating",
@@ -187,7 +201,7 @@ class StreamConsumer:
         if add_cursor:
             text = text + " ▉"
         if self._message_id and text == self._last_sent_text:
-            return
+            return True  # Already delivered
         self._last_sent_text = text
 
         if self._message_id and self._edit_supported:
@@ -199,7 +213,7 @@ class StreamConsumer:
                 self._flood_strikes = 0
                 self._current_edit_interval = self._edit_interval
                 self._already_sent = True
-                return
+                return True
             if self._is_flood_error(result.error):
                 self._flood_strikes += 1
                 self._current_edit_interval = min(self._current_edit_interval * 2, 10.0)
@@ -207,7 +221,9 @@ class StreamConsumer:
                 if self._flood_strikes >= self._MAX_FLOOD_STRIKES:
                     self._edit_supported = False
                     logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)
-                return
+                    # Fall through to send_message fallback
+                else:
+                    return False  # Transient backoff, content not delivered
             self._edit_supported = False
 
         # Fallback: send new message and re-enable editing for the new message
@@ -217,10 +233,13 @@ class StreamConsumer:
             self._already_sent = True
             self._edit_supported = True
             self._flood_strikes = 0
+            self._current_edit_interval = self._edit_interval
             # Sync msg_type from the new message so subsequent edits use
             # the correct type for this message (mirrors run() logic).
             if hasattr(result, "msg_type") and result.msg_type:
                 self._msg_type = result.msg_type
+            return True
+        return False
 
     @staticmethod
     def _is_flood_error(error: Optional[str]) -> bool:
