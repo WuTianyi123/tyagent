@@ -190,10 +190,17 @@ class Gateway:
             return
         new_messages = sanitized[original_count:]
         for msg in new_messages:
+            kwargs = {}
+            for k in ("tool_calls", "tool_call_id", "reasoning"):
+                if k in msg:
+                    kwargs[k] = msg[k]
+            # DeepSeek uses "reasoning_content" instead of "reasoning"
+            if "reasoning_content" in msg:
+                kwargs["reasoning"] = msg["reasoning_content"]
             session.add_message(
                 msg.get("role", "assistant"),
                 msg.get("content"),
-                **{k: msg[k] for k in ("tool_calls", "tool_call_id", "reasoning", "reasoning_content") if k in msg},
+                **kwargs,
             )
 
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
