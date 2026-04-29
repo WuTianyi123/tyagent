@@ -43,8 +43,16 @@ class Session:
 
     @property
     def messages(self) -> List[Dict[str, Any]]:
-        """Get all messages for this session from the database."""
+        """Get all messages for this session from the database.
+
+        Only messages with the current session_id are returned.
+        This enables session isolation — /new generates a fresh session_id
+        so old messages are excluded without being deleted.
+        """
         if self._store is not _UNSET:
+            current_sid = self.metadata.get("current_session_id", "")
+            if current_sid:
+                return self._store.get_messages(self.session_key, session_id=current_sid)
             return self._store.get_messages(self.session_key)
         return []
 
@@ -59,6 +67,9 @@ class Session:
     ) -> int:
         """Append a message to this session. Persisted immediately.
 
+        Messages are tagged with the current session_id (from metadata)
+        for isolation across /new boundaries.
+
         Returns the message ID.
 
         Raises:
@@ -69,8 +80,10 @@ class Session:
                 "Session has no store backing — use SessionStore.get() "
                 "or SessionStore.add_message() instead."
             )
+        current_sid = self.metadata.get("current_session_id", "")
         msg_id = self._store.add_message(
             self.session_key, role, content,
+            session_id=current_sid,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning=reasoning,
@@ -171,12 +184,22 @@ class SessionStore:
 
         Returns a Session object with lazy message loading via .messages property.
 
+        On first creation, generates a current_session_id UUID so messages
+        are properly isolated by session identity.
+
         Raises:
             SessionError: If session_key is empty.
         """
         if not session_key:
             raise SessionError("session_key must not be empty")
-        session_dict, _ = self._db.get_or_create_session(session_key)
+        session_dict, created = self._db.get_or_create_session(session_key)
+        if created:
+            # Initialize current_session_id for session isolation
+            import uuid
+            metadata = session_dict["metadata"]
+            metadata["current_session_id"] = uuid.uuid4().hex[:16]
+            self._db.update_session_metadata(session_key, metadata)
+            session_dict["metadata"] = metadata
         return self._build_session(session_dict)
 
     def add_message(
@@ -185,34 +208,70 @@ class SessionStore:
         role: str,
         content: Optional[str] = "",
         *,
+        session_id: str = "",
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         tool_call_id: Optional[str] = None,
         reasoning: Optional[str] = None,
     ) -> int:
         """Append a message to a session. Persisted immediately.
+
+        If session_id is not provided, auto-injects the current session's
+        current_session_id from metadata for isolation.
+
+        Args:
+            session_id: Logical session identifier for isolation.
         Returns the message ID.
         """
+        if not session_id:
+            session_dict, _ = self._db.get_or_create_session(session_key)
+            session_id = session_dict["metadata"].get("current_session_id", "")
         return self._db.add_message(
             session_key, role, content,
+            session_id=session_id,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning=reasoning,
         )
 
-    def get_messages(self, session_key: str) -> List[Dict[str, Any]]:
-        """Get all messages for a session, ordered by creation time."""
-        return self._db.get_messages(session_key)
+    def get_messages(self, session_key: str, session_id: str = "") -> List[Dict[str, Any]]:
+        """Get all messages for a session, ordered by creation time.
 
-    def get_message_count(self, session_key: str) -> int:
-        """Return the number of messages in a session."""
-        return self._db.get_message_count(session_key)
+        Args:
+            session_key: The session key.
+            session_id: Optional filter — only messages with this session_id
+                        are returned. Used for session isolation on /new.
+        """
+        return self._db.get_messages(session_key, session_id=session_id)
+
+    def get_message_count(self, session_key: str, session_id: str = "") -> int:
+        """Return the number of messages in a session (optionally filtered by session_id)."""
+        return self._db.get_message_count(session_key, session_id=session_id)
 
     def archive(self, session_key: str) -> None:
         """Archive a session: mark as archived in metadata.
 
         The session's messages remain in the database.
+        Also saves the previous session_start so the archived state
+        can be distinguished from the fresh one.
         """
         self._db.archive_session(session_key)
+
+    def freshen_session(self, session_key: str) -> None:
+        """Reset a session to a fresh state while preserving old messages.
+
+        Generates a new current_session_id so subsequent .messages loads
+        only return messages tagged with the new ID. Old messages remain
+        in the database with the previous session_id.
+        """
+        import uuid
+        session_dict, _ = self._db.get_or_create_session(session_key)
+        metadata = session_dict["metadata"]
+        # Save previous session_id for historical reference
+        old_sid = metadata.get("current_session_id", "")
+        if old_sid:
+            metadata["prev_session_id"] = old_sid
+        metadata["current_session_id"] = uuid.uuid4().hex[:16]
+        self._db.update_session_metadata(session_key, metadata)
 
     def get_or_create_after_archive(self, session_key: str) -> Session:
         """Get a fresh session after archiving the old one.

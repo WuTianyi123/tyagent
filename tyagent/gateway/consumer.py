@@ -59,6 +59,8 @@ class StreamConsumer:
         self._current_edit_interval: float = 1.0
         self.final_content: str = ""
         self._already_sent: bool = False
+        self._edit_permanently_disabled: bool = False
+        self._fallback_prefix: str = ""  # Text already visible when fallback starts; tail-only on got_done
         self._reply_to_message_id = reply_to_message_id
 
     def on_delta(self, text: str) -> None:
@@ -92,10 +94,10 @@ class StreamConsumer:
                         item = self._queue.get_nowait()
                         if item is _DONE:
                             got_done = True
-                            continue  # drain remaining items first
+                            break  # stop draining — content after DONE is not part of this stream
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
-                            continue  # drain remaining items first
+                            break  # stop draining — content after segment break belongs to next segment
                         self._accumulated += item
                     except queue.Empty:
                         break
@@ -140,28 +142,66 @@ class StreamConsumer:
                     else:
                         # Edit existing message
                         display = self._accumulated
-                        await self._try_edit(display, add_cursor=not got_done)
+                        try:
+                            delivered = await self._try_edit(display, add_cursor=not got_done)
+                            if not delivered:
+                                # Only create new message if edit failure was transient (flood).
+                                # For permanent failures (e.g., platform doesn't support editing),
+                                # let content accumulate until got_done/got_segment_break.
+                                if not self._edit_permanently_disabled:
+                                    display_with_cursor = display + (" ▉" if not got_done else "")
+                                    result = await self.adapter.send_message(self.chat_id, display_with_cursor, reply_to_message_id=self._reply_to_message_id)
+                                    if result.success:
+                                        self._message_id = result.message_id
+                                        self._already_sent = True
+                                        self._last_sent_text = display_with_cursor
+                                        self._edit_supported = True
+                                        self._flood_strikes = 0
+                                        if hasattr(result, "msg_type") and result.msg_type:
+                                            self._msg_type = result.msg_type
+                        except Exception:
+                            logger.exception("Edit failed with exception, content: %d chars", len(display))
+                            if not self._edit_permanently_disabled:
+                                try:
+                                    display_with_cursor = display + (" ▉" if not got_done else "")
+                                    result = await self.adapter.send_message(
+                                        self.chat_id, display_with_cursor,
+                                        reply_to_message_id=self._reply_to_message_id,
+                                    )
+                                    if result.success:
+                                        self._message_id = result.message_id
+                                        self._already_sent = True
+                                        self._last_sent_text = display_with_cursor
+                                        self._edit_supported = True
+                                        self._flood_strikes = 0
+                                except Exception:
+                                    pass
                     self._last_edit_time = time.monotonic()
 
                 # Segment break: finalize current message
-                if got_segment_break:
-                    self._message_id = None
-                    self._accumulated = ""
-                    self._edit_supported = True
-                    self._flood_strikes = 0
-                    self._current_edit_interval = self._edit_interval
-
                 if got_done:
                     # Final send without cursor
                     if self._accumulated:
                         if self._message_id:
                             delivered = await self._try_edit(self._accumulated)
                             if not delivered:
-                                # Flood backoff skipped content — send as new message
-                                result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
-                                if result.success:
-                                    self._message_id = result.message_id
-                                    self._already_sent = True
+                                # Edit failed — send remaining content as new message.
+                                # When _edit_permanently_disabled, send only the tail
+                                # (content the user hasn't seen yet) to avoid duplicate.
+                                if self._edit_permanently_disabled and self._fallback_prefix and self._accumulated.startswith(self._fallback_prefix):
+                                    tail = self._accumulated[len(self._fallback_prefix):].lstrip()
+                                    if tail:
+                                        result = await self.adapter.send_message(self.chat_id, tail, reply_to_message_id=self._reply_to_message_id)
+                                        if result.success:
+                                            self._message_id = result.message_id
+                                            self._already_sent = True
+                                            self._last_sent_text = self._accumulated
+                                else:
+                                    result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
+                                    if result.success:
+                                        self._message_id = result.message_id
+                                        self._already_sent = True
+                                        self._last_sent_text = self._accumulated
                         elif not self._already_sent:
                             result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
                             if result.success:
@@ -170,18 +210,33 @@ class StreamConsumer:
                     self.final_content = self._accumulated
                     return self.final_content
 
+                if got_segment_break:
+                    self._message_id = None
+                    self._accumulated = ""
+                    self._already_sent = False
+                    self._edit_supported = True
+                    self._edit_permanently_disabled = False
+                    self._fallback_prefix = ""
+                    self._flood_strikes = 0
+                    self._current_edit_interval = self._edit_interval
                 await asyncio.sleep(0.05)
 
         except asyncio.CancelledError:
-            if self._accumulated and self._message_id:
-                try:
-                    delivered = await self._try_edit(self._accumulated)
-                    if not delivered:
-                        result = await self.adapter.send_message(self.chat_id, self._accumulated)
-                        if result.success:
-                            self._message_id = result.message_id
-                except Exception:
-                    pass
+            if self._accumulated:
+                if self._message_id:
+                    try:
+                        delivered = await self._try_edit(self._accumulated)
+                        if not delivered:
+                            result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
+                            if result.success:
+                                self._message_id = result.message_id
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
+                    except Exception:
+                        pass
             self.final_content = self._accumulated
             return self.final_content
         except Exception as e:
@@ -229,10 +284,19 @@ class StreamConsumer:
                 else:
                     return False  # Transient backoff, content not delivered
             self._edit_supported = False
+            # 230072 = "edit count exhausted for this message"
+            # This is NOT permanently disabled — a new message CAN be edited.
+            # Only set _edit_permanently_disabled for errors that fundamentally
+            # prevent editing (e.g., API doesn't support editing this message type).
+            if "230072" not in (result.error or ""):
+                self._edit_permanently_disabled = True
+                # Save what the user has already seen, so final fallback sends only the tail
+                self._fallback_prefix = (self._last_sent_text or "").rstrip(" ▉")
             logger.warning(
                 "Edit message failed (non-flood, not retryable): error=%s — "
-                "progressive edit disabled, final content sent on stream end",
+                "progressive edit %s, final content sent on stream end",
                 result.error,
+                "permanently disabled" if self._edit_permanently_disabled else "disabled for this message only",
             )
             return False  # Content remains accumulated, sent on got_done
 

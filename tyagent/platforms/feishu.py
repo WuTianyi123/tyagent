@@ -1313,19 +1313,22 @@ class FeishuAdapter(BasePlatformAdapter):
 
         def _do_edit() -> SendResult:
             try:
-                from lark_oapi.api.im.v1.model import PatchMessageRequest, PatchMessageRequestBody
+                from lark_oapi.api.im.v1.model import (
+                    UpdateMessageRequest,
+                    UpdateMessageRequestBody,
+                )
 
-                body = PatchMessageRequestBody()
+                body = UpdateMessageRequestBody()
                 body.content = payload
                 body.msg_type = msg_type
 
                 req = (
-                    PatchMessageRequest.builder()
+                    UpdateMessageRequest.builder()
                     .message_id(message_id)
                     .request_body(body)
                     .build()
                 )
-                resp = self._client.im.v1.message.patch(req)
+                resp = self._client.im.v1.message.update(req)
                 if resp.code == 0:
                     logger.info("[Feishu] Message edited successfully (msg_id=%s)", message_id)
                     return SendResult(success=True, message_id=message_id)

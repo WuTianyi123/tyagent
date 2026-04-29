@@ -167,6 +167,30 @@ class Database:
                 # Backfill existing messages into the FTS index
                 self._backfill_fts()
 
+            if version < 3:
+                logger.info("Upgrading database schema to v3 (session_id)")
+                self._conn.executescript(
+                    "ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT '';"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                    "ON messages(session_key, session_id)"
+                )
+                # Backfill: assign stable session_id per session_key
+                cur = self._conn.execute(
+                    "SELECT DISTINCT session_key FROM sessions"
+                )
+                for row in cur.fetchall():
+                    sk = row["session_key"]
+                    sid = f"v0_{sk}"
+                    self._conn.execute(
+                        "UPDATE messages SET session_id = ? WHERE session_key = ?",
+                        (sid, sk),
+                    )
+                self._conn.execute("PRAGMA user_version = 3")
+                self._conn.commit()
+                version = 3
+
     # ------------------------------------------------------------------
     # FTS backfill
     # ------------------------------------------------------------------
@@ -348,19 +372,25 @@ class Database:
     def delete_session(self, session_key: str) -> None:
         """Delete a session and its messages (including FTS index)."""
         with self._lock:
-            # Delete FTS entries for this session's messages
-            self._conn.execute(
-                "DELETE FROM messages_fts WHERE rowid IN "
-                "(SELECT id FROM messages WHERE session_key = ?)",
-                (session_key,),
-            )
-            self._conn.execute(
-                "DELETE FROM messages WHERE session_key = ?", (session_key,)
-            )
+            self._delete_messages_for_session(session_key)
             self._conn.execute(
                 "DELETE FROM sessions WHERE session_key = ?", (session_key,)
             )
             self._conn.commit()
+
+    def _delete_messages_for_session(self, session_key: str) -> None:
+        """Delete messages (incl. FTS index) for a session, keeping session row.
+        Caller must hold self._lock.
+        """
+        self._conn.execute(
+            "DELETE FROM messages_fts WHERE rowid IN "
+            "(SELECT id FROM messages WHERE session_key = ?)",
+            (session_key,),
+        )
+        self._conn.execute(
+            "DELETE FROM messages WHERE session_key = ?", (session_key,)
+        )
+        self._conn.commit()
 
     def delete_sessions_older_than(self, cutoff: float) -> int:
         """Delete all sessions with updated_at older than cutoff.
@@ -399,6 +429,7 @@ class Database:
         role: str,
         content: str = "",
         *,
+        session_id: str = "",
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         tool_call_id: Optional[str] = None,
         reasoning: Optional[str] = None,
@@ -408,6 +439,11 @@ class Database:
         Also indexes the message content into the FTS5 full-text search table.
         If the session does not exist, it is automatically created.
         Also updates the session's updated_at timestamp.
+
+        Args:
+            session_id: Logical session identifier for isolation.
+                        Messages are grouped by session_id so /new can
+                        create a fresh context without deleting data.
         """
         with self._lock:
             now = time.time()
@@ -425,8 +461,8 @@ class Database:
             )
             self._conn.execute(
                 "INSERT INTO messages "
-                "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_key,
                     role,
@@ -435,6 +471,7 @@ class Database:
                     tool_call_id,
                     reasoning,
                     now,
+                    session_id,
                 ),
             )
             cur = self._conn.execute("SELECT last_insert_rowid()")
@@ -456,25 +493,44 @@ class Database:
             return rowid
 
     def get_messages(
-        self, session_key: str
+        self, session_key: str, session_id: str = ""
     ) -> List[Dict[str, Any]]:
-        """Get all messages for a session, ordered by creation time."""
+        """Get messages for a session (optionally filtered by session_id).
+
+        When session_id is provided, only messages with that session_id are
+        returned. This enables session-level isolation: /new creates a fresh
+        session_id so old messages are excluded without being deleted.
+        """
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT role, content, tool_calls, tool_call_id, reasoning, created_at "
-                "FROM messages WHERE session_key = ? "
-                "ORDER BY created_at ASC, id ASC",
-                (session_key,),
-            )
+            if session_id:
+                cur = self._conn.execute(
+                    "SELECT role, content, tool_calls, tool_call_id, reasoning, created_at "
+                    "FROM messages WHERE session_key = ? AND session_id = ? "
+                    "ORDER BY created_at ASC, id ASC",
+                    (session_key, session_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT role, content, tool_calls, tool_call_id, reasoning, created_at "
+                    "FROM messages WHERE session_key = ? "
+                    "ORDER BY created_at ASC, id ASC",
+                    (session_key,),
+                )
             return [_row_to_message(row) for row in cur.fetchall()]
 
-    def get_message_count(self, session_key: str) -> int:
-        """Return the number of messages in a session."""
+    def get_message_count(self, session_key: str, session_id: str = "") -> int:
+        """Return the number of messages in a session (optionally filtered by session_id)."""
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT COUNT(*) as cnt FROM messages WHERE session_key = ?",
-                (session_key,),
-            )
+            if session_id:
+                cur = self._conn.execute(
+                    "SELECT COUNT(*) as cnt FROM messages WHERE session_key = ? AND session_id = ?",
+                    (session_key, session_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT COUNT(*) as cnt FROM messages WHERE session_key = ?",
+                    (session_key,),
+                )
             return cur.fetchone()["cnt"]
 
     # ------------------------------------------------------------------

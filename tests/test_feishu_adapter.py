@@ -62,18 +62,17 @@ async def test_edit_message_returns_failure_when_client_not_initialized(adapter)
 
 
 # ---------------------------------------------------------------------------
-# Tests: edit_message calls PATCH API correctly
+# Tests: edit_message calls UPDATE API correctly
 # ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
-async def test_edit_message_calls_patch_api_with_text_msg_type(adapter):
-    """Edit with text message should call the PATCH API."""
+async def test_edit_message_calls_update_api_with_text_msg_type(adapter):
+    """Edit with text message should call the UPDATE API."""
     mock_resp = MagicMock()
     mock_resp.code = 0
     mock_resp.msg = "success"
 
-    mock_patch = MagicMock(return_value=mock_resp)
-    adapter._client.im.v1.message.patch = mock_patch
+    mock_update = MagicMock(return_value=mock_resp)
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -83,9 +82,9 @@ async def test_edit_message_calls_patch_api_with_text_msg_type(adapter):
 
     assert result.success is True
     assert result.message_id == "om_xxx"
-    mock_patch.assert_called_once()
+    mock_update.assert_called_once()
     # Verify the request was built correctly (check args of the call)
-    args, kwargs = mock_patch.call_args
+    args, kwargs = mock_update.call_args
     req = args[0]
     assert req.message_id == "om_xxx"
     assert req.request_body.msg_type == "text"
@@ -93,14 +92,14 @@ async def test_edit_message_calls_patch_api_with_text_msg_type(adapter):
 
 
 @pytest.mark.asyncio
-async def test_edit_message_calls_patch_api_with_specified_msg_type(adapter):
+async def test_edit_message_calls_update_api_with_specified_msg_type(adapter):
     """Edit with explicit msg_type should use that type."""
     mock_resp = MagicMock()
     mock_resp.code = 0
     mock_resp.msg = "success"
 
-    mock_patch = MagicMock(return_value=mock_resp)
-    adapter._client.im.v1.message.patch = mock_patch
+    mock_update = MagicMock(return_value=mock_resp)
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -110,7 +109,7 @@ async def test_edit_message_calls_patch_api_with_specified_msg_type(adapter):
     )
 
     assert result.success is True
-    args, kwargs = mock_patch.call_args
+    args, kwargs = mock_update.call_args
     req = args[0]
     assert req.request_body.msg_type == "post"
     assert "Updated content" in req.request_body.content
@@ -123,8 +122,8 @@ async def test_edit_message_returns_message_id_on_success(adapter):
     mock_resp.code = 0
     mock_resp.msg = "success"
 
-    mock_patch = MagicMock(return_value=mock_resp)
-    adapter._client.im.v1.message.patch = mock_patch
+    mock_update = MagicMock(return_value=mock_resp)
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -143,8 +142,8 @@ async def test_edit_message_returns_error_on_api_failure(adapter):
     mock_resp.code = 100003
     mock_resp.msg = "invalid message_id"
 
-    mock_patch = MagicMock(return_value=mock_resp)
-    adapter._client.im.v1.message.patch = mock_patch
+    mock_update = MagicMock(return_value=mock_resp)
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -164,8 +163,8 @@ async def test_edit_message_with_markdown_content(adapter):
     mock_resp.code = 0
     mock_resp.msg = "success"
 
-    mock_patch = MagicMock(return_value=mock_resp)
-    adapter._client.im.v1.message.patch = mock_patch
+    mock_update = MagicMock(return_value=mock_resp)
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -174,7 +173,7 @@ async def test_edit_message_with_markdown_content(adapter):
     )
 
     assert result.success is True
-    args, kwargs = mock_patch.call_args
+    args, kwargs = mock_update.call_args
     req = args[0]
     assert req.request_body.msg_type == "post"
 
@@ -182,10 +181,10 @@ async def test_edit_message_with_markdown_content(adapter):
 @pytest.mark.asyncio
 async def test_edit_message_handles_exception(adapter):
     """Runtime exception during edit should be caught and returned as error."""
-    mock_patch = MagicMock(
+    mock_update = MagicMock(
         side_effect=RuntimeError("Connection failed")
     )
-    adapter._client.im.v1.message.patch = mock_patch
+    adapter._client.im.v1.message.update = mock_update
 
     result = await adapter.edit_message(
         chat_id="oc_xxx",
@@ -203,8 +202,8 @@ if __name__ == "__main__":
 
     tests = [
         test_edit_message_returns_failure_when_client_not_initialized,
-        test_edit_message_calls_patch_api_with_text_msg_type,
-        test_edit_message_calls_patch_api_with_specified_msg_type,
+        test_edit_message_calls_update_api_with_text_msg_type,
+        test_edit_message_calls_update_api_with_specified_msg_type,
         test_edit_message_returns_message_id_on_success,
         test_edit_message_returns_error_on_api_failure,
         test_edit_message_with_markdown_content,

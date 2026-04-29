@@ -274,6 +274,7 @@ class Gateway:
         normalized_triggers = {t.lstrip("/").lower() for t in self.config.reset_triggers}
         if event.is_command() and event.get_command() in normalized_triggers:
             self.session_store.archive(session_key)
+            self.session_store.freshen_session(session_key)
             await adapter.send_message(
                 event.chat_id or "",
                 "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
@@ -337,7 +338,9 @@ class Gateway:
             # Define the persistence callback for tool loop messages
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(
-                    session_key, role, content, **extras
+                    session_key, role, content,
+                    session_id=session.metadata.get("current_session_id", ""),
+                    **extras
                 )
 
             agent = self._get_or_create_agent(session_key)

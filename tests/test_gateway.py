@@ -157,11 +157,17 @@ class TestOnMessage:
         result = await gw._on_message(event)
 
         assert result == "Session archived"
-        # After archive, get_or_create_after_archive gives fresh session
-        fresh = gw.session_store.get_or_create_after_archive("feishu:chat1")
-        assert fresh.session_key == "feishu:chat1"
-        # Old messages still in DB
-        assert gw.session_store.get_message_count("feishu:chat1") == 1
+        # Old session preserved with its messages
+        old = gw.session_store.get("feishu:chat1")
+        assert old.session_key == "feishu:chat1"
+        # Old messages still in DB (visible via get_message_count without filter)
+        all_count = gw.session_store.get_message_count("feishu:chat1")
+        assert all_count == 1
+        # But session.messages (filtered by current_session_id) shows 0
+        assert len(old.messages) == 0
+        # A new session_id was generated
+        assert "current_session_id" in old.metadata
+        assert old.metadata["current_session_id"] != ""
         gw.session_store.close()
 
     @pytest.mark.asyncio
