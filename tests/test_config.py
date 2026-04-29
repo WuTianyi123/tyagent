@@ -138,7 +138,6 @@ class TestAgentConfigToDict:
             "max_turns": 50,
             "max_tool_turns": 30,
             "system_prompt": "You are a helpful assistant.",
-            "context_max_chars": 280_000,
         }
 
     def test_custom_to_dict(self):

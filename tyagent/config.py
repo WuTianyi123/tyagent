@@ -63,7 +63,6 @@ class AgentConfig:
     max_turns: int = 50
     max_tool_turns: int = 30
     system_prompt: str = "You are a helpful assistant."
-    context_max_chars: int = 280_000
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -73,7 +72,6 @@ class AgentConfig:
             "max_turns": self.max_turns,
             "max_tool_turns": self.max_tool_turns,
             "system_prompt": self.system_prompt,
-            "context_max_chars": self.context_max_chars,
         }
 
     @classmethod
@@ -85,7 +83,6 @@ class AgentConfig:
             max_turns=data.get("max_turns", 50),
             max_tool_turns=data.get("max_tool_turns", 30),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
-            context_max_chars=data.get("context_max_chars", 280_000),
         )
 
 
