@@ -233,6 +233,8 @@ class StreamConsumer:
             )
             return False  # Content remains accumulated, sent on got_done
 
+        return False  # _edit_supported disabled or no message_id, content waits for got_done
+
     @staticmethod
     def _is_flood_error(error: Optional[str]) -> bool:
         if not error:

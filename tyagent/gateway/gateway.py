@@ -275,7 +275,7 @@ class Gateway:
             await adapter.send_message(
                 event.chat_id or "",
                 "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
-                reply_to=event.reply_to_text,
+                reply_to_message_id=event.message_id,
             )
             return "Session archived"
 
