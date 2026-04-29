@@ -202,7 +202,6 @@ class StreamConsumer:
             text = text + " ▉"
         if self._message_id and text == self._last_sent_text:
             return True  # Already delivered
-        self._last_sent_text = text
 
         if self._message_id and self._edit_supported:
             result = await self.adapter.edit_message(
@@ -210,6 +209,7 @@ class StreamConsumer:
                 msg_type=self._msg_type,
             )
             if result.success:
+                self._last_sent_text = text  # Mark delivered only after success
                 self._flood_strikes = 0
                 self._current_edit_interval = self._edit_interval
                 self._already_sent = True

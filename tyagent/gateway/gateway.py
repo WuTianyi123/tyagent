@@ -346,7 +346,9 @@ class Gateway:
                         on_segment_break=consumer.on_segment_break,
                         on_message=persist_message,
                     )
+                    streaming_ok = True
                 except Exception:
+                    streaming_ok = False
                     logger.exception("Agent streaming chat failed, propagating to outer handler")
                     raise
                 finally:
@@ -356,8 +358,9 @@ class Gateway:
                     except asyncio.CancelledError:
                         pass  # Normal cancellation, consumer already handled it
                     except Exception:
-                        logger.exception("StreamConsumer task failed during cleanup")
-                        raise  # Re-raise so outer handler sends error to user
+                        if streaming_ok:
+                            raise  # Consumer failed after agent succeeded — must report
+                        logger.exception("StreamConsumer task failed during cleanup (agent also failed)")
 
                 # Response is already sent via StreamConsumer editing
                 return response
