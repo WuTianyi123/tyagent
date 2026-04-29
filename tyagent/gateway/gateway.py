@@ -180,8 +180,10 @@ class Gateway:
             self._agent_cache.move_to_end(session_key)
             return agent
 
-        # If a default agent was explicitly provided, return it for all sessions
-        # (do NOT create per-session agents in that case)
+        # If a default agent was explicitly provided, use it for all sessions.
+        # ⚠️ TyAgent mutates instance state (_prev_msg_count, last_usage) during
+        # chat(), creating a race condition with concurrent sessions.
+        # For single-session use (e.g. CLI), this is fine.
         if "_default" in self._agent_cache:
             agent = self._agent_cache["_default"]
             self._agent_cache.move_to_end("_default")

@@ -120,7 +120,7 @@ class StreamConsumer:
 
                 if should_edit and self._accumulated:
                     # Don't send tiny fragments on first edit (avoid "<cursor>")
-                    if not self._already_sent and len(self._accumulated) < 4 and not got_done:
+                    if not self._already_sent and len(self._accumulated) < 4 and not got_done and not got_segment_break:
                         pass  # Wait for more content
                     elif self._message_id is None:
                         # First send: create the message
@@ -147,6 +147,9 @@ class StreamConsumer:
                 if got_segment_break:
                     self._message_id = None
                     self._accumulated = ""
+                    self._edit_supported = True
+                    self._flood_strikes = 0
+                    self._current_edit_interval = self._edit_interval
 
                 if got_done:
                     # Final send without cursor
