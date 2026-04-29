@@ -1,6 +1,10 @@
-fix: resolve medium/low review findings from round 3 review
+fix: address review findings round 4 — three medium issues
 
-- fix msg_type/payload mismatch in edit_message: always build post
-  payload when caller explicitly requests post type
-- rename test_outbound_payload_table_forces_text -> uses_post
-- rename test_outbound_payload_table_with_bold_forces_text -> uses_post
+1. edit_message: add table→code-block conversion in post branch
+   (mirrors _build_outbound_payload's logic for explicit msg_type="post")
+2. consumer.py: sync _msg_type after fallback send_message
+   (prevents stale msg_type on the new message)
+3. _TABLE_BLOCK_RE: support empty cells ([^|\n]+ → [^|\n]*)
+4. Add 5 new edge-case tests: single column, empty cells, empty data rows
+
+Tests: 22 → 27 (all pass)

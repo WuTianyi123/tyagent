@@ -104,7 +104,7 @@ _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 # Match a complete markdown table: header row + separator row + optional data rows.
 # A table ends at a blank line, a non-table line, or end of text.
 _TABLE_BLOCK_RE = re.compile(
-    r"^(\|(?:[^|\n]+\|)+\n\|[-|: ]+\|\n?)(?:\|(?:[^|\n]+\|)+\n?)*",
+    r"^(\|(?:[^|\n]*\|)+\n\|[-|: ]+\|\n?)(?:\|(?:[^|\n]*\|)+\n?)*",
     re.MULTILINE,
 )
 
@@ -1296,12 +1296,16 @@ class FeishuAdapter(BasePlatformAdapter):
         if msg_type is None:
             msg_type, payload = _build_outbound_payload(text)
         else:
-            # Always build post-compatible payload (never trust auto-detect
-            # when caller explicitly requests post — text w/o markdown would
-            # produce a text payload that mismatches the requested msg_type).
             if msg_type == "text":
                 payload = json.dumps({"text": text}, ensure_ascii=False)
             else:
+                # Always build post-compatible payload (never trust auto-detect
+                # when caller explicitly requests post — text w/o markdown would
+                # produce a text payload that mismatches the requested msg_type).
+                # Also convert tables to code blocks since Feishu post md does
+                # not render them — this mirrors _build_outbound_payload's logic.
+                if _MARKDOWN_TABLE_RE.search(text):
+                    text = _convert_tables_to_code_blocks(text)
                 payload = _build_markdown_post_payload(text)
 
         loop = asyncio.get_running_loop()

@@ -175,6 +175,57 @@ def test_convert_tables_to_code_blocks_code_before_table():
     assert code_seen
 
 
+def test_convert_tables_to_code_blocks_single_column():
+    """Single-column table should be wrapped in a code fence."""
+    text = "| A |\n|---|\n| B |"
+    result = _convert_tables_to_code_blocks(text)
+    assert result.count("```") == 2, f"Single-col table should be code-fenced, got {result}"
+    assert "| A |" in result
+    assert "| B |" in result
+
+
+def test_convert_tables_to_code_blocks_empty_cells():
+    """Table with empty cells should be correctly fenced."""
+    text = "| H1 | H2 |\n|---|---|\n| A | |\n| | B |"
+    result = _convert_tables_to_code_blocks(text)
+    assert "```" in result, "Should be code-fenced"
+    assert "| A | |" in result, "Empty cell after A should be preserved"
+    assert "| | B |" in result, "Empty cell before B should be preserved"
+    # Verify the full round-trip through post builder
+    rows = _build_markdown_post_rows(result)
+    all_content = " ".join(r[0]["text"] for r in rows)
+    assert "| A | |" in all_content, "Empty cell should appear in post rows"
+
+
+def test_convert_tables_to_code_blocks_single_column_empty_cell():
+    """Single-column table with an empty data row cell."""
+    text = "| H |\n|---|\n| |"
+    result = _convert_tables_to_code_blocks(text)
+    assert "```" in result
+    assert "| H |" in result
+    assert "| |" in result
+
+
+def test_outbound_payload_single_column():
+    """Single-column table through _build_outbound_payload should return post."""
+    content = "| A |\n|---|\n| B |"
+    msg_type, payload = _build_outbound_payload(content)
+    assert msg_type == "post", f"Single-col table should use post, got {msg_type}"
+    data = json.loads(payload)
+    content_str = json.dumps(data, ensure_ascii=False)
+    assert "```" in content_str, "Table should be code-fenced"
+
+
+def test_outbound_payload_empty_cells():
+    """Table with empty cells through _build_outbound_payload should return post."""
+    content = "| H1 | H2 |\n|---|---|\n| A | |"
+    msg_type, payload = _build_outbound_payload(content)
+    assert msg_type == "post", f"Empty-cell table should use post, got {msg_type}"
+    data = json.loads(payload)
+    content_str = json.dumps(data, ensure_ascii=False)
+    assert "```" in content_str
+
+
 def test_fence_boundary_4_backticks():
     """4-backtick fence should not be closed by inner 3-backtick line."""
     content = "text before\n````python\ninner ```\n````\ntext after"
@@ -284,6 +335,11 @@ if __name__ == "__main__":
         test_convert_tables_to_code_blocks_and_fence_interaction,
         test_convert_tables_to_code_blocks_table_after_code_block,
         test_convert_tables_to_code_blocks_code_before_table,
+        test_convert_tables_to_code_blocks_single_column,
+        test_convert_tables_to_code_blocks_empty_cells,
+        test_convert_tables_to_code_blocks_single_column_empty_cell,
+        test_outbound_payload_single_column,
+        test_outbound_payload_empty_cells,
         test_fence_boundary_4_backticks,
         test_fence_boundary_tilde,
         test_fence_boundary_mixed_fences,

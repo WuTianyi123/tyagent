@@ -217,6 +217,10 @@ class StreamConsumer:
             self._already_sent = True
             self._edit_supported = True
             self._flood_strikes = 0
+            # Sync msg_type from the new message so subsequent edits use
+            # the correct type for this message (mirrors run() logic).
+            if hasattr(result, "msg_type") and result.msg_type:
+                self._msg_type = result.msg_type
 
     @staticmethod
     def _is_flood_error(error: Optional[str]) -> bool:
