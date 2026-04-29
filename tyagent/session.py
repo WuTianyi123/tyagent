@@ -194,17 +194,16 @@ class SessionStore:
         """
         if not session_key:
             raise SessionError("session_key must not be empty")
-        session_dict, created = self._db.get_or_create_session(session_key)
-        if created:
-            with self._metadata_lock:
-                # Re-read in case another thread already initialized metadata
-                session_dict, _ = self._db.get_or_create_session(session_key)
-                metadata = session_dict["metadata"]
-                if "current_session_id" not in metadata:
-                    import uuid
-                    metadata["current_session_id"] = uuid.uuid4().hex[:16]
-                    self._db.update_session_metadata(session_key, metadata)
-                    session_dict["metadata"] = metadata
+        session_dict, _ = self._db.get_or_create_session(session_key)
+        with self._metadata_lock:
+            # Re-read under lock to ensure consistency with other threads
+            session_dict, _ = self._db.get_or_create_session(session_key)
+            metadata = session_dict["metadata"]
+            if "current_session_id" not in metadata:
+                import uuid
+                metadata["current_session_id"] = uuid.uuid4().hex[:16]
+                self._db.update_session_metadata(session_key, metadata)
+                session_dict["metadata"] = metadata
         return self._build_session(session_dict)
 
     def add_message(
@@ -287,9 +286,16 @@ class SessionStore:
 
         The old session's messages remain in the database (associated with
         the same session_key). The session metadata is reset to empty.
+        A new current_session_id is generated for isolation.
         """
         session_dict = self._db.get_or_create_session_after_archive(session_key)
-        return self._build_session(session_dict)
+        with self._metadata_lock:
+            sd, _ = self._db.get_or_create_session(session_key)
+            metadata = sd["metadata"]
+            import uuid
+            metadata["current_session_id"] = uuid.uuid4().hex[:16]
+            self._db.update_session_metadata(session_key, metadata)
+            return self._build_session(sd)
 
     def reset(self, session_key: str) -> None:
         """Legacy reset — delegates to archive."""

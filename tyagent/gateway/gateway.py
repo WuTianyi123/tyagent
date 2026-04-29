@@ -201,41 +201,6 @@ class Gateway:
             loop.create_task(lru_agent.close())
         return agent
 
-    @staticmethod
-    def _sync_messages_to_session(
-        session: Any,
-        sanitized: List[Dict[str, Any]],
-        original_count: int,
-    ) -> None:
-        """Sync messages from sanitized list back to session store.
-
-        agent.chat() mutates the sanitized list in-place (appends assistant/tool
-        messages). If sanitized is a different list object than session.messages
-        (e.g. after _sanitize_message_chain creates a copy), the original session
-        would miss these new messages. This method copies only the new messages
-        (those beyond original_count) into the session's message list.
-
-        Also syncs via persist_message callback (see _on_message), so this is
-        a safety net for any messages the callback might have missed, plus it
-        ensures session.messages is kept up-to-date for the next user turn.
-        """
-        if len(sanitized) <= original_count:
-            return
-        new_messages = sanitized[original_count:]
-        for msg in new_messages:
-            kwargs = {}
-            for k in ("tool_calls", "tool_call_id", "reasoning"):
-                if k in msg:
-                    kwargs[k] = msg[k]
-            # DeepSeek uses "reasoning_content" instead of "reasoning"
-            if "reasoning_content" in msg:
-                kwargs["reasoning"] = msg["reasoning_content"]
-            session.add_message(
-                msg.get("role", "assistant"),
-                msg.get("content"),
-                **kwargs,
-            )
-
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message event."""
         adapter = self._find_adapter_for_event(event)
