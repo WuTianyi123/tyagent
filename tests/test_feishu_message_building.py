@@ -36,7 +36,7 @@ def test_no_false_positive_on_bold():
     assert not _MARKDOWN_TABLE_RE.search(bold), "Bold only should not match table re"
 
 
-def test_outbound_payload_table_forces_text():
+def test_outbound_payload_table_uses_post():
     """Table content should use post type with table converted to code block."""
     table = "| a | b |\n|---|---|\n| 1 | 2 |"
     msg_type, payload = _build_outbound_payload(table)
@@ -49,7 +49,7 @@ def test_outbound_payload_table_forces_text():
     assert "| a | b |" in content_str
 
 
-def test_outbound_payload_table_with_bold_forces_text():
+def test_outbound_payload_table_with_bold_uses_post():
     """Table + bold should use post type with table in code block."""
     content = "| a | b |\n|---|---|\n| 1 | 2 |\n\n**bold**"
     msg_type, payload = _build_outbound_payload(content)
@@ -271,8 +271,8 @@ if __name__ == "__main__":
     tests = [
         test_table_detection,
         test_no_false_positive_on_bold,
-        test_outbound_payload_table_forces_text,
-        test_outbound_payload_table_with_bold_forces_text,
+        test_outbound_payload_table_uses_post,
+        test_outbound_payload_table_with_bold_uses_post,
         test_outbound_payload_bold_uses_post,
         test_outbound_payload_plain_text,
         test_convert_tables_to_code_blocks_basic,

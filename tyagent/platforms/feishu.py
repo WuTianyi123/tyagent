@@ -1296,12 +1296,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if msg_type is None:
             msg_type, payload = _build_outbound_payload(text)
         else:
-            # Use caller-specified msg_type (same as initial message's type)
-            # to avoid PATCH API rejecting type switches.
+            # Always build post-compatible payload (never trust auto-detect
+            # when caller explicitly requests post — text w/o markdown would
+            # produce a text payload that mismatches the requested msg_type).
             if msg_type == "text":
                 payload = json.dumps({"text": text}, ensure_ascii=False)
             else:
-                _, payload = _build_outbound_payload(text)  # use autodetected payload for post
+                payload = _build_markdown_post_payload(text)
 
         loop = asyncio.get_running_loop()
 

@@ -1,7 +1,6 @@
-fix: address low-severity review findings
+fix: resolve medium/low review findings from round 3 review
 
-Changes:
-1. Remove dead code _MARKDOWN_FENCE_OPEN_RE / _MARKDOWN_FENCE_CLOSE_RE
-2. Tighten _TABLE_BLOCK_RE regex from .+ to (?:[^|\n]+\|)+ for precision
-3. Add fence+table combination tests: table after code block, code block
-   after table, fence interaction with _build_markdown_post_rows
+- fix msg_type/payload mismatch in edit_message: always build post
+  payload when caller explicitly requests post type
+- rename test_outbound_payload_table_forces_text -> uses_post
+- rename test_outbound_payload_table_with_bold_forces_text -> uses_post
