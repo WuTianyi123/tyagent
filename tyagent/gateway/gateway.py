@@ -302,9 +302,13 @@ class Gateway:
                 sanitized[-1]["content"] = existing + "\n\n[记忆上下文]\n" + memory_block
 
             # Define the persistence callback for tool loop messages
+            # Capture session_id at definition time so it stays consistent with
+            # session.add_message() used for user messages on the same turn
+            _persist_sid = session.metadata.get("current_session_id", "")
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(
                     session_key, role, content,
+                    session_id=_persist_sid,
                     **extras
                 )
 

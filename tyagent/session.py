@@ -82,6 +82,11 @@ class Session:
                 "or SessionStore.add_message() instead."
             )
         current_sid = self.metadata.get("current_session_id", "")
+        if not current_sid:
+            import uuid
+            current_sid = uuid.uuid4().hex[:16]
+            self.metadata["current_session_id"] = current_sid
+            self._store._db.update_session_metadata(self.session_key, self.metadata)
         msg_id = self._store.add_message(
             self.session_key, role, content,
             session_id=current_sid,
@@ -274,9 +279,8 @@ class SessionStore:
             old_sid = metadata.get("current_session_id", "")
             if old_sid:
                 metadata["prev_session_id"] = old_sid
-            else:
-                # Migrated data: no current_session_id yet, use v0 backfill id
-                metadata["prev_session_id"] = f"v0_{session_key}"
+            # Clean up archive markers from previous lifecycle
+            metadata.pop("archived_at", None)
             metadata["current_session_id"] = uuid.uuid4().hex[:16]
             self._db.update_session_metadata(session_key, metadata)
 
@@ -286,12 +290,20 @@ class SessionStore:
         The old session's messages remain in the database (associated with
         the same session_key). The session metadata is reset to empty.
         A new current_session_id is generated for isolation.
+        The old current_session_id is preserved as prev_session_id.
         """
+        # Capture old current_session_id before archive destroys it
+        old_sid = ""
+        old_dict, _ = self._db.get_or_create_session(session_key)
+        old_sid = old_dict["metadata"].get("current_session_id", "")
+
         self._db.get_or_create_session_after_archive(session_key)
         with self._metadata_lock:
             sd, _ = self._db.get_or_create_session(session_key)
             metadata = sd["metadata"]
             import uuid
+            if old_sid:
+                metadata["prev_session_id"] = old_sid
             metadata["current_session_id"] = uuid.uuid4().hex[:16]
             self._db.update_session_metadata(session_key, metadata)
             return self._build_session(sd)
