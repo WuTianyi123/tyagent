@@ -83,10 +83,14 @@ class Session:
             )
         current_sid = self.metadata.get("current_session_id", "")
         if not current_sid:
-            import uuid
-            current_sid = uuid.uuid4().hex[:16]
-            self.metadata["current_session_id"] = current_sid
-            self._store._db.update_session_metadata(self.session_key, self.metadata)
+            with self._store._metadata_lock:
+                # Re-read under lock for consistency
+                current_sid = self.metadata.get("current_session_id", "")
+                if not current_sid:
+                    import uuid
+                    current_sid = uuid.uuid4().hex[:16]
+                    self.metadata["current_session_id"] = current_sid
+                    self._store._db.update_session_metadata(self.session_key, self.metadata)
         msg_id = self._store.add_message(
             self.session_key, role, content,
             session_id=current_sid,
@@ -279,8 +283,6 @@ class SessionStore:
             old_sid = metadata.get("current_session_id", "")
             if old_sid:
                 metadata["prev_session_id"] = old_sid
-            # Clean up archive markers from previous lifecycle
-            metadata.pop("archived_at", None)
             metadata["current_session_id"] = uuid.uuid4().hex[:16]
             self._db.update_session_metadata(session_key, metadata)
 
