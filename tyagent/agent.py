@@ -197,8 +197,10 @@ class TyAgent:
                             if not line.startswith("data: "):
                                 continue
                             data_str = line[6:].strip()
-                            if data_str == "[DONE]" or not data_str:
+                            if data_str == "[DONE]":
                                 break
+                            if not data_str:
+                                continue  # keepalive / heartbeat
 
                             chunk = json.loads(data_str)
                             if not chunk.get("choices"):

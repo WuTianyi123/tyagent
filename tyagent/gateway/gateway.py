@@ -333,9 +333,6 @@ class Gateway:
 
             agent = self._get_or_create_agent(session_key)
 
-            # Track original message count to sync back sanitized -> session
-            original_msg_count = len(session.messages)
-
             # Streaming path for platform chat messages (non-command)
             if event.chat_id and not event.is_command():
                 consumer = StreamConsumer(adapter, event.chat_id, reply_to_message_id=event.message_id)
@@ -362,8 +359,6 @@ class Gateway:
                         logger.exception("StreamConsumer task failed during cleanup")
                         raise  # Re-raise so outer handler sends error to user
 
-                # Sync sanitized messages back to session
-                self._sync_messages_to_session(session, sanitized, original_msg_count)
                 # Response is already sent via StreamConsumer editing
                 return response
 
@@ -373,9 +368,6 @@ class Gateway:
                 tools=tool_defs,
                 on_message=persist_message,
             )
-
-            # Sync sanitized messages back to session
-            self._sync_messages_to_session(session, sanitized, original_msg_count)
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
             response = f"❌ 错误: {exc}"

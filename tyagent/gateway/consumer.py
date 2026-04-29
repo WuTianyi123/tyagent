@@ -100,6 +100,15 @@ class StreamConsumer:
                     except queue.Empty:
                         break
 
+                # --- Truncation check: ensure accumulated text doesn't exceed safe_limit ---
+                # Truncate BEFORE sending so the edit never shows shrinking content.
+                if len(self._accumulated) > _safe_limit:
+                    logger.warning(
+                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating from end",
+                        len(self._accumulated), _safe_limit,
+                    )
+                    self._accumulated = self._accumulated[:_safe_limit]
+
                 # Decide whether to flush
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
@@ -133,15 +142,6 @@ class StreamConsumer:
                         display = self._accumulated
                         await self._try_edit(display, add_cursor=not got_done)
                     self._last_edit_time = time.monotonic()
-
-                # --- 截断检查：在发送前确保累积文本不超 safe_limit ---
-                # 截断末尾以保留开头的内容完整性（避免破坏 Markdown 结构）
-                if len(self._accumulated) > _safe_limit:
-                    logger.warning(
-                        "StreamConsumer accumulated text exceeds safe limit (%d > %d), truncating from end",
-                        len(self._accumulated), _safe_limit,
-                    )
-                    self._accumulated = self._accumulated[:_safe_limit]
 
                 # Segment break: finalize current message
                 if got_segment_break:
