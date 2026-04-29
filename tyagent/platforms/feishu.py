@@ -1247,8 +1247,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     resp = self._client.im.v1.message.create(req)
 
                 if resp.code == 0:
-                    data = json.loads(resp.raw.content) if hasattr(resp, "raw") else {}
-                    msg_id = data.get("data", {}).get("message_id", "")
+                    msg_id = resp.data.message_id if resp.data else ""
                     logger.info("[Feishu] Message sent successfully (type=%s, msg_id=%s)", msg_type, msg_id)
                     return SendResult(success=True, message_id=msg_id, msg_type=msg_type)
                 else:
