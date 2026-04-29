@@ -81,16 +81,13 @@ class Session:
                 "Session has no store backing — use SessionStore.get() "
                 "or SessionStore.add_message() instead."
             )
-        current_sid = self.metadata.get("current_session_id", "")
-        if not current_sid:
-            with self._store._metadata_lock:
-                # Re-read under lock for consistency
-                current_sid = self.metadata.get("current_session_id", "")
-                if not current_sid:
-                    import uuid
-                    current_sid = uuid.uuid4().hex[:16]
-                    self.metadata["current_session_id"] = current_sid
-                    self._store._db.update_session_metadata(self.session_key, self.metadata)
+        with self._store._metadata_lock:
+            current_sid = self.metadata.get("current_session_id", "")
+            if not current_sid:
+                import uuid
+                current_sid = uuid.uuid4().hex[:16]
+                self.metadata["current_session_id"] = current_sid
+                self._store._db.update_session_metadata(self.session_key, self.metadata)
         msg_id = self._store.add_message(
             self.session_key, role, content,
             session_id=current_sid,
@@ -237,6 +234,11 @@ class SessionStore:
             with self._metadata_lock:
                 session_dict, _ = self._db.get_or_create_session(session_key)
                 session_id = session_dict["metadata"].get("current_session_id", "")
+                if not session_id:
+                    import uuid
+                    session_id = uuid.uuid4().hex[:16]
+                    session_dict["metadata"]["current_session_id"] = session_id
+                    self._db.update_session_metadata(session_key, session_dict["metadata"])
         return self._db.add_message(
             session_key, role, content,
             session_id=session_id,
@@ -294,13 +296,12 @@ class SessionStore:
         A new current_session_id is generated for isolation.
         The old current_session_id is preserved as prev_session_id.
         """
-        # Capture old current_session_id before archive destroys it
-        old_sid = ""
-        old_dict, _ = self._db.get_or_create_session(session_key)
-        old_sid = old_dict["metadata"].get("current_session_id", "")
-
-        self._db.get_or_create_session_after_archive(session_key)
         with self._metadata_lock:
+            # Capture old current_session_id before archive destroys it
+            old_dict, _ = self._db.get_or_create_session(session_key)
+            old_sid = old_dict["metadata"].get("current_session_id", "")
+
+            self._db.get_or_create_session_after_archive(session_key)
             sd, _ = self._db.get_or_create_session(session_key)
             metadata = sd["metadata"]
             import uuid
