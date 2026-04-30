@@ -287,12 +287,12 @@ class TyAgent:
                         reasoning_content = message.get("reasoning_content")
 
                     # Record token usage for later compression cut-point
-                    # calculation. Each entry maps (api_message_count,
+                    # calculation. Each entry maps (message_count,
                     # cumulative_prompt_tokens) so we can walk backward
                     # from the tail to find 50%-of-context cutoffs.
                     if self.last_usage and self.last_usage.get("prompt_tokens"):
                         self._token_history.append(
-                            (len(api_messages), self.last_usage["prompt_tokens"])
+                            (len(messages), self.last_usage["prompt_tokens"])
                         )
 
                     break  # API call succeeded

@@ -80,8 +80,8 @@ class CompressionConfig:
             model=data.get("model"),
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
-            context_window=int(data.get("context_window") or 128000),
-            cut_ratio=float(data.get("cut_ratio") or 0.5),
+            context_window=int(_v) if (_v := data.get("context_window")) is not None else 128000,
+            cut_ratio=float(_v) if (_v := data.get("cut_ratio")) is not None else 0.5,
         )
 
 
@@ -161,14 +161,15 @@ class TyAgentConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> TyAgentConfig:
         platforms = {}
-        for name, pdata in data.get("platforms", {}).items():
+        platform_data = data.get("platforms") or {}
+        for name, pdata in platform_data.items():
             platforms[name] = PlatformConfig.from_dict(pdata)
         home = Path(data.get("home_dir", str(default_home)))
         workspace = Path(data.get("workspace_dir", str(default_workspace)))
         return cls(
             platforms=platforms,
-            agent=AgentConfig.from_dict(data.get("agent", {})),
-            compression=CompressionConfig.from_dict(data.get("compression", {})),
+            agent=AgentConfig.from_dict(data.get("agent") or {}),
+            compression=CompressionConfig.from_dict(data.get("compression") or {}),
             home_dir=home,
             workspace_dir=workspace,
             sessions_dir=Path(data.get("sessions_dir", str(home / "sessions"))),
