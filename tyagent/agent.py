@@ -262,7 +262,15 @@ class TyAgent:
                             headers=headers,
                             json=payload_base,
                         )
-                        resp.raise_for_status()
+                        # Check for 400 overflow before raise_for_status so
+                        # ContextOverflow is raised inside the try block
+                        # (sibling except handlers don't catch re-raised exceptions).
+                        if resp.status_code >= 400:
+                            body_str = resp.text[:2000]
+                            logger.error("LLM API error: %s - %s", resp.status_code, body_str)
+                            if _is_context_overflow(resp.status_code, body_str):
+                                raise ContextOverflow(body_str)
+                            raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
                         data = resp.json()
                         usage = data.get("usage")
                         if usage:
