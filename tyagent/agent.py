@@ -161,7 +161,7 @@ class TyAgent:
         reasoning_content: Optional[str] = None
         tool_calls = None
         while True:
-            if self.max_tool_turns is not None and tool_turn >= self.max_tool_turns:
+            if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
                 logger.warning("Max tool turns (%d) reached, returning last content", self.max_tool_turns)
                 break
 
