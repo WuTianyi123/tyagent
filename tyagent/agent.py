@@ -174,6 +174,7 @@ class TyAgent:
             # Context overflow retry loop — single-pass compression
             _compressed = False
             while True:
+                self.last_usage = None  # reset before each API call
                 try:
                     if stream:
                         # --- Streaming path ---
