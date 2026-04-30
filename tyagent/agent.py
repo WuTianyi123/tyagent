@@ -60,7 +60,7 @@ _CONTEXT_OVERFLOW_PATTERNS = [
 
 def _is_context_overflow(status_code: int, body: str) -> bool:
     """Return True if the API error indicates a context overflow."""
-    if status_code != 400:
+    if status_code not in (400, 413):
         return False
     body_lower = body.lower()
     return any(p in body_lower for p in _CONTEXT_OVERFLOW_PATTERNS)
