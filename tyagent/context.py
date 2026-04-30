@@ -86,7 +86,10 @@ async def compress_context(
     #  • assistant message with content and no tool_calls → cut right
     #    after it (tail starts fresh after a complete reply)
     #  • tool / assistant-with-tool_calls → skip (keep walking backward)
-    #    to avoid starting the tail mid-tool-chain
+    #    to avoid starting the tail mid-tool-chain.
+    #    Note: in practice a user message always exists at index ≥ 1
+    #    (index 0 is the injected system prompt), so the loop always
+    #    terminates on a valid boundary before reaching index 0.
     aligned = cut_idx
     for i in range(cut_idx - 1, 0, -1):
         role = messages[i].get("role", "")
