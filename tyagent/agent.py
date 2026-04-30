@@ -297,12 +297,6 @@ class TyAgent:
 
                     break  # API call succeeded
 
-                except httpx.HTTPStatusError as exc:
-                    body = exc.response.text if hasattr(exc, 'response') else "<no response>"
-                    logger.error("LLM API error: %s - %s", exc.response.status_code, body)
-                    if _is_context_overflow(exc.response.status_code, body):
-                        raise ContextOverflow(body) from exc
-                    raise AgentError(f"LLM API returned {exc.response.status_code}: {body}") from exc
                 except ContextOverflow:
                     if not _compressed:
                         _compressed = True
@@ -326,7 +320,7 @@ class TyAgent:
                         "Context too long even after compression."
                     )
                 except AgentError:
-                    raise  # Propagate errors from streaming path
+                    raise  # re-raise directly — already an AgentError
                 except Exception as exc:
                     logger.exception("LLM request failed")
                     raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
