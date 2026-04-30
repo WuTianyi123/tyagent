@@ -189,6 +189,7 @@ async def compress_context(
         {
             "role": m.get("role", ""),
             "content": m.get("content") or "",
+            "reasoning_content": m.get("reasoning_content"),
             "tool_calls": (
                 [tc.get("function", {}).get("name", "?")
                  for tc in (m.get("tool_calls") or [])]
