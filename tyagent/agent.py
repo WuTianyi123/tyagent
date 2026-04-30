@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class ContextOverflow(Exception):
     """LLM API returned 400 indicating the context is too long.
-    Caught by chat() to trigger Level 1 compression and retry.
+    Caught by chat() to trigger single-pass compression and retry.
     """
     pass
 
@@ -278,16 +278,16 @@ class TyAgent:
                         tool_calls = message.get("tool_calls")
                         reasoning_content = message.get("reasoning_content")
 
-                    break  # API call succeeded
-
                     # Record token usage for later compression cut-point
-                    # calculation. Each entry maps (total_message_count,
+                    # calculation. Each entry maps (api_message_count,
                     # cumulative_prompt_tokens) so we can walk backward
                     # from the tail to find 50%-of-context cutoffs.
                     if self.last_usage and self.last_usage.get("prompt_tokens"):
                         self._token_history.append(
-                            (len(messages), self.last_usage["prompt_tokens"])
+                            (len(api_messages), self.last_usage["prompt_tokens"])
                         )
+
+                    break  # API call succeeded
 
                 except httpx.HTTPStatusError as exc:
                     body = exc.response.text if hasattr(exc, 'response') else "<no response>"

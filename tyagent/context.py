@@ -85,16 +85,21 @@ async def compress_context(
     #  • user message → cut just before it (tail starts with user turn)
     #  • assistant message with content and no tool_calls → cut right
     #    after it (tail starts fresh after a complete reply)
+    #  • tool / assistant-with-tool_calls → skip (keep walking backward)
+    #    to avoid starting the tail mid-tool-chain
     aligned = cut_idx
     for i in range(cut_idx - 1, 0, -1):
         role = messages[i].get("role", "")
+        if role in ("tool",):
+            continue  # skip tool messages — walk further back
+        if role == "assistant":
+            if not messages[i].get("content") or messages[i].get("tool_calls"):
+                continue  # mid-tool-chain assistant — walk further back
+            aligned = i + 1  # complete reply boundary
+            break
         if role == "user":
             aligned = i
             break
-        if role == "assistant":
-            if messages[i].get("content") and not messages[i].get("tool_calls"):
-                aligned = i + 1
-                break
 
     if aligned <= 0 or aligned >= n:
         return None
