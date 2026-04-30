@@ -80,8 +80,8 @@ class CompressionConfig:
             model=data.get("model"),
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
-            context_window=int(data.get("context_window", 128000)),
-            cut_ratio=float(data.get("cut_ratio", 0.5)),
+            context_window=int(data.get("context_window") or 128000),
+            cut_ratio=float(data.get("cut_ratio") or 0.5),
         )
 
 
