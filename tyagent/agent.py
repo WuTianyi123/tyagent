@@ -286,12 +286,11 @@ class TyAgent:
                         tool_calls = message.get("tool_calls")
                         reasoning_content = message.get("reasoning_content")
 
-                    # Record token usage for later compression cut-point
-                    # calculation.  Skip post-compression retry calls
-                    # (api_messages diverged from messages, count mismatch).
-                    if not _compressed and self.last_usage and self.last_usage.get("prompt_tokens"):
+                    # Record token usage for later cut-point calculation.
+                    # Uses api_messages count — maps 1:1 to prompt_tokens.
+                    if self.last_usage and self.last_usage.get("prompt_tokens"):
                         self._token_history.append(
-                            (len(messages), self.last_usage["prompt_tokens"])
+                            (len(api_messages), self.last_usage["prompt_tokens"])
                         )
 
                     break  # API call succeeded
@@ -301,7 +300,7 @@ class TyAgent:
                         _compressed = True
                         logger.info("Context overflow — applying single-pass compression")
                         compressed = await compress_context(
-                            messages, self._client,
+                            api_messages, self._client,
                             model=self.compress_model or self.model,
                             api_key=self.compress_api_key,
                             base_url=self.compress_base_url,
