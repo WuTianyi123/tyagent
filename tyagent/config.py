@@ -13,7 +13,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Default config directory — use passwd entry so we aren't fooled by $HOME overrides
 _usr_home = Path(os.path.expanduser("~"))
 try:
     import pwd
@@ -21,15 +20,12 @@ try:
 except (ImportError, KeyError):
     pass
 default_home = _usr_home / ".tyagent"
-
-# Default workspace — user's real home, not the agent profile home
 default_workspace = _usr_home
 
 
 @dataclass
 class PlatformConfig:
     """Configuration for a single messaging platform."""
-
     enabled: bool = False
     token: Optional[str] = None
     api_key: Optional[str] = None
@@ -54,25 +50,63 @@ class PlatformConfig:
 
 
 @dataclass
+class CompressionConfig:
+    """Configuration for context compression (LLM summarization on overflow).
+
+    All fields optional — None falls back to the agent model (model/api_key/base_url).
+    context_window and cut_ratio control the single-pass compression cut point.
+    """
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    context_window: int = 128000
+    cut_ratio: float = 0.5
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {}
+        if self.model:
+            d["model"] = self.model
+        if self.api_key:
+            d["api_key"] = self.api_key
+        if self.base_url:
+            d["base_url"] = self.base_url
+        d["context_window"] = self.context_window
+        d["cut_ratio"] = self.cut_ratio
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> CompressionConfig:
+        return cls(
+            model=data.get("model"),
+            api_key=data.get("api_key"),
+            base_url=data.get("base_url"),
+            context_window=data.get("context_window", 128000),
+            cut_ratio=data.get("cut_ratio", 0.5),
+        )
+
+
+@dataclass
 class AgentConfig:
     """Configuration for the AI agent."""
-
     model: str = "anthropic/claude-sonnet-4"
     api_key: Optional[str] = None
     base_url: Optional[str] = None
-    max_turns: int = 50
-    max_tool_turns: int = 30
+    max_tool_turns: Optional[int] = 200  # None = no limit
     system_prompt: str = "You are a helpful assistant."
+    reasoning_effort: Optional[str] = "high"  # None/"" = don't send
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "model": self.model,
             "api_key": self.api_key,
             "base_url": self.base_url,
-            "max_turns": self.max_turns,
-            "max_tool_turns": self.max_tool_turns,
             "system_prompt": self.system_prompt,
         }
+        if self.max_tool_turns is not None:
+            d["max_tool_turns"] = self.max_tool_turns
+        if self.reasoning_effort:
+            d["reasoning_effort"] = self.reasoning_effort
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> AgentConfig:
@@ -80,18 +114,18 @@ class AgentConfig:
             model=data.get("model", "anthropic/claude-sonnet-4"),
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
-            max_turns=data.get("max_turns", 50),
-            max_tool_turns=data.get("max_tool_turns", 30),
+            max_tool_turns=data.get("max_tool_turns", 200),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
+            reasoning_effort=data.get("reasoning_effort", "high"),
         )
 
 
 @dataclass
 class TyAgentConfig:
     """Main configuration for tyagent."""
-
     platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    compression: CompressionConfig = field(default_factory=CompressionConfig)
     home_dir: Path = field(default_factory=lambda: default_home)
     workspace_dir: Path = field(default_factory=lambda: default_workspace)
     sessions_dir: Path = field(default_factory=lambda: default_home / "sessions")
@@ -102,15 +136,12 @@ class TyAgentConfig:
         return self.platforms.get(name)
 
     def get_connected_platforms(self) -> List[str]:
-        """Return list of enabled and configured platform names."""
         connected = []
         for name, cfg in self.platforms.items():
             if not cfg.enabled:
                 continue
-            # Feishu needs app_id
             if name == "feishu" and cfg.extra.get("app_id"):
                 connected.append(name)
-            # Generic token-based platforms
             elif cfg.token or cfg.api_key:
                 connected.append(name)
         return connected
@@ -119,6 +150,7 @@ class TyAgentConfig:
         return {
             "platforms": {k: v.to_dict() for k, v in self.platforms.items()},
             "agent": self.agent.to_dict(),
+            "compression": self.compression.to_dict(),
             "home_dir": str(self.home_dir),
             "workspace_dir": str(self.workspace_dir),
             "sessions_dir": str(self.sessions_dir),
@@ -136,6 +168,7 @@ class TyAgentConfig:
         return cls(
             platforms=platforms,
             agent=AgentConfig.from_dict(data.get("agent", {})),
+            compression=CompressionConfig.from_dict(data.get("compression", {})),
             home_dir=home,
             workspace_dir=workspace,
             sessions_dir=Path(data.get("sessions_dir", str(home / "sessions"))),
@@ -145,26 +178,15 @@ class TyAgentConfig:
 
 
 def load_config(config_path: Optional[Path] = None) -> TyAgentConfig:
-    """Load configuration from file or environment.
-
-    Priority:
-    1. Explicit config_path
-    2. ~/.tyagent/config.yaml
-    3. ~/.tyagent/config.json
-    4. Built-in defaults
-    """
     if config_path:
         return _load_from_path(config_path)
-
     home = default_home
     yaml_path = home / "config.yaml"
     json_path = home / "config.json"
-
     if yaml_path.exists():
         return _load_from_path(yaml_path)
     if json_path.exists():
         return _load_from_path(json_path)
-
     logger.info("No config file found, using defaults.")
     return TyAgentConfig()
 
@@ -179,15 +201,12 @@ def _load_from_path(path: Path) -> TyAgentConfig:
 
 
 def save_config(config: TyAgentConfig, path: Optional[Path] = None) -> None:
-    """Save configuration to file."""
     if path is None:
         path = config.home_dir / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
-    # Restrict permissions so only owner can read
     try:
-        import os
         os.chmod(path, 0o600)
     except OSError:
         pass

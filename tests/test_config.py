@@ -12,6 +12,7 @@ import yaml
 
 from tyagent.config import (
     AgentConfig,
+    CompressionConfig,
     PlatformConfig,
     TyAgentConfig,
     default_home,
@@ -121,7 +122,7 @@ class TestAgentConfigDefaults:
         assert cfg.model == "anthropic/claude-sonnet-4"
         assert cfg.api_key is None
         assert cfg.base_url is None
-        assert cfg.max_turns == 50
+        assert cfg.max_tool_turns == 200
         assert cfg.system_prompt == "You are a helpful assistant."
 
 
@@ -135,9 +136,9 @@ class TestAgentConfigToDict:
             "model": "anthropic/claude-sonnet-4",
             "api_key": None,
             "base_url": None,
-            "max_turns": 50,
-            "max_tool_turns": 30,
+            "max_tool_turns": 200,
             "system_prompt": "You are a helpful assistant.",
+            "reasoning_effort": "high",
         }
 
     def test_custom_to_dict(self):
@@ -145,14 +146,14 @@ class TestAgentConfigToDict:
             model="openai/gpt-4o",
             api_key="sk-test",
             base_url="https://api.example.com",
-            max_turns=100,
+            max_tool_turns=100,
             system_prompt="Be concise.",
         )
         d = cfg.to_dict()
         assert d["model"] == "openai/gpt-4o"
         assert d["api_key"] == "sk-test"
         assert d["base_url"] == "https://api.example.com"
-        assert d["max_turns"] == 100
+        assert d["max_tool_turns"] == 100
         assert d["system_prompt"] == "Be concise."
 
 
@@ -164,7 +165,7 @@ class TestAgentConfigFromDict:
         assert cfg.model == "anthropic/claude-sonnet-4"
         assert cfg.api_key is None
         assert cfg.base_url is None
-        assert cfg.max_turns == 50
+        assert cfg.max_tool_turns == 200
         assert cfg.system_prompt == "You are a helpful assistant."
 
     def test_full_dict(self):
@@ -172,22 +173,22 @@ class TestAgentConfigFromDict:
             "model": "openai/gpt-4o",
             "api_key": "sk-test",
             "base_url": "https://api.example.com",
-            "max_turns": 100,
+            "max_tool_turns": 100,
             "system_prompt": "Be concise.",
         }
         cfg = AgentConfig.from_dict(data)
         assert cfg.model == "openai/gpt-4o"
         assert cfg.api_key == "sk-test"
         assert cfg.base_url == "https://api.example.com"
-        assert cfg.max_turns == 100
+        assert cfg.max_tool_turns == 100
         assert cfg.system_prompt == "Be concise."
 
     def test_partial_dict(self):
-        data = {"model": "custom-model", "max_turns": 20}
+        data = {"model": "custom-model", "max_tool_turns": 20}
         cfg = AgentConfig.from_dict(data)
         assert cfg.model == "custom-model"
         assert cfg.api_key is None
-        assert cfg.max_turns == 20
+        assert cfg.max_tool_turns == 20
         assert cfg.system_prompt == "You are a helpful assistant."
 
     def test_roundtrip(self):
@@ -195,7 +196,7 @@ class TestAgentConfigFromDict:
             model="openai/gpt-4o",
             api_key="sk-test",
             base_url="https://api.example.com",
-            max_turns=75,
+            max_tool_turns=75,
             system_prompt="Custom prompt",
         )
         restored = AgentConfig.from_dict(original.to_dict())
@@ -228,6 +229,7 @@ class TestTyAgentConfigToDict:
         d = cfg.to_dict()
         assert d["platforms"] == {}
         assert d["agent"] == AgentConfig().to_dict()
+        assert d["compression"] == CompressionConfig().to_dict()
         assert d["home_dir"] == str(default_home)
         assert d["workspace_dir"] == str(default_workspace)
         assert d["sessions_dir"] == str(default_home / "sessions")
@@ -241,11 +243,11 @@ class TestTyAgentConfigToDict:
         assert d["platforms"]["slack"] == pc.to_dict()
 
     def test_custom_agent(self):
-        ac = AgentConfig(model="test-model", max_turns=10)
+        ac = AgentConfig(model="test-model", max_tool_turns=10)
         cfg = TyAgentConfig(agent=ac)
         d = cfg.to_dict()
         assert d["agent"]["model"] == "test-model"
-        assert d["agent"]["max_turns"] == 10
+        assert d["agent"]["max_tool_turns"] == 10
 
     def test_custom_dirs(self):
         cfg = TyAgentConfig(
@@ -275,7 +277,7 @@ class TestTyAgentConfigFromDict:
                 "slack": {"enabled": True, "token": "slack-tok", "extra": {}},
                 "discord": {"enabled": False, "api_key": "dk", "extra": {}},
             },
-            "agent": {"model": "gpt-4o", "max_turns": 30, "system_prompt": "Hi"},
+            "agent": {"model": "gpt-4o", "max_tool_turns": 30, "system_prompt": "Hi"},
             "home_dir": "/opt/ty",
             "workspace_dir": "/opt/ty/work",
             "sessions_dir": "/opt/ty/sessions",
@@ -288,7 +290,7 @@ class TestTyAgentConfigFromDict:
         assert cfg.platforms["slack"].token == "slack-tok"
         assert cfg.platforms["discord"].api_key == "dk"
         assert cfg.agent.model == "gpt-4o"
-        assert cfg.agent.max_turns == 30
+        assert cfg.agent.max_tool_turns == 30
         assert cfg.home_dir == Path("/opt/ty")
         assert cfg.workspace_dir == Path("/opt/ty/work")
         assert cfg.sessions_dir == Path("/opt/ty/sessions")
@@ -420,7 +422,7 @@ class TestLoadConfig:
             "platforms": {
                 "slack": {"enabled": True, "token": "slack-tok", "extra": {}},
             },
-            "agent": {"model": "test-model", "max_turns": 10},
+            "agent": {"model": "test-model", "max_tool_turns": 10},
             "log_level": "DEBUG",
         }
         yaml_path = tmp_path / "config.yaml"
@@ -538,7 +540,7 @@ class TestSaveConfig:
     def test_save_roundtrip(self, tmp_path):
         original = TyAgentConfig(
             platforms={"slack": PlatformConfig(enabled=True, token="tok")},
-            agent=AgentConfig(model="roundtrip-model", max_turns=5),
+            agent=AgentConfig(model="roundtrip-model", max_tool_turns=5),
             home_dir=Path("/tmp/tyhome"),
             workspace_dir=Path("/tmp/tywork"),
             sessions_dir=Path("/tmp/tyhome/sessions"),

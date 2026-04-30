@@ -17,7 +17,8 @@ OnMessageCallback = Callable[..., Any]
 
 import httpx
 
-from tyagent.context import build_api_messages
+from tyagent.config import CompressionConfig
+from tyagent.context import compress_context
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +77,23 @@ class TyAgent:
         model: str = "anthropic/claude-sonnet-4",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        max_turns: int = 50,
-        max_tool_turns: int = 30,
+        max_tool_turns: Optional[int] = 200,
         system_prompt: str = "You are a helpful assistant.",
+        reasoning_effort: Optional[str] = "high",
+        compression: Optional[CompressionConfig] = None,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        self.max_turns = max_turns
         self.max_tool_turns = max_tool_turns
         self.system_prompt = system_prompt
+        self.reasoning_effort = reasoning_effort
+        c = compression or CompressionConfig()
+        self.compress_model = c.model
+        self.compress_api_key = c.api_key or self.api_key
+        self.compress_base_url = c.base_url or self.base_url
+        self.compress_context_window = c.context_window
+        self.compress_cut_ratio = c.cut_ratio
         self._client = httpx.AsyncClient(timeout=120.0)
         # Real token usage from the last API response
         self.last_usage: Optional[Dict[str, int]] = None
@@ -93,6 +101,9 @@ class TyAgent:
         self._system_msg: Optional[Dict[str, Any]] = None
         # Boundary index for append-only api_messages mode
         self._prev_msg_count: int = 0
+        # Token tracking: (message_count, cumulative_prompt_tokens) per API call.
+        # Used by compression to find precise cut points without a tokenizer.
+        self._token_history: List[tuple] = []
 
     async def chat(
         self,
@@ -108,9 +119,10 @@ class TyAgent:
         """Send messages to the LLM and return the response text.
 
         If *tools* are provided, the agent runs a tool-calling loop.
-        Context overflow (400 "context too long") is handled transparently:
-        Level 1 deterministic compression is applied once and the request
-        is retried. If compression is insufficient, an error is raised.
+        Context overflow (400 'context too long') triggers single-pass
+        compression: a cut point is found at ~cut_ratio of the context
+        window using precise token counts, and pre-cut messages are
+        summarized by an LLM.
         """
         from tyagent.tools.registry import registry
 
@@ -129,6 +141,7 @@ class TyAgent:
         # Build the message list to send. No proactive compression —
         # we only compress when the API returns 400 (context overflow).
         self._prev_msg_count = 0
+        self._token_history = []
         api_messages = list(messages)
         self._prev_msg_count = len(messages)
 
@@ -137,6 +150,8 @@ class TyAgent:
             "max_tokens": 4096,
             "temperature": 0.7,
         }
+        if self.reasoning_effort:
+            payload_base["reasoning_effort"] = self.reasoning_effort
         if tools:
             payload_base["tools"] = tools
             payload_base["tool_choice"] = "auto"
@@ -146,7 +161,7 @@ class TyAgent:
         reasoning_content: Optional[str] = None
         tool_calls = None
         while True:
-            if tool_turn >= self.max_tool_turns:
+            if self.max_tool_turns is not None and tool_turn >= self.max_tool_turns:
                 logger.warning("Max tool turns (%d) reached, returning last content", self.max_tool_turns)
                 break
 
@@ -156,8 +171,8 @@ class TyAgent:
             self._prev_msg_count = len(messages)
             payload_base["messages"] = api_messages
 
-            # Context overflow retry loop — try once, compress and retry once
-            _overflow_retried = False
+            # Context overflow retry loop — single-pass compression
+            _compressed = False
             while True:
                 try:
                     if stream:
@@ -265,6 +280,15 @@ class TyAgent:
 
                     break  # API call succeeded
 
+                    # Record token usage for later compression cut-point
+                    # calculation. Each entry maps (total_message_count,
+                    # cumulative_prompt_tokens) so we can walk backward
+                    # from the tail to find 50%-of-context cutoffs.
+                    if self.last_usage and self.last_usage.get("prompt_tokens"):
+                        self._token_history.append(
+                            (len(messages), self.last_usage["prompt_tokens"])
+                        )
+
                 except httpx.HTTPStatusError as exc:
                     body = exc.response.text if hasattr(exc, 'response') else "<no response>"
                     logger.error("LLM API error: %s - %s", exc.response.status_code, body)
@@ -272,17 +296,27 @@ class TyAgent:
                         raise ContextOverflow(body) from exc
                     raise AgentError(f"LLM API returned {exc.response.status_code}: {body}") from exc
                 except ContextOverflow:
-                    if _overflow_retried:
-                        raise AgentError(
-                            "Context too long even after level-1 compression. "
-                            "Level 2 (LLM summarization) is not yet implemented."
+                    if not _compressed:
+                        _compressed = True
+                        logger.info("Context overflow — applying single-pass compression")
+                        compressed = await compress_context(
+                            messages, self._client,
+                            model=self.compress_model or self.model,
+                            api_key=self.compress_api_key,
+                            base_url=self.compress_base_url,
+                            token_history=self._token_history,
+                            context_window=self.compress_context_window,
+                            cut_ratio=self.compress_cut_ratio,
                         )
-                    logger.info("Context overflow detected — applying level-1 compression and retrying")
-                    _overflow_retried = True
-                    api_messages = build_api_messages(messages)
-                    self._prev_msg_count = len(messages)
-                    payload_base["messages"] = api_messages
-                    continue
+                        if compressed is not None:
+                            api_messages = compressed
+                            self._prev_msg_count = len(messages)
+                            self._token_history = []
+                            payload_base["messages"] = api_messages
+                            continue
+                    raise AgentError(
+                        "Context too long even after compression."
+                    )
                 except AgentError:
                     raise  # Propagate errors from streaming path
                 except Exception as exc:
@@ -321,8 +355,8 @@ class TyAgent:
 
             # Execute tool calls and append results
             tool_turn += 1
-            logger.info("Tool turn %d/%d: executing %d tool call(s)",
-                        tool_turn, self.max_tool_turns, len(tool_calls))
+            logger.info("Tool turn %d/%s: executing %d tool call(s)",
+                        tool_turn, self.max_tool_turns or "∞", len(tool_calls))
 
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
@@ -362,13 +396,15 @@ class TyAgent:
     @classmethod
     def from_config(cls, config: Any) -> "TyAgent":
         """Create a TyAgent from an AgentConfig."""
+        compression = getattr(config, "compression", None)
         return cls(
             model=config.model,
             api_key=config.api_key,
             base_url=config.base_url,
-            max_turns=config.max_turns,
-            max_tool_turns=getattr(config, "max_tool_turns", 30),
+            max_tool_turns=getattr(config, "max_tool_turns", 200),
             system_prompt=config.system_prompt,
+            reasoning_effort=getattr(config, "reasoning_effort", "high"),
+            compression=compression,
         )
 
 

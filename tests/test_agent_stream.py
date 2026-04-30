@@ -84,7 +84,7 @@ def _make_sse_chunks(text_chunks: List[str], tool_calls: List[Dict] = None,
 
 @pytest.fixture
 def agent():
-    return TyAgent(api_key="test-key", base_url="https://api.test/v1")
+    return TyAgent(api_key="test-key", base_url="https://api.test/v1", max_tool_turns=30)
 
 
 # ---------------------------------------------------------------------------

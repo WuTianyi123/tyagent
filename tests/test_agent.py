@@ -21,8 +21,7 @@ class TestTyAgentInit:
         assert agent.model == "anthropic/claude-sonnet-4"
         assert agent.api_key == ""
         assert "openai.com" in agent.base_url
-        assert agent.max_turns == 50
-        assert agent.max_tool_turns == 30
+        assert agent.max_tool_turns == 200
 
     def test_env_var_fallback(self):
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key-123"}):
@@ -53,14 +52,14 @@ class TestFromConfig:
             model="test-model",
             api_key="cfg-key",
             base_url="https://cfg.api/v1",
-            max_turns=100,
+            max_tool_turns=100,
             system_prompt="Cfg prompt",
         )
         agent = TyAgent.from_config(cfg)
         assert agent.model == "test-model"
         assert agent.api_key == "cfg-key"
         assert agent.base_url == "https://cfg.api/v1"
-        assert agent.max_turns == 100
+        assert agent.max_tool_turns == 100
         assert agent.system_prompt == "Cfg prompt"
 
 
