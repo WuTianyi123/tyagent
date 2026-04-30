@@ -294,7 +294,7 @@ class TestCompressContext:
 
         call_kwargs = client.post.call_args[1]
         assert call_kwargs["json"]["model"] == "cheap-model"
-        assert call_kwargs["json"]["max_tokens"] == 512
+        assert "max_tokens" not in call_kwargs["json"]  # let LLM decide length
         assert call_kwargs["json"]["temperature"] == 0.3
         assert call_kwargs["json"]["messages"][0]["content"] == _SUMMARIZE_SYSTEM_PROMPT
         assert "Authorization" in call_kwargs["headers"]

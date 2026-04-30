@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 _SUMMARIZE_SYSTEM_PROMPT = (
     "You are a compression assistant. Given an excerpt of a conversation "
     "between a user, an AI assistant, and tool execution results, produce "
-    "a brief factual summary (under 200 words). Retain any data, insights, "
-    "or decisions that remain relevant. Omit technical details that are no "
-    "longer actionable."
+    "a factual summary. Retain all data, insights, or decisions that remain "
+    "relevant. Omit only technical details that are no longer actionable. "
+    "Be as concise as possible while preserving all important information."
 )
 
 
@@ -155,7 +155,6 @@ async def compress_context(
                 ),
             },
         ],
-        "max_tokens": 512,
         "temperature": 0.3,
     }
 
