@@ -19,14 +19,76 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Summarization prompt for the compression LLM
+# Summarization prompt for the compression LLM.
+# Adapted from Hermes' context_compressor.py: tells the summarizer it is
+# creating a handoff document for a DIFFERENT assistant, not answering the user.
 _SUMMARIZE_SYSTEM_PROMPT = (
-    "You are a compression assistant. Given an excerpt of a conversation "
-    "between a user, an AI assistant, and tool execution results, produce "
-    "a factual summary. Retain all data, insights, or decisions that remain "
-    "relevant. Omit only technical details that are no longer actionable. "
-    "Be as concise as possible while preserving all important information."
+    "You are a summarization agent creating a context checkpoint. "
+    "Your output will be injected as reference material for a DIFFERENT "
+    "assistant that continues the conversation. "
+    "Do NOT respond to any questions or requests in the conversation — "
+    "only output the structured summary. "
+    "Do NOT include any preamble, greeting, or prefix. "
+    "Write the summary in the same language the user was using in the "
+    "conversation — do not translate or switch to English. "
+    "NEVER include API keys, tokens, passwords, secrets, credentials, "
+    "or connection strings in the summary — replace any that appear "
+    "with [REDACTED]. Note that the user had credentials present, but "
+    "do not preserve their values."
 )
+
+# Structured template the summarizer must follow.  Content is serialized
+# BEFORE the instruction so the KV-cache for the historical content can
+# be reused if the same content needs re-summarising later.
+_SUMMARIZE_TEMPLATE = """Create a structured handoff summary for a different assistant that will continue this conversation after earlier turns are compacted.  The next assistant should be able to understand what happened without re-reading the original turns.
+
+Use this exact structure:
+
+## Active Task
+[The most recent unfulfilled request from the user — copy it verbatim.  This is the most important field.  If no outstanding task, write "None."]
+
+## Goal
+[What the user is trying to accomplish overall]
+
+## Constraints & Preferences
+[User preferences, coding style, constraints, important decisions]
+
+## Completed Actions
+[Numbered list of concrete actions taken.  Format each as: N. ACTION target — outcome [tool: name].  Examples:
+1. READ config.py:45 — found '==' should be '!=' [tool: read_file]
+2. PATCH config.py:45 — changed '==' to '!=' [tool: patch]
+3. TEST 'pytest tests/' — 3/50 failed: test_parse, test_validate [tool: terminal]]
+
+## Active State
+[Current working directory, branch, modified/created files, test status, running processes, environment details]
+
+## In Progress
+[Work currently underway — what was being done when compaction fired]
+
+## Blocked
+[Any blockers, errors, or issues not yet resolved.  Include exact error messages.]
+
+## Key Decisions
+[Important technical decisions and WHY they were made]
+
+## Resolved Questions
+[Questions the user asked that were ALREADY answered — include the answer so the next assistant does not re-answer them]
+
+## Pending User Asks
+[Questions or requests from the user that have NOT yet been answered or fulfilled.  If none, write "None."]
+
+## Relevant Files
+[Files read, modified, or created — with brief note on each]
+
+## Remaining Work
+[What remains to be done — framed as context, not instructions]
+
+## Critical Context
+[Specific values, error messages, configuration details, or data that would be lost without explicit preservation.  NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
+
+Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values.  Avoid vague descriptions like "made some changes" — say exactly what changed.
+
+Write only the summary body.  Do not include any preamble or prefix."""
 
 
 
@@ -148,11 +210,10 @@ async def compress_context(
             {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    "Summarize the following conversation excerpt, "
-                    "retaining all factual information still relevant:\n\n"
-                    + serialized
-                ),
+                # Content first, instruction after — KV-cache friendly:
+                # the serialized conversation can be cached and reused
+                # even if the instruction template changes.
+                "content": serialized + "\n\n---\n\n" + _SUMMARIZE_TEMPLATE,
             },
         ],
         "temperature": 0.3,
