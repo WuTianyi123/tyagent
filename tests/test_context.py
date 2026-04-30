@@ -136,10 +136,12 @@ class TestCompressContext:
             {"role": "assistant", "content": "a3"},
         ]
 
-        # token history: after msg 4 (user "u2") we have 2K tokens (below target)
-        # after msg 7 (assistant "a2") we have 65K tokens (above target)
-        # cut_idx=7, then align backward to index 6+1=7 (a2 is complete reply)
-        token_history = [(4, 2000), (7, 65000)]
+        # token history: after msg 6 (assistant "a2") we have 63K tokens
+        # (still below 64K target); after msg 8 (assistant "a3") we have
+        # 90K (above target).  cut_idx=6, alignment walks from i=5 (tool
+        # msg, skipped) → i=4 (assistant with tool_calls, skipped) →
+        # i=3 (user "u2") → aligned=3.  This exercises both skip branches.
+        token_history = [(6, 63000), (8, 90000)]
 
         result = await compress_context(
             messages, client,
@@ -149,7 +151,7 @@ class TestCompressContext:
         )
 
         assert result is not None
-        # tail should start with "u3" (msg 7, idx 7 since aligned=i+1=7)
+        # tail starts at u2 (aligned=3); last two messages are u3, a3
         assert result[-2] == {"role": "user", "content": "u3"}
         assert result[-1] == {"role": "assistant", "content": "a3"}
 
