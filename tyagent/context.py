@@ -126,7 +126,7 @@ async def compress_context(
     serialized = json.dumps([
         {
             "role": m.get("role", ""),
-            "content": (m.get("content") or "")[:2000],
+            "content": m.get("content") or "",
             "tool_calls": (
                 [tc.get("function", {}).get("name", "?")
                  for tc in (m.get("tool_calls") or [])]
