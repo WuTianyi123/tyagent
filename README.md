@@ -1,6 +1,6 @@
 # tyagent
 
-可扩展的 AI Agent 框架，支持飞书/Lark 消息网关。
+全功能 AI Agent 框架，native 飞书/Lark 消息网关。支持子代理委派、流式输出、工具进度显示、优雅重启。
 
 ## 快速开始
 
