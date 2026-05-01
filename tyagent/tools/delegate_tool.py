@@ -78,7 +78,7 @@ def _run_child_sync(
         loop = asyncio.new_event_loop()
         timeout = 600.0  # wall-clock timeout for child agent
         summary = loop.run_until_complete(asyncio.wait_for(_run(), timeout=timeout))
-    except Exception as exc:
+    except BaseException as exc:
         return {
             "success": False,
             "summary": None,
