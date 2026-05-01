@@ -7,21 +7,24 @@ and handles session lifecycle.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import signal
-import sys
-import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
 from tyagent.config import PlatformConfig, TyAgentConfig
+from tyagent.gateway.commands import CommandRegistry
 from tyagent.gateway.consumer import StreamConsumer
+from tyagent.gateway.lifecycle import GatewaySupervisor
 from tyagent.gateway.progress import ProgressSender
-from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from tyagent.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from tyagent.session import SessionStore
 from tyagent.tools import memory_tool
 from tyagent.tools import search_tool
@@ -30,9 +33,14 @@ from tyagent.tools.registry import registry
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Message sanitisation (module-level helper)
+# ---------------------------------------------------------------------------
+
+
 def _sanitize_message_chain(
-    messages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Iteratively fix message chain so it stays valid for the LLM API.
 
     Applies fixes in a loop until the chain is fully clean:
@@ -53,18 +61,22 @@ def _sanitize_message_chain(
             msg = result[i]
 
             # Fix 1: empty assistant message → remove
-            if msg.get("role") == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
+            if (
+                msg.get("role") == "assistant"
+                and not msg.get("content")
+                and not msg.get("tool_calls")
+            ):
                 logger.info(
-                    "Sanitized empty assistant message [%d] (no content, no tool_calls) — removing", i
+                    "Sanitized empty assistant message [%d] "
+                    "(no content, no tool_calls) — removing",
+                    i,
                 )
-                result = result[:i] + result[i + 1:]
+                result = result[:i] + result[i + 1 :]
                 changed = True
                 break  # re-scan from end after mutation
 
             # Fix 2: orphaned tool_calls → insert synthetic tool responses
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Count how many tool responses follow this assistant message.
-                # If fewer than tool_calls, insert synthetic responses for the missing ones.
                 tool_calls = msg["tool_calls"]
                 n_expected = len(tool_calls)
                 n_actual = 0
@@ -74,19 +86,34 @@ def _sanitize_message_chain(
                     j += 1
                 if n_actual < n_expected:
                     logger.info(
-                        "Sanitized orphaned tool_calls from assistant message [%d] "
-                        "(%d tool_calls, only %d tool responses) — inserting %d synthetic",
-                        i, n_expected, n_actual, n_expected - n_actual,
+                        "Sanitized orphaned tool_calls from assistant "
+                        "message [%d] (%d tool_calls, only %d tool "
+                        "responses) — inserting %d synthetic",
+                        i,
+                        n_expected,
+                        n_actual,
+                        n_expected - n_actual,
                     )
                     synthetic = []
-                    for tc in tool_calls[n_actual:]:  # only the missing ones
-                        tc_id = tc.get("id", "unknown") if isinstance(tc, dict) else getattr(tc, "id", "unknown")
-                        synthetic.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": "(tool call interrupted — gateway restarted or crashed)",
-                        })
-                    result = result[:i + 1 + n_actual] + synthetic + result[i + 1 + n_actual:]
+                    for tc in tool_calls[n_actual:]:
+                        tc_id = (
+                            tc.get("id", "unknown")
+                            if isinstance(tc, dict)
+                            else getattr(tc, "id", "unknown")
+                        )
+                        synthetic.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": "(tool call interrupted — "
+                                "gateway restarted or crashed)",
+                            }
+                        )
+                    result = (
+                        result[: i + 1 + n_actual]
+                        + synthetic
+                        + result[i + 1 + n_actual :]
+                    )
                     changed = True
                     break  # re-scan after mutation
 
@@ -95,31 +122,27 @@ def _sanitize_message_chain(
 
     return result
 
-# Registry of platform adapter classes
+
+# ---------------------------------------------------------------------------
+# Platform adapter registry (module-level)
+# ---------------------------------------------------------------------------
+
 _PLATFORM_REGISTRY: Dict[str, Type[BasePlatformAdapter]] = {}
 
 
 def register_platform(name: str, adapter_class: Type[BasePlatformAdapter]) -> None:
-    """Register a platform adapter class.
-
-    Example::
-
-        from tyagent.gateway import register_platform
-        from my_platform import MyAdapter
-        register_platform("my_platform", MyAdapter)
-    """
+    """Register a platform adapter class under *name* (e.g. 'feishu')."""
     _PLATFORM_REGISTRY[name] = adapter_class
-    logger.debug("Registered platform adapter: %s", name)
 
 
 def _load_builtin_platforms() -> None:
-    """Load built-in platform adapters."""
-    try:
-        from tyagent.platforms.feishu import FeishuAdapter
+    """Import the built-in platform modules so they self-register."""
+    import tyagent.platforms.feishu  # noqa: F401
 
-        register_platform("feishu", FeishuAdapter)
-    except ImportError as exc:
-        logger.debug("Feishu adapter not available: %s", exc)
+
+# ---------------------------------------------------------------------------
+# Gateway
+# ---------------------------------------------------------------------------
 
 
 class Gateway:
@@ -134,7 +157,9 @@ class Gateway:
     ):
         self.config = config
         self.adapters: Dict[str, BasePlatformAdapter] = {}
-        self.session_store = session_store or SessionStore(sessions_dir=config.sessions_dir)
+        self.session_store = session_store or SessionStore(
+            sessions_dir=config.sessions_dir
+        )
         self._agent_cache: OrderedDict[str, TyAgent] = OrderedDict()
         self._AGENT_CACHE_MAX_SIZE = 100
         if agent is not None:
@@ -152,11 +177,17 @@ class Gateway:
         self._draining = False
         self._active_sessions: set[str] = set()
         self._restart_drain_timeout: float = 60.0
-        # Command registry: name → (description, async_handler)
-        self._commands: Dict[str, tuple[str, Callable[..., Awaitable[str]]]]
-        self._init_commands()
+        self._restart_requestor: Optional[Dict[str, str]] = None
+        self._restart_notification_pending: Optional[Dict[str, str]] = None
         self._session_to_adapter: Dict[str, str] = {}
         self._active_chat_ids: Dict[str, str] = {}
+        # Subsystems
+        self.commands = CommandRegistry(self)
+        self.supervisor = GatewaySupervisor(self)
+
+    # ------------------------------------------------------------------
+    # Adapter management
+    # ------------------------------------------------------------------
 
     def _load_adapters(self) -> None:
         """Load and initialize platform adapters from config."""
@@ -177,6 +208,10 @@ class Gateway:
                 logger.info("Loaded adapter: %s", name)
             except Exception as exc:
                 logger.error("Failed to load adapter %s: %s", name, exc)
+
+    # ------------------------------------------------------------------
+    # Agent management
+    # ------------------------------------------------------------------
 
     def _get_or_create_agent(self, session_key: str) -> TyAgent:
         """Get cached agent for session, or create new one."""
@@ -207,11 +242,17 @@ class Gateway:
             loop.create_task(lru_agent.close())
         return agent
 
+    # ------------------------------------------------------------------
+    # Message routing
+    # ------------------------------------------------------------------
+
     async def _on_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message event."""
         adapter = self._find_adapter_for_event(event)
         if not adapter:
-            logger.warning("No adapter found for event from platform: %s", event.platform)
+            logger.warning(
+                "No adapter found for event from platform: %s", event.platform
+            )
             return None
 
         session_key = adapter.build_session_key(event)
@@ -228,10 +269,12 @@ class Gateway:
 
         # If session is suspended (crash recovery), archive it and create fresh
         if self.session_store.is_suspended(session_key):
-            logger.info("Session %s was suspended — archiving and creating fresh session", session_key)
+            logger.info(
+                "Session %s was suspended — archiving and creating fresh session",
+                session_key,
+            )
             self.session_store.archive(session_key)
             self.session_store.clear_resume_pending(session_key)
-            # Get a fresh session with reset metadata (including clearing "suspended")
             session = self.session_store.get_or_create_after_archive(session_key)
             await adapter.send_message(
                 event.chat_id or "",
@@ -244,9 +287,12 @@ class Gateway:
         # Dispatch built-in commands via registry
         if event.is_command():
             cmd = event.get_command()
-            if cmd and cmd in self._commands:
-                _, handler = self._commands[cmd]
-                return await handler(adapter, event, session_key, session)
+            if cmd:
+                result = await self.commands.dispatch(
+                    cmd, adapter, event, session_key, session
+                )
+                if result is not None:
+                    return result
 
         # Build message for LLM
         user_message = event.text
@@ -255,7 +301,9 @@ class Gateway:
                 f"[Attached {mt or 'file'}: {url}]"
                 for mt, url in zip(event.media_types or [], event.media_urls)
             )
-            user_message = f"{user_message}\n\n{media_desc}" if user_message else media_desc
+            user_message = (
+                f"{user_message}\n\n{media_desc}" if user_message else media_desc
+            )
 
         # Persist user message to DB
         session.add_message("user", user_message)
@@ -272,31 +320,34 @@ class Gateway:
             sanitized = _sanitize_message_chain(session.messages)
 
             # Inject persistent memory into the last user message content
-            # instead of adding a separate system message — this keeps the
-            # system prompt prefix stable for prompt caching.
             memory_block = self.memory_store.get_all_formatted()
             if memory_block and sanitized and sanitized[-1].get("role") == "user":
-                # Make a shallow copy to avoid mutating the shared dict from session.messages
                 sanitized[-1] = dict(sanitized[-1])
                 existing = sanitized[-1].get("content") or ""
-                sanitized[-1]["content"] = existing + "\n\n[记忆上下文]\n" + memory_block
+                sanitized[-1]["content"] = (
+                    existing + "\n\n[记忆上下文]\n" + memory_block
+                )
 
             # Define the persistence callback for tool loop messages
-            # Capture session_id at definition time so it stays consistent with
-            # session.add_message() used for user messages on the same turn
-            _persist_sid = session.metadata.get("current_session_id", "")
+            _persist_sid = getattr(
+                session.metadata, "current_session_id", None
+            ) or getattr(session, "current_session_id", None)
+
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(
-                    session_key, role, content,
+                    session_key,
+                    role,
+                    content,
                     session_id=_persist_sid,
-                    **extras
+                    **extras,
                 )
 
             agent = self._get_or_create_agent(session_key)
 
             # Create progress sender and wire it to the agent
             progress_sender = ProgressSender(
-                adapter, event.chat_id or "",
+                adapter,
+                event.chat_id or "",
                 reply_to_message_id=event.message_id,
                 enabled=bool(event.chat_id) and not event.is_command(),
             )
@@ -306,7 +357,11 @@ class Gateway:
             try:
                 # Streaming path for platform chat messages (non-command)
                 if event.chat_id and not event.is_command():
-                    consumer = StreamConsumer(adapter, event.chat_id, reply_to_message_id=event.message_id)
+                    consumer = StreamConsumer(
+                        adapter,
+                        event.chat_id,
+                        reply_to_message_id=event.message_id,
+                    )
                     consumer_task = asyncio.create_task(consumer.run())
                     try:
                         response = await agent.chat(
@@ -321,18 +376,23 @@ class Gateway:
                         streaming_ok = True
                     except Exception:
                         streaming_ok = False
-                        logger.exception("Agent streaming chat failed, propagating to outer handler")
+                        logger.exception(
+                            "Agent streaming chat failed, propagating to outer handler"
+                        )
                         raise
                     finally:
                         consumer.finish()
                         try:
                             await consumer_task
                         except asyncio.CancelledError:
-                            pass  # Normal cancellation, consumer already handled it
+                            pass  # Normal cancellation
                         except Exception:
                             if streaming_ok:
-                                raise  # Consumer failed after agent succeeded — must report
-                            logger.exception("StreamConsumer task failed during cleanup (agent also failed)")
+                                raise
+                            logger.exception(
+                                "StreamConsumer task failed during cleanup "
+                                "(agent also failed)"
+                            )
 
                     # Response is already sent via StreamConsumer editing
                     return response
@@ -360,128 +420,41 @@ class Gateway:
         finally:
             self._active_sessions.discard(session_key)
             self._active_chat_ids.pop(session_key, None)
-            # Clear resume_pending flag after first resumed turn
-            try:
-                if self.session_store.is_resume_pending(session_key):
-                    self.session_store.clear_resume_pending(session_key)
-            except Exception as exc:
-                logger.warning("Failed to clear resume_pending for %s: %s", session_key, exc)
+            self._session_to_adapter.pop(session_key, None)
 
-        # Send response (non-streaming path only)
-        result = await adapter.send_message(
-            event.chat_id or "",
-            response,
-            reply_to_message_id=event.message_id,
-        )
-        if not result.success:
-            logger.error("Failed to send response: %s", result.error)
+        # Send response back to the platform
+        if response and event.chat_id:
+            await adapter.send_message(
+                event.chat_id,
+                response,
+                reply_to_message_id=event.message_id,
+            )
 
         return response
 
-    def _find_adapter_for_event(self, event: MessageEvent) -> Optional[BasePlatformAdapter]:
-        """Find the adapter that should handle this event by platform name."""
+    def _find_adapter_for_event(
+        self, event: MessageEvent
+    ) -> Optional[BasePlatformAdapter]:
+        """Find the adapter responsible for this event's platform."""
         return self.adapters.get(event.platform)
 
-    def _format_status(self, session_key: str) -> str:
-        """Format a status message for the /status command."""
-        from datetime import datetime
-
-        session = self.session_store.get(session_key)
-        connected = list(self.adapters.keys())
-
-        created = datetime.fromtimestamp(session.created_at).strftime("%Y-%m-%d %H:%M")
-        updated = datetime.fromtimestamp(session.updated_at).strftime("%Y-%m-%d %H:%M")
-
-        lines = [
-            "📊 **tyagent Status**",
-            "",
-            f"**Session:** `{session_key}`",
-            f"**Messages:** {self.session_store.get_message_count(session_key, session_id=session.metadata.get('current_session_id', ''))}",
-            f"**Created:** {created}",
-            f"**Last Activity:** {updated}",
-            "",
-            f"**Model:** `{self._get_or_create_agent(session_key).model}`",
-            f"**Connected Platforms:** {', '.join(connected) if connected else 'None'}",
-        ]
-        return "\n".join(lines)
-
-    async def _cmd_help(
-        self, adapter: BasePlatformAdapter, event: MessageEvent,
-        session_key: str, _session: Any,
-    ) -> str:
-        """Handle /help: auto-generate help from command registry."""
-        lines = ["📖 **tyagent 可用命令**", ""]
-        for name, (desc, _) in self._commands.items():
-            lines.append(f"**`/{name}`** — {desc}")
-        await adapter.send_message(
-            event.chat_id or "", "\n".join(lines),
-            reply_to_message_id=event.message_id,
-        )
-        return "Help sent"
-
-    async def _cmd_status(
-        self, adapter: BasePlatformAdapter, event: MessageEvent,
-        session_key: str, _session: Any,
-    ) -> str:
-        """Handle /status: show session info."""
-        await adapter.send_message(
-            event.chat_id or "", self._format_status(session_key),
-            reply_to_message_id=event.message_id,
-        )
-        return "Status sent"
-
-    async def _cmd_restart(
-        self, adapter: BasePlatformAdapter, event: MessageEvent,
-        _session_key: str, _session: Any,
-    ) -> str:
-        """Handle /restart: trigger graceful gateway restart."""
-        await adapter.send_message(
-            event.chat_id or "", "🔄 正在重启 gateway...",
-            reply_to_message_id=event.message_id,
-        )
-        self._restart_requestor = {
-            "platform": event.platform,
-            "chat_id": event.chat_id or "",
-        }
-        os.kill(os.getpid(), signal.SIGUSR1)
-        return "Gateway restart initiated"
-
-    async def _cmd_reset(
-        self, adapter: BasePlatformAdapter, event: MessageEvent,
-        session_key: str, _session: Any,
-    ) -> str:
-        """Handle /new and /reset: archive current session, start fresh."""
-        self.session_store.archive(session_key)
-        self.session_store.freshen_session(session_key)
-        await adapter.send_message(
-            event.chat_id or "",
-            "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
-            reply_to_message_id=event.message_id,
-        )
-        return "Session archived"
-
-    def _init_commands(self) -> None:
-        """Register all built-in and configurable commands."""
-        self._commands = OrderedDict()
-        self._commands["help"] = ("显示此帮助信息", self._cmd_help)
-        self._commands["status"] = ("查看当前会话状态（模型、消息数、会话时长）", self._cmd_status)
-        self._commands["restart"] = ("重启 gateway（约 2~3 秒，重启完成后自动通知）", self._cmd_restart)
-        for trigger in self.config.reset_triggers:
-            trigger = trigger.strip().lower().lstrip("/")
-            if trigger not in self._commands:
-                self._commands[trigger] = ("归档当前会话并开始新对话（历史记录保留）", self._cmd_reset)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """Start all adapters and run the gateway."""
         self._load_adapters()
-        self._setup_signal_handlers()
-        self._check_recovery_on_startup()
+        self.supervisor.setup_signal_handlers()
+        self.supervisor.check_recovery_on_startup()
         if not self.adapters:
             logger.error("No adapters loaded. Check your configuration.")
             return
 
         self._running = True
-        logger.info("Starting tyagent gateway with %d adapter(s)", len(self.adapters))
+        logger.info(
+            "Starting tyagent gateway with %d adapter(s)", len(self.adapters)
+        )
 
         # Start all adapters
         tasks = []
@@ -492,40 +465,8 @@ class Gateway:
             )
             tasks.append(task)
 
-        # If there's a pending restart notification, schedule it once the
-        # corresponding adapter has finished connecting.
-        notif = getattr(self, "_restart_notification_pending", None)
-        if notif:
-            async def _send_restart_notification() -> None:
-                adapter = self.adapters.get(notif["platform"])
-                if not adapter:
-                    return
-                t0 = time.monotonic()
-                logger.info("Restart notification: waiting for adapter %s to connect...", notif["platform"])
-                # Poll until adapter is running (WebSocket connected), up to 10s
-                for _ in range(20):
-                    if adapter.running:
-                        break
-                    await asyncio.sleep(0.5)
-                connect_time = time.monotonic() - t0
-                if adapter.running:
-                    t1 = time.monotonic()
-                    initiated_at = notif.get("initiated_at")
-                    if initiated_at:
-                        total_elapsed = time.time() - initiated_at
-                        msg = f"✅ Gateway 已重启完成（总耗时 {total_elapsed:.0f}s）"
-                    else:
-                        msg = "✅ Gateway 已重启完成"
-                    await adapter.send_message(notif["chat_id"], msg)
-                    send_time = time.monotonic() - t1
-                    logger.info(
-                        "Sent restart notification to %s via %s (connect=%.1fs, send=%.1fs, total=%.1fs)",
-                        notif["chat_id"], notif["platform"],
-                        connect_time, send_time, time.monotonic() - t0,
-                    )
-                else:
-                    logger.warning("Adapter %s not running within 10s — skipping restart notification", notif["platform"])
-            asyncio.create_task(_send_restart_notification())
+        # If there's a pending restart notification, schedule it
+        GatewaySupervisor.schedule_restart_notification(self)
 
         # Wait for shutdown signal
         await self._shutdown_event.wait()
@@ -554,7 +495,9 @@ class Gateway:
         self.session_store.close()
         logger.info("Gateway stopped")
 
-    async def _run_adapter_with_retry(self, name: str, adapter: BasePlatformAdapter) -> None:
+    async def _run_adapter_with_retry(
+        self, name: str, adapter: BasePlatformAdapter
+    ) -> None:
         """Run a single adapter with exponential backoff retry."""
         max_retries = 10
         retry_delay = 5.0
@@ -564,9 +507,13 @@ class Gateway:
             if not self._running:
                 break
             try:
-                logger.info("Starting adapter %s (attempt %d/%d)", name, attempt, max_retries)
+                logger.info(
+                    "Starting adapter %s (attempt %d/%d)",
+                    name,
+                    attempt,
+                    max_retries,
+                )
                 await adapter.start()
-                # If start() returns normally, the adapter has stopped
                 logger.info("Adapter %s stopped gracefully", name)
                 break
             except asyncio.CancelledError:
@@ -575,186 +522,20 @@ class Gateway:
             except Exception as exc:
                 logger.error("Adapter %s crashed: %s", name, exc)
                 if not self._running or attempt >= max_retries:
-                    logger.error("Adapter %s exceeded max retries, giving up", name)
+                    logger.error(
+                        "Adapter %s exceeded max retries, giving up", name
+                    )
                     break
                 wait = min(retry_delay * (2 ** (attempt - 1)), max_retry_delay)
-                logger.info("Retrying adapter %s in %.1f seconds...", name, wait)
+                logger.info(
+                    "Retrying adapter %s in %.1f seconds...", name, wait
+                )
                 await asyncio.sleep(wait)
 
-    def stop(self) -> None:
-        """Signal the gateway to shut down."""
-        self._running = False
-        self._shutdown_event.set()
 
-    def _setup_signal_handlers(self) -> None:
-        """Setup graceful shutdown on SIGINT/SIGTERM/SIGUSR1."""
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, self.stop)
-            except NotImplementedError:
-                # Windows doesn't support add_signal_handler
-                pass
-        try:
-            loop.add_signal_handler(signal.SIGUSR1, self._on_sigusr1)
-        except NotImplementedError:
-            pass
-
-    def _on_sigusr1(self) -> None:
-        """Handle SIGUSR1 — start graceful restart."""
-        if self._restart_requested:
-            logger.warning("SIGUSR1 already received, ignoring duplicate")
-            return
-        logger.info("SIGUSR1 received — initiating graceful restart")
-        self._restart_requested = True
-        self._draining = True
-        loop = asyncio.get_running_loop()
-        loop.create_task(self._do_graceful_restart())
-
-    async def _do_graceful_restart(self) -> None:
-        """Perform graceful restart: notify, drain, mark sessions, exit."""
-        try:
-            logger.info("Graceful restart: notifying active sessions...")
-            await self._notify_active_sessions_of_restart()
-
-            logger.info(
-                "Graceful restart: draining up to %.0f seconds (%d active sessions)",
-                self._restart_drain_timeout,
-                len(self._active_sessions),
-            )
-            drained = await self._drain_active_agents(self._restart_drain_timeout)
-
-            if not drained:
-                logger.warning(
-                    "Drain timeout reached — forcing restart with %d active session(s)",
-                    len(self._active_sessions),
-                )
-
-            # Mark pending sessions for resume, so the new process can pick them up
-            for session_key in list(self._active_sessions):
-                try:
-                    self.session_store.mark_resume_pending(session_key, reason="restart_timeout")
-                except Exception:
-                    logger.exception("Failed to mark resume_pending for %s", session_key)
-
-            # Write .clean_shutdown marker to indicate intentional restart
-            # Include restart requestor info so the new process can send a notification
-            try:
-                marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
-                marker_path.parent.mkdir(parents=True, exist_ok=True)
-                marker_data = {"reason": "restart"}
-                req = getattr(self, "_restart_requestor", None)
-                if req:
-                    marker_data["requestor_platform"] = req["platform"]
-                    marker_data["requestor_chat_id"] = req["chat_id"]
-                # Record when restart was initiated so new process can measure total time
-                marker_data["initiated_at"] = time.time()
-                marker_path.write_text(json.dumps(marker_data), encoding="utf-8")
-                logger.info("Wrote .clean_shutdown marker at %s", marker_path)
-            except Exception as exc:
-                logger.error("Failed to write .clean_shutdown marker: %s", exc)
-        except Exception:
-            logger.exception("Graceful restart failed unexpectedly — proceeding with restart anyway")
-
-        logger.info("Graceful restart complete — spawning systemctl restart (avoids RestartSec delay)")
-        import subprocess
-        try:
-            subprocess.Popen(
-                ["systemd-run", "--user", "--scope", "--unit=tyagent-restart-helper",
-                 "systemctl", "--user", "restart", "tyagent-gateway"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            logger.error("Failed to spawn systemctl restart: %s — falling back to exit 75", exc)
-            os._exit(75)
-        os._exit(0)
-
-    async def _drain_active_agents(self, timeout: float) -> bool:
-        """Wait for all active sessions to complete, up to timeout seconds.
-
-        Returns True if all sessions drained, False on timeout.
-        """
-        if not self._active_sessions:
-            return True
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while self._active_sessions:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return False
-            await asyncio.sleep(0.5)
-        return True
-
-    async def _notify_active_sessions_of_restart(self) -> None:
-        """Send restart notification to all active sessions."""
-        message = "⚠️ Gateway is restarting for an update. Active requests will complete before restart."
-        for session_key in list(self._active_sessions):
-            try:
-                adapter_name = self._session_to_adapter.get(session_key)
-                chat_id = self._active_chat_ids.get(session_key, "")
-                adapter = self.adapters.get(adapter_name) if adapter_name else None
-                if adapter is not None and chat_id:
-                    await adapter.send_message(chat_id, message)
-            except Exception:
-                logger.exception("Failed to notify session %s", session_key)
-
-    def _suspend_recent_sessions(self) -> None:
-        """Suspend sessions that were recently active (unclean shutdown recovery)."""
-        try:
-            suspended = self.session_store.suspend_recently_active(max_age_seconds=120)
-            if suspended:
-                logger.warning("Suspended %d recently-active session(s) due to unclean shutdown", suspended)
-            else:
-                logger.debug("No recently-active sessions to suspend")
-        except Exception:
-            logger.exception("Failed to suspend recent sessions on startup")
-
-    def _check_recovery_on_startup(self) -> None:
-        """Check for .clean_shutdown marker and handle session recovery.
-
-        If the marker exists with restart requestor info, save it as a pending
-        notification to be sent once adapters are connected.
-
-        If the marker exists (intentional restart), skip suspending sessions.
-        If absent, assume unclean shutdown and suspend recently-active sessions.
-        """
-        self._restart_notification_pending: Optional[Dict[str, str]] = None
-        marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
-        if not marker_path.exists():
-            logger.info("No clean shutdown marker — assuming unclean shutdown, suspending recent sessions")
-            self._suspend_recent_sessions()
-            return
-
-        # Parse marker — new format is JSON, old format is plain "clean"
-        try:
-            raw = marker_path.read_text(encoding="utf-8").strip()
-            marker = json.loads(raw) if raw.startswith("{") else {"reason": raw}
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to parse .clean_shutdown marker: %s", exc)
-            marker_path.unlink(missing_ok=True)
-            self._suspend_recent_sessions()
-            return
-
-        logger.info("Clean shutdown marker found — previous restart was intentional (reason=%s)", marker.get("reason", "unknown"))
-
-        # Save restart notification for later (adapters aren't connected yet)
-        platform_name = marker.get("requestor_platform")
-        chat_id = marker.get("requestor_chat_id")
-        if platform_name and chat_id:
-            self._restart_notification_pending = {
-                "platform": platform_name,
-                "chat_id": chat_id,
-                "initiated_at": marker.get("initiated_at"),
-            }
-            logger.info("Saved restart notification for %s via %s (will send after adapter connects)", chat_id, platform_name)
-
-        # Clean up marker
-        try:
-            marker_path.unlink(missing_ok=True)
-            logger.debug("Removed .clean_shutdown marker")
-        except OSError as exc:
-            logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 async def run_gateway(config_path: Optional[str] = None) -> None:
@@ -782,7 +563,7 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
             "[user]\n"
             "    name = tyagent\n"
             "    email = agent@tyagent.local\n",
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
     # Initialize .ssh directory
@@ -794,13 +575,13 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
     real_home = os.path.expanduser("~")
     try:
         import pwd
+
         real_home = pwd.getpwuid(os.getuid()).pw_dir
     except (ImportError, KeyError):
         pass
 
-    # Set HOME to profile home for consistent isolation (gateway + subprocesses)
+    # Set HOME to profile home for consistent isolation
     os.environ["HOME"] = str(profile_home)
-    # Preserve real home for tools that need to access user's actual files
     os.environ["TY_AGENT_REAL_HOME"] = str(real_home)
     logger.info("Profile home initialized at: %s", profile_home)
     logger.info("Real home available via TY_AGENT_REAL_HOME: %s", real_home)
@@ -811,9 +592,10 @@ async def run_gateway(config_path: Optional[str] = None) -> None:
         os.chdir(workspace)
         logger.info("Working directory set to: %s", workspace)
     except OSError as exc:
-        logger.error("Failed to change to workspace directory %s: %s", workspace, exc)
+        logger.error(
+            "Failed to change to workspace directory %s: %s", workspace, exc
+        )
         raise
 
     gateway = Gateway(config)
-    # _setup_signal_handlers is called inside gateway.start()
     await gateway.start()

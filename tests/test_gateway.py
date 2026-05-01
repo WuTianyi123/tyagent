@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tyagent.agent import AgentError
 from tyagent.config import AgentConfig, TyAgentConfig
 from tyagent.gateway import Gateway
+from tyagent.gateway.commands import _format_status
 from tyagent.gateway.gateway import _sanitize_message_chain
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import Session, SessionStore
@@ -296,7 +297,7 @@ class TestFormatStatus:
         gw = Gateway(config, agent=agent)
         gw.adapters["feishu"] = _make_adapter()
 
-        status = gw._format_status("test_key")
+        status = _format_status(gw, "test_key")
         assert "test_key" in status
         assert "my-model" in status
         assert "feishu" in status
@@ -314,7 +315,7 @@ class TestGatewayStop:
         gw = Gateway(config, agent=MagicMock())
         assert gw._running is False
         gw._running = True
-        gw.stop()
+        gw.supervisor.shutdown()
         assert gw._running is False
         gw.session_store.close()
 
@@ -435,7 +436,7 @@ class TestGatewayDrainAndRestart:
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)
         with patch.object(asyncio.get_event_loop(), "add_signal_handler") as mock_add:
-            gw._setup_signal_handlers()
+            gw.supervisor.setup_signal_handlers()
             # Should be called for SIGINT, SIGTERM (from existing code), and SIGUSR1
             sigs_called = [call.args[0] for call in mock_add.call_args_list]
             assert signal.SIGUSR1 in sigs_called
@@ -535,7 +536,7 @@ class TestGatewayDrainAndRestart:
         marker.write_text("clean")
 
         try:
-            gw._check_recovery_on_startup()
+            gw.supervisor.check_recovery_on_startup()
             # File should be removed
             assert not marker.exists()
         finally:
@@ -557,7 +558,7 @@ class TestGatewayDrainAndRestart:
         session = gw.session_store.get("test:key")
         session.add_message("user", "hello")
 
-        gw._check_recovery_on_startup()
+        gw.supervisor.check_recovery_on_startup()
 
         # Session should be suspended if it was recently active
         assert gw.session_store.is_suspended("test:key")
@@ -579,7 +580,7 @@ class TestGatewayDrainAndRestart:
         gw._active_chat_ids["feishu:sess1"] = "chat1"
         gw._active_chat_ids["feishu:sess2"] = "chat2"
 
-        await gw._notify_active_sessions_of_restart()
+        await gw.supervisor._notify_active_sessions()
         assert adapter.send_message.call_count == 2
         sent_text = adapter.send_message.call_args[0][1]
         assert "restarting" in sent_text.lower()
