@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ToolEntry:
     """Metadata for a single registered tool."""
 
-    __slots__ = ("name", "schema", "handler", "description", "emoji")
+    __slots__ = ("name", "schema", "handler", "description", "emoji", "wants_parent")
 
     def __init__(
         self,
@@ -27,12 +27,14 @@ class ToolEntry:
         handler: Callable[[Dict[str, Any]], str],
         description: str = "",
         emoji: str = "",
+        wants_parent: bool = False,
     ):
         self.name = name
         self.schema = schema
         self.handler = handler
         self.description = description or schema.get("description", "")
         self.emoji = emoji
+        self.wants_parent = wants_parent
 
 
 class ToolRegistry:
@@ -49,6 +51,7 @@ class ToolRegistry:
         handler: Callable[[Dict[str, Any]], str],
         description: str = "",
         emoji: str = "",
+        wants_parent: bool = False,
     ) -> None:
         """Register a tool.
 
@@ -58,6 +61,7 @@ class ToolRegistry:
             handler: Sync function receiving a single dict of args, returning a JSON string.
             description: Optional human-readable description.
             emoji: Optional display emoji.
+            wants_parent: If True, the handler receives a parent_agent kwarg.
         """
         with self._lock:
             self._tools[name] = ToolEntry(
@@ -66,6 +70,7 @@ class ToolRegistry:
                 handler=handler,
                 description=description,
                 emoji=emoji,
+                wants_parent=wants_parent,
             )
         logger.debug("Registered tool: %s", name)
 
@@ -93,16 +98,19 @@ class ToolRegistry:
             result.append({"type": "function", "function": schema})
         return result
 
-    def dispatch(self, name: str, args: Dict[str, Any]) -> str:
+    def dispatch(self, name: str, args: Dict[str, Any], parent_agent: Any = None) -> str:
         """Execute a tool handler by name.
 
         All exceptions are caught and returned as ``{"error": "..."}``.
+        Optional *parent_agent* is passed to the handler (used by delegate_task).
         """
         with self._lock:
             entry = self._tools.get(name)
         if entry is None:
             return tool_error(f"Unknown tool: {name}")
         try:
+            if entry.wants_parent:
+                return entry.handler(args, parent_agent=parent_agent)
             return entry.handler(args)
         except Exception as exc:
             logger.exception("Tool %s dispatch error: %s", name, exc)

@@ -94,6 +94,7 @@ class TyAgent:
         self.compress_base_url = c.base_url or self.base_url
         self.compress_context_window = c.context_window
         self.compress_cut_ratio = c.cut_ratio
+        self._compression_config = compression  # stored for child agent cloning
         self._client = httpx.AsyncClient(timeout=120.0)
         # Real token usage from the last API response
         self.last_usage: Optional[Dict[str, int]] = None
@@ -384,7 +385,9 @@ class TyAgent:
 
                 logger.info("  ⚡ %s(%s)", func_name, ", ".join(f"{k}={v!r}" for k, v in list(func_args.items())[:3]))
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(None, registry.dispatch, func_name, func_args)
+                result = await loop.run_in_executor(
+                    None, registry.dispatch, func_name, func_args, self,
+                )
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
                 if on_message:
                     on_message("tool", result, tool_call_id=tc_id)
