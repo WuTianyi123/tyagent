@@ -11,6 +11,7 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import json
 import logging
 import mimetypes
@@ -51,6 +52,10 @@ _MSG_TYPE_POST = "post"
 
 # Dedup TTL
 _DEDUP_TTL_SECONDS = 24 * 60 * 60
+
+# Feishu processing reaction constants
+_FEISHU_REACTION_IN_PROGRESS = "Typing"        # ⌨️ badge — processing
+_FEISHU_PROCESSING_REACTION_CACHE_SIZE = 100   # LRU bound for reaction handles
 
 # Content-Type to extension mapping (supplements mimetypes)
 _CT_EXT_OVERRIDES = {
@@ -632,6 +637,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_lock = threading.Lock()
         self._dedup: Dict[str, float] = self._load_dedup()
 
+        # Processing reaction tracking (message_id → reaction_id)
+        self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+
     def _load_dedup(self) -> Dict[str, float]:
         """Load deduplication state from disk, pruning expired entries."""
         if not self._dedup_path.exists():
@@ -702,7 +710,130 @@ class FeishuAdapter(BasePlatformAdapter):
             .build()
         )
 
-    # ---- WebSocket handlers ----
+    # ---- Processing status reactions ----
+
+    def _reactions_enabled(self) -> bool:
+        """Whether Feishu processing reactions are enabled (default: on)."""
+        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in ("false", "0", "no")
+
+    async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
+        """Add a reaction emoji to a message. Returns reaction_id on success."""
+        if not self._client or not message_id or not emoji_type:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+            )
+            body = (
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type({"emoji_type": emoji_type})
+                .build()
+            )
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(body)
+                .build()
+            )
+            response = await asyncio.to_thread(
+                self._client.im.v1.message_reaction.create, request
+            )
+            if response and getattr(response, "code", None) == 0:
+                data = getattr(response, "data", None)
+                return getattr(data, "reaction_id", None)
+            logger.debug(
+                "[Feishu] Add reaction %s on %s rejected: code=%s msg=%s",
+                emoji_type, message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.warning(
+                "[Feishu] Add reaction %s on %s raised", emoji_type, message_id,
+                exc_info=True,
+            )
+        return None
+
+    async def _remove_reaction(self, message_id: str, reaction_id: str) -> bool:
+        """Remove a reaction from a message by its reaction_id."""
+        if not self._client or not message_id or not reaction_id:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            request = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            response = await asyncio.to_thread(
+                self._client.im.v1.message_reaction.delete, request
+            )
+            if response and getattr(response, "code", None) == 0:
+                return True
+            logger.debug(
+                "[Feishu] Remove reaction %s on %s rejected: code=%s msg=%s",
+                reaction_id, message_id,
+                getattr(response, "code", None),
+                getattr(response, "msg", None),
+            )
+        except Exception:
+            logger.warning(
+                "[Feishu] Remove reaction %s on %s raised", reaction_id, message_id,
+                exc_info=True,
+            )
+        return False
+
+    def _remember_processing_reaction(self, message_id: str, reaction_id: str) -> None:
+        """Store a processing reaction handle in the LRU cache."""
+        cache = self._pending_processing_reactions
+        cache[message_id] = reaction_id
+        cache.move_to_end(message_id)
+        while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
+            evicted, _ = cache.popitem(last=False)
+            logger.warning(
+                "[Feishu] Evicted processing reaction for %s from cache (limit %d) — "
+                "⌨️ badge will be permanent on that message",
+                evicted, _FEISHU_PROCESSING_REACTION_CACHE_SIZE,
+            )
+
+    def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
+        """Retrieve and remove a stored processing reaction handle."""
+        return self._pending_processing_reactions.pop(message_id, None)
+
+    async def _add_processing_reaction(self, message_id: Optional[str]) -> None:
+        """Add the ⌨️ processing reaction and track its handle."""
+        if not message_id or message_id in self._pending_processing_reactions:
+            return
+        try:
+            reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
+            if reaction_id:
+                self._remember_processing_reaction(message_id, reaction_id)
+        except asyncio.CancelledError:
+            # The reaction may have been created server-side before
+            # cancellation, but we lost the reaction_id (opaque handle
+            # from the Create API).  Feishu's Delete Reaction API
+            # requires this ID — we cannot remove by emoji_type alone.
+            # The ⌨️ badge may remain permanently on this message.
+            # This is an inherent API limitation, accepted as a rare
+            # cosmetic edge case during forced cancellation (shutdown).
+            logger.warning(
+                "[Feishu] Cancelled while adding processing reaction on %s — "
+                "⌨️ badge may be permanent (API requires reaction_id for deletion)",
+                message_id,
+            )
+            raise
+
+    async def _remove_processing_reaction(self, message_id: Optional[str]) -> None:
+        """Remove the ⌨️ processing reaction from a message."""
+        if not message_id:
+            return
+        reaction_id = self._pop_processing_reaction(message_id)
+        if reaction_id:
+            await self._remove_reaction(message_id, reaction_id)
+
+    # ---- Processing status reactions ----
 
     def _on_message(self, data: Any) -> None:
         """Handle incoming WebSocket message event.
@@ -728,20 +859,43 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("Received message from %s in %s chat %s: %r",
                     event.sender_id, event.chat_type, event.chat_id, event.text)
 
-        # Schedule coroutine on the main event loop thread-safely
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_message(event), self._loop
-        )
-        # Attach error callback so exceptions aren't lost
-        future.add_done_callback(self._on_task_done)
+        # Schedule a single orchestrator coroutine that adds the ⌨️ reaction,
+        # then runs the handler, then cleans up — all in one atomic sequence.
+        # This eliminates the race where a fast handler could complete before
+        # _add_processing_reaction's API call had returned its reaction_id.
+        async def _handle_with_reaction(ev: MessageEvent) -> Optional[str]:
+            """Add ⌨️, run handler, clean up — single coroutine, no race.
 
-    def _on_task_done(self, future: Any) -> None:
-        """Callback for background tasks to log errors."""
-        try:
-            result = future.result()
-            logger.info("Message handler completed, result=%s", result)
-        except Exception as exc:
-            logger.exception("Feishu message handler task failed: %s", exc)
+            Uses try/finally so the ⌨️ badge is always removed even if the
+            coroutine is cancelled (gateway shutdown).
+
+            Note: base.py's _handle_message already catches all Exception and
+            returns None, so exceptions from the message handler never propagate
+            here. The handler's result (str or None) is returned as-is; reaction
+            cleanup happens regardless.
+            """
+            do_reaction = (
+                self._reactions_enabled()
+                and bool(ev.message_id)
+                and not ev.is_command()
+            )
+            try:
+                if do_reaction:
+                    await self._add_processing_reaction(ev.message_id)
+                return await self._handle_message(ev)
+            finally:
+                if do_reaction:
+                    await self._remove_processing_reaction(ev.message_id)
+
+        future = asyncio.run_coroutine_threadsafe(
+            _handle_with_reaction(event), self._loop
+        )
+        # Log any unhandled exception from the orchestrator (shouldn't happen
+        # with internal try/except, but defensive).
+        future.add_done_callback(lambda f: (
+            logger.error("[Feishu] _handle_with_reaction failed: %s", f.exception())
+            if not f.cancelled() and f.exception() else None
+        ))
 
     def _parse_event(self, data: Any) -> Optional[MessageEvent]:
         """Parse a Feishu event (dict or P2ImMessageReceiveV1 object) into a MessageEvent."""
