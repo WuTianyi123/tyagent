@@ -46,7 +46,7 @@
   - `import_messages()` 支持 JSON → SQLite 迁移
   - 29 个测试全部通过，经过 7 轮盲审-修复循环后连续 2 轮无实质性问题
 
-- **`tyagent/session.py`**（重写）：轻量 Session + SessionStore 封装
+- **`tyagent/session.py`**（重写）：精简 Session + SessionStore 封装
   - `Session.messages` 属性按需从 DB 惰性加载
   - `Session.add_message()` 委托给 store 实时持久化
   - `SessionStore` 带 `close()` 和 context manager，自动清理临时目录

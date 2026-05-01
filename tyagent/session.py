@@ -31,7 +31,7 @@ class SessionError(Exception):
 class Session:
     """A conversation session backed by database.
 
-    This is a lightweight data object. Messages are lazily loaded from
+    This is a plain data object. Messages are lazily loaded from
     the database via the .messages property. The .add_message() method
     delegates to the store for immediate persistence.
     """

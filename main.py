@@ -1,4 +1,4 @@
-"""tyagent: A lightweight, extensible agent framework.
+"""tyagent: A full-featured, extensible AI agent framework with native Feishu/Lark gateway support.
 
 Entry point. Use `python -m tyagent_cli` for the CLI.
 """

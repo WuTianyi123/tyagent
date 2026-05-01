@@ -427,7 +427,7 @@ def cmd_configure(args: argparse.Namespace) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tyagent",
-        description="tyagent: A lightweight, extensible agent framework.",
+        description="tyagent: A full-featured, extensible AI agent framework.",
     )
     parser.add_argument(
         "-c", "--config",

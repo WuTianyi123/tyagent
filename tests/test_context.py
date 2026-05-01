@@ -111,8 +111,9 @@ class TestCompressContext:
         assert result[0] == {"role": "system", "content": "You are a helpful assistant."}
         assert result[1]["role"] == "system"
         assert "Summary" in result[1]["content"]
-        # cut at msg 5 (after "answer 2", index 5 is "user: question 3")
-        # aligned should be index 4+1=5
+        # cut_idx=4 (msg_count from token_history); alignment walks from i=3:
+        # messages[3] = "user: question 2" → aligned=3.
+        # tail = messages[3:] = [q2, a2, q3, a3]
         assert len(result) >= 3  # system + summary + at least one tail msg
 
     @pytest.mark.asyncio
@@ -260,9 +261,9 @@ class TestCompressContext:
         )
 
         assert result is not None
-        # Should use msg_count=3 as fallback, then align
-        # msg_count=3 → index 3 is "assistant: a1" (complete reply) → aligned=4
-        # tail starts at index 4: "user: q2", "assistant: a2"
+        # cut_idx=3 (from msg_count=3 in token_history → messages[:3]).
+        # alignment: messages[2] = "assistant: a1" (complete reply) → aligned=3.
+        # tail = messages[3:] = [q2, a2]
         assert result[0] == {"role": "system", "content": "sys"}
         assert "Summary" in result[1]["content"]
         # tail messages preserved

@@ -69,7 +69,7 @@ except Exception:
 ## 验证
 
 ```bash
-cd ~/project/ty-agent
+cd ~/project/tyagent
 python3 -m pytest tests/ -q
 # 预期: 全部通过（371 passed）
 ```

@@ -218,7 +218,7 @@ class TestTyAgentConfigDefaults:
         assert cfg.workspace_dir == default_workspace
         assert cfg.sessions_dir == default_home / "sessions"
         assert cfg.log_level == "INFO"
-        assert cfg.reset_triggers == ["new", "reset"]
+        assert cfg.reset_triggers == ["new"]
 
 
 class TestTyAgentConfigToDict:
@@ -234,7 +234,7 @@ class TestTyAgentConfigToDict:
         assert d["workspace_dir"] == str(default_workspace)
         assert d["sessions_dir"] == str(default_home / "sessions")
         assert d["log_level"] == "INFO"
-        assert d["reset_triggers"] == ["new", "reset"]
+        assert d["reset_triggers"] == ["new"]
 
     def test_with_platforms(self):
         pc = PlatformConfig(enabled=True, token="tok")
@@ -269,7 +269,7 @@ class TestTyAgentConfigFromDict:
         assert cfg.platforms == {}
         assert cfg.agent == AgentConfig()
         assert cfg.log_level == "INFO"
-        assert cfg.reset_triggers == ["new", "reset"]
+        assert cfg.reset_triggers == ["new"]
 
     def test_full_dict(self):
         data = {

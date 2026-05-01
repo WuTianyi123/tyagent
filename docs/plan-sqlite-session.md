@@ -1,7 +1,7 @@
 # 重构计划：SQLite 会话存储 + 新压缩策略
 
 > 创建：2026-04-24
-> 状态：待实施
+> 状态：已完成（2026-04-28）
 
 ---
 
@@ -14,7 +14,7 @@
 2. **无法按需查询**：要么全加载、要么不加载，没有中间地带
 3. **压缩与存储耦合**：当前的 `context.py` 在内存里做压缩，依赖 `session.messages` 这个完整列表存在内存中
 
-同时，经过讨论确定了新的压缩策略：**保留最后一个 user 消息之后的全部 tool 调用链，丢掉之前的 tool 消息；assistant 的文本回复和 user 消息始终保留。** 这比 Hermes 的辅助 LLM 摘要方案更轻量、更确定，因为 assistant 回复本身就是 tool 结果的自然摘要。
+实际实现中，压缩策略改为 **LLM 摘要方案**（见 `context.py:compress_context()`）：当 token 估算超过上下文窗口 50% 时，将最近一条 user 消息之前的全部对话内容发给 LLM 做一次摘要，保留当前轮次的完整 tool 调用链。相比 Hermes 的分级压缩更简单（单次摘要、无分级），且利用了 KV-cache 优化（对话内容在前、指令在后）。
 
 ## 目标
 
@@ -64,7 +64,7 @@ CREATE INDEX idx_messages_session_time
 重构后：
 
 - `SessionStore` 持有一个 SQLite 连接（`~/.tyagent/sessions.db`）
-- `Session` 变成轻量对象，只有 `session_key`、`created_at`、`updated_at`，**不再持有 messages**
+- `Session` 变成精简对象，只有 `session_key`、`created_at`、`updated_at`，**不再持有 messages**
 - 消息操作全部走 SQL：
   - `add_message(session_key, role, content, **extras)` → INSERT
   - `get_messages(session_key)` → SELECT 全部（用于构建压缩视图）
@@ -110,7 +110,7 @@ SQLite 存储层，职责：
 
 ### 第二步：重写 `tyagent/session.py`
 
-`Session` 数据类简化为不含 messages 的轻量对象。
+`Session` 数据类简化为不含 messages 的精简对象。
 `SessionStore` 改为基于 `db.py` 的薄封装，对外接口尽量兼容：
 
 | 旧接口 | 新实现 |

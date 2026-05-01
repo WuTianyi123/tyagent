@@ -164,10 +164,10 @@ Hermes 将记忆放在 `~/.hermes/memories/` 下，有两个文件：
 
 必须引入记忆系统。tyagent 现在每次重启 gateway 后，之前会话中 agent 学到的所有事实都丢失了。这非常浪费。
 
-但考虑到 tyagent 的定位是"轻量级"，不应该照搬 hermes 的完整实现。建议：
+但 tyagent 的第一阶段应以实用为主，优先实现内置文件记忆而非插件化架构。建议：
 
 1. **简化版记忆**：`~/.tyagent/memories/`
-   - `AGENT.md` — agent 学到的环境事实（合并 MEMORY.md 的功能）
+   - `MEMORY.md` — agent 学到的环境事实
    - `USER.md` — 用户画像
    - 每个文件上限 2000 字符（比 hermes 稍大，因为 tyagent 目前只有这一个记忆渠道）
    - 使用 `§` 分隔符（与 hermes 兼容，方便未来迁移）
@@ -313,27 +313,25 @@ Profile 对 tyagent 来说是** nice-to-have，不是 must-have**。因为：
 | 功能 | hermes | tyagent（建议） | 理由 |
 |------|--------|----------------|------|
 | 记忆上限 | MEMORY 2200 + USER 1375 | 各 2000 | 单通道，稍大 |
-| 记忆提供者插件 | 支持 Honcho/Mem0 等 | 仅内置 | 保持轻量 |
+| 记忆提供者插件 | 支持 Honcho/Mem0 等 | 仅内置 | 已实现，暂不扩展 |
 | 技能系统 | 完整（70+ 内置） | 预留目录 | 未来扩展 |
 | Profile | 完整支持 | 预留结构 | 未来扩展 |
-| 上下文压缩 | 有 | 无 | 轻量定位 |
+| 上下文压缩 | 有 | 有（LLM 单次摘要） | 已实现 |
 | 子进程 HOME 隔离 | 有 | 无 | 暂不涉及复杂工具链 |
 | 工作区上下文 | `.hermes.md` | `.tyagent.md` | 同名替换 |
-| 记忆工具 | 独立 tool schema | 通过现有工具调用 | 简化工具系统 |
+| 记忆工具 | 独立 tool schema | 独立 memory tool | 已实现 |
 
-### 3.4 实施优先级
+### 3.4 实施状态
 
-**P0（立即做）**：
-1. 创建 `memories/` 目录和 `AGENT.md` + `USER.md`
-2. 在 `agent.py` 中读取并注入记忆到系统提示词
-3. 提供 `memory` 工具（add/replace/remove）
+**已完成**：
+1. ✅ 创建 `memories/` 目录和 `MEMORY.md` + `USER.md`
+2. ✅ 通过 gateway 注入记忆到系统提示词
+3. ✅ 提供独立 `memory` 工具（add/replace/remove/expand/read）
 
-**P1（近期做）**：
+**待实施**：
 4. 引入 `.env` 分离敏感信息
 5. 创建 `prompts/system.md` 用户自定义提示词
 6. 引入 `.tyagent.md` 工作区上下文
-
-**P2（未来做）**：
 7. `skills/` 目录和基础技能加载
 8. `logs/` 结构化日志
 9. Profile 模式

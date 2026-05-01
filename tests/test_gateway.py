@@ -69,7 +69,7 @@ def _make_adapter(platform="feishu"):
 def _make_config(**overrides):
     defaults = {
         "agent": AgentConfig(model="test-model", api_key="key"),
-        "reset_triggers": ["new", "reset"],
+        "reset_triggers": ["new"],
     }
     defaults.update(overrides)
     return TyAgentConfig(**defaults)

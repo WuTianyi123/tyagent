@@ -10,7 +10,7 @@
 
 ## Phase 1: Summary-Index + Expand Tool
 
-**Objective:** Memory index becomes a lightweight summary of all entries (compact, always-injected). LLM can use `expand(keyword)` to retrieve full entry content.
+**Objective:** Memory index becomes a compact summary of all entries (compact, always-injected). LLM can use `expand(keyword)` to retrieve full entry content.
 
 ### Changes
 
@@ -48,7 +48,7 @@ MEMORY (your notes) [entries: 3]
 **get_all_formatted()** → produces summary-only output:
 - Each entry → one bullet point with first ~100 chars
 - Shows entry count per store
-- LLM sees lightweight index, not full content
+- LLM sees compact index, not full content
 
 **New `expand(keyword)` action on `memory` tool:**
 

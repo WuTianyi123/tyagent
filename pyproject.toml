@@ -1,7 +1,7 @@
 [project]
 name = "tyagent"
 version = "0.1.0"
-description = "A lightweight, extensible agent framework. Prioritizes Feishu support."
+description = "A full-featured, extensible AI agent framework with native Feishu/Lark gateway support."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
