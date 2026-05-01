@@ -174,45 +174,42 @@ def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str
 # ---------------------------------------------------------------------------
 
 DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "delegate_task",
-        "description": (
-            "Spawn a child agent to work on a task in isolated context. "
-            "The child gets a fresh conversation, a restricted toolset (no "
-            "delegate_task / memory), and returns a summary only — "
-            "intermediate tool calls never enter your context window.\n\n"
-            "Use this when:\n"
-            "- A subtask would flood your context with intermediate data\n"
-            "- You need researched synthesis, code review, or debugging\n"
-            "- A reasoning-heavy task would benefit from focused attention\n\n"
-            "Do NOT use for single tool calls — just call the tool directly."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "goal": {
-                    "type": "string",
-                    "description": "What the child should accomplish. Be specific and self-contained.",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Optional background info the child needs (file paths, constraints).",
-                },
-                "toolsets": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of tool names the child can use. Default: all non-blocked parent tools.",
-                },
-                "max_tool_turns": {
-                    "type": "integer",
-                    "description": f"Max tool-calling turns for the child (default: {DEFAULT_SUBAGENT_MAX_TOOL_TURNS}).",
-                    "minimum": 1,
-                    "maximum": 200,
-                },
+    "name": "delegate_task",
+    "description": (
+        "Spawn a child agent to work on a task in isolated context. "
+        "The child gets a fresh conversation, a restricted toolset (no "
+        "delegate_task / memory), and returns a summary only — "
+        "intermediate tool calls never enter your context window.\n\n"
+        "Use this when:\n"
+        "- A subtask would flood your context with intermediate data\n"
+        "- You need researched synthesis, code review, or debugging\n"
+        "- A reasoning-heavy task would benefit from focused attention\n\n"
+        "Do NOT use for single tool calls — just call the tool directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "What the child should accomplish. Be specific and self-contained.",
             },
-            "required": ["goal"],
+            "context": {
+                "type": "string",
+                "description": "Optional background info the child needs (file paths, constraints).",
+            },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of tool names the child can use. Default: all non-blocked parent tools.",
+            },
+            "max_tool_turns": {
+                "type": "integer",
+                "description": f"Max tool-calling turns for the child (default: {DEFAULT_SUBAGENT_MAX_TOOL_TURNS}).",
+                "minimum": 1,
+                "maximum": 200,
+            },
         },
+        "required": ["goal"],
     },
 }
 
