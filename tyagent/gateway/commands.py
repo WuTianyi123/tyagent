@@ -138,10 +138,7 @@ class CommandRegistry:
             "🔄 正在重启 gateway...",
             reply_to_message_id=event.message_id,
         )
-        self._gateway._restart_requestor = {
-            "platform": event.platform,
-            "chat_id": event.chat_id or "",
-        }
+        self._gateway.set_restart_requestor(event.platform, event.chat_id or "")
         os.kill(os.getpid(), signal.SIGUSR1)
         return "Gateway restart initiated"
 

@@ -438,6 +438,10 @@ class Gateway:
         """Find the adapter responsible for this event's platform."""
         return self.adapters.get(event.platform)
 
+    def set_restart_requestor(self, platform: str, chat_id: str) -> None:
+        """Record restart request info so the new process can send a notification."""
+        self._restart_requestor = {"platform": platform, "chat_id": chat_id}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
