@@ -116,6 +116,7 @@ class TyAgent:
         stream_delta_callback: Optional[Callable[[str], None]] = None,
         on_segment_break: Optional[Callable[[], None]] = None,
         reasoning_callback: Optional[Callable[[str], None]] = None,
+        tool_progress_callback: Optional[Callable[..., Any]] = None,
     ) -> str:
         """Send messages to the LLM and return the response text.
 
@@ -384,6 +385,12 @@ class TyAgent:
                     continue
 
                 logger.info("  ⚡ %s(%s)", func_name, ", ".join(f"{k}={v!r}" for k, v in list(func_args.items())[:3]))
+                # Fire tool_progress_callback before execution
+                if tool_progress_callback:
+                    try:
+                        tool_progress_callback(func_name, func_args)
+                    except Exception as exc:
+                        logger.warning("tool_progress_callback failed: %s", exc)
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     None, registry.dispatch, func_name, func_args, self,

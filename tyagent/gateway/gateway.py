@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Type
 from tyagent.agent import AgentError, TyAgent
 from tyagent.config import PlatformConfig, TyAgentConfig
 from tyagent.gateway.consumer import StreamConsumer
+from tyagent.gateway.progress import ProgressSender
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from tyagent.session import SessionStore
 from tyagent.tools import memory_tool
@@ -314,50 +315,69 @@ class Gateway:
 
             agent = self._get_or_create_agent(session_key)
 
-            # Streaming path for platform chat messages (non-command)
-            if event.chat_id and not event.is_command():
-                consumer = StreamConsumer(adapter, event.chat_id, reply_to_message_id=event.message_id)
-                consumer_task = asyncio.create_task(consumer.run())
-                try:
-                    response = await agent.chat(
-                        sanitized,
-                        tools=tool_defs,
-                        stream=True,
-                        stream_delta_callback=consumer.on_delta,
-                        on_segment_break=consumer.on_segment_break,
-                        on_message=persist_message,
-                    )
-                    streaming_ok = True
-                except Exception:
-                    streaming_ok = False
-                    logger.exception("Agent streaming chat failed, propagating to outer handler")
-                    raise
-                finally:
-                    consumer.finish()
-                    try:
-                        await consumer_task
-                    except asyncio.CancelledError:
-                        pass  # Normal cancellation, consumer already handled it
-                    except Exception:
-                        if streaming_ok:
-                            raise  # Consumer failed after agent succeeded — must report
-                        logger.exception("StreamConsumer task failed during cleanup (agent also failed)")
-
-                # Response is already sent via StreamConsumer editing
-                return response
-
-            # Non-streaming path for commands and fallback
-            response = await agent.chat(
-                sanitized,
-                tools=tool_defs,
-                on_message=persist_message,
+            # Create progress sender and wire it to the agent
+            progress_sender = ProgressSender(
+                adapter, event.chat_id or "",
+                reply_to_message_id=event.message_id,
+                enabled=bool(event.chat_id) and not event.is_command(),
             )
-        except AgentError as exc:
-            logger.error("Agent error: %s", exc)
-            response = f"❌ 错误: {exc}"
-        except Exception:
-            logger.exception("Unexpected agent error")
-            response = "Sorry, something went wrong."
+            _progress_cb = progress_sender.on_tool_started
+            progress_task = asyncio.create_task(progress_sender.run())
+
+            try:
+                # Streaming path for platform chat messages (non-command)
+                if event.chat_id and not event.is_command():
+                    consumer = StreamConsumer(adapter, event.chat_id, reply_to_message_id=event.message_id)
+                    consumer_task = asyncio.create_task(consumer.run())
+                    try:
+                        response = await agent.chat(
+                            sanitized,
+                            tools=tool_defs,
+                            stream=True,
+                            stream_delta_callback=consumer.on_delta,
+                            on_segment_break=consumer.on_segment_break,
+                            on_message=persist_message,
+                            tool_progress_callback=_progress_cb,
+                        )
+                        streaming_ok = True
+                    except Exception:
+                        streaming_ok = False
+                        logger.exception("Agent streaming chat failed, propagating to outer handler")
+                        raise
+                    finally:
+                        consumer.finish()
+                        try:
+                            await consumer_task
+                        except asyncio.CancelledError:
+                            pass  # Normal cancellation, consumer already handled it
+                        except Exception:
+                            if streaming_ok:
+                                raise  # Consumer failed after agent succeeded — must report
+                            logger.exception("StreamConsumer task failed during cleanup (agent also failed)")
+
+                    # Response is already sent via StreamConsumer editing
+                    return response
+
+                # Non-streaming path for commands and fallback
+                response = await agent.chat(
+                    sanitized,
+                    tools=tool_defs,
+                    on_message=persist_message,
+                    tool_progress_callback=_progress_cb,
+                )
+            except AgentError as exc:
+                logger.error("Agent error: %s", exc)
+                response = f"❌ 错误: {exc}"
+            except Exception:
+                logger.exception("Unexpected agent error")
+                response = "Sorry, something went wrong."
+            finally:
+                # Clean up progress sender
+                progress_sender.finish()
+                try:
+                    await progress_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         finally:
             self._active_sessions.discard(session_key)
             self._active_chat_ids.pop(session_key, None)
