@@ -24,6 +24,8 @@ tyagent/
 │   ├── browser_tools.py  # Playwright 浏览器工具
 │   ├── memory_tool.py    # 持久记忆
 │   └── search_tool.py    # 会话搜索
+├── skills/
+│   └── neat-freak/       # 会话收尾知识库同步（洁癖）
 ├── platforms/
 │   ├── base.py           # BasePlatformAdapter
 │   └── feishu.py         # FeishuAdapter
@@ -72,3 +74,9 @@ tyagent/
 - `_compression_config` 存在 agent 上供 delegate_task 子代理克隆
 - 测试中 `_format_status` 从 `commands.py` 导入，不是 Gateway 方法
 - feishu.py 的 `_add_reaction` 受 `FEISHU_REACTIONS` 环境变量控制（默认 true）
+
+## 预装 Skill
+
+### neat-freak（洁癖）
+会话结束后对项目文档和记忆进行审查与同步。触发词：`/neat`、`整理一下`、`同步一下`、`收尾`。
+参见 `skills/neat-freak/SKILL.md`。
