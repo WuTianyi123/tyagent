@@ -7,13 +7,15 @@ and handles session lifecycle.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
+import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
 from tyagent.config import PlatformConfig, TyAgentConfig
@@ -150,6 +152,9 @@ class Gateway:
         self._draining = False
         self._active_sessions: set[str] = set()
         self._restart_drain_timeout: float = 60.0
+        # Command registry: name → (description, async_handler)
+        self._commands: Dict[str, tuple[str, Callable[..., Awaitable[str]]]]
+        self._init_commands()
         self._session_to_adapter: Dict[str, str] = {}
         self._active_chat_ids: Dict[str, str] = {}
 
@@ -236,38 +241,12 @@ class Gateway:
         else:
             session = self.session_store.get(session_key)
 
-        # Handle reset commands (normalize triggers to strip leading /)
-        normalized_triggers = {t.lstrip("/").lower() for t in self.config.reset_triggers}
-        if event.is_command() and event.get_command() in normalized_triggers:
-            self.session_store.archive(session_key)
-            self.session_store.freshen_session(session_key)
-            session = self.session_store.get(session_key)
-            await adapter.send_message(
-                event.chat_id or "",
-                "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
-                reply_to_message_id=event.message_id,
-            )
-            return "Session archived"
-
-        # Handle /status command
-        if event.is_command() and event.get_command() == "status":
-            status_text = self._format_status(session_key)
-            await adapter.send_message(
-                event.chat_id or "",
-                status_text,
-                reply_to_message_id=event.message_id,
-            )
-            return "Status sent"
-
-        # Handle /restart command
-        if event.is_command() and event.get_command() == "restart":
-            await adapter.send_message(
-                event.chat_id or "",
-                "🔄 正在重启 gateway...",
-                reply_to_message_id=event.message_id,
-            )
-            os.kill(os.getpid(), signal.SIGUSR1)
-            return "Gateway restart initiated"
+        # Dispatch built-in commands via registry
+        if event.is_command():
+            cmd = event.get_command()
+            if cmd and cmd in self._commands:
+                _, handler = self._commands[cmd]
+                return await handler(adapter, event, session_key, session)
 
         # Build message for LLM
         user_message = event.text
@@ -426,6 +405,72 @@ class Gateway:
         ]
         return "\n".join(lines)
 
+    async def _cmd_help(
+        self, adapter: BasePlatformAdapter, event: MessageEvent,
+        session_key: str, _session: Any,
+    ) -> str:
+        """Handle /help: auto-generate help from command registry."""
+        lines = ["📖 **tyagent 可用命令**", ""]
+        for name, (desc, _) in self._commands.items():
+            lines.append(f"**`/{name}`** — {desc}")
+        await adapter.send_message(
+            event.chat_id or "", "\n".join(lines),
+            reply_to_message_id=event.message_id,
+        )
+        return "Help sent"
+
+    async def _cmd_status(
+        self, adapter: BasePlatformAdapter, event: MessageEvent,
+        session_key: str, _session: Any,
+    ) -> str:
+        """Handle /status: show session info."""
+        await adapter.send_message(
+            event.chat_id or "", self._format_status(session_key),
+            reply_to_message_id=event.message_id,
+        )
+        return "Status sent"
+
+    async def _cmd_restart(
+        self, adapter: BasePlatformAdapter, event: MessageEvent,
+        _session_key: str, _session: Any,
+    ) -> str:
+        """Handle /restart: trigger graceful gateway restart."""
+        await adapter.send_message(
+            event.chat_id or "", "🔄 正在重启 gateway...",
+            reply_to_message_id=event.message_id,
+        )
+        self._restart_requestor = {
+            "platform": event.platform,
+            "chat_id": event.chat_id or "",
+        }
+        os.kill(os.getpid(), signal.SIGUSR1)
+        return "Gateway restart initiated"
+
+    async def _cmd_reset(
+        self, adapter: BasePlatformAdapter, event: MessageEvent,
+        session_key: str, _session: Any,
+    ) -> str:
+        """Handle /new and /reset: archive current session, start fresh."""
+        self.session_store.archive(session_key)
+        self.session_store.freshen_session(session_key)
+        await adapter.send_message(
+            event.chat_id or "",
+            "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
+            reply_to_message_id=event.message_id,
+        )
+        return "Session archived"
+
+    def _init_commands(self) -> None:
+        """Register all built-in and configurable commands."""
+        self._commands = OrderedDict()
+        self._commands["help"] = ("显示此帮助信息", self._cmd_help)
+        self._commands["status"] = ("查看当前会话状态（模型、消息数、会话时长）", self._cmd_status)
+        self._commands["restart"] = ("重启 gateway（约 2~3 秒，重启完成后自动通知）", self._cmd_restart)
+        for trigger in self.config.reset_triggers:
+            trigger = trigger.strip().lower().lstrip("/")
+            if trigger not in self._commands:
+                self._commands[trigger] = ("归档当前会话并开始新对话（历史记录保留）", self._cmd_reset)
+
     async def start(self) -> None:
         """Start all adapters and run the gateway."""
         self._load_adapters()
@@ -446,6 +491,41 @@ class Gateway:
                 name=f"adapter-{name}",
             )
             tasks.append(task)
+
+        # If there's a pending restart notification, schedule it once the
+        # corresponding adapter has finished connecting.
+        notif = getattr(self, "_restart_notification_pending", None)
+        if notif:
+            async def _send_restart_notification() -> None:
+                adapter = self.adapters.get(notif["platform"])
+                if not adapter:
+                    return
+                t0 = time.monotonic()
+                logger.info("Restart notification: waiting for adapter %s to connect...", notif["platform"])
+                # Poll until adapter is running (WebSocket connected), up to 10s
+                for _ in range(20):
+                    if adapter.running:
+                        break
+                    await asyncio.sleep(0.5)
+                connect_time = time.monotonic() - t0
+                if adapter.running:
+                    t1 = time.monotonic()
+                    initiated_at = notif.get("initiated_at")
+                    if initiated_at:
+                        total_elapsed = time.time() - initiated_at
+                        msg = f"✅ Gateway 已重启完成（总耗时 {total_elapsed:.0f}s）"
+                    else:
+                        msg = "✅ Gateway 已重启完成"
+                    await adapter.send_message(notif["chat_id"], msg)
+                    send_time = time.monotonic() - t1
+                    logger.info(
+                        "Sent restart notification to %s via %s (connect=%.1fs, send=%.1fs, total=%.1fs)",
+                        notif["chat_id"], notif["platform"],
+                        connect_time, send_time, time.monotonic() - t0,
+                    )
+                else:
+                    logger.warning("Adapter %s not running within 10s — skipping restart notification", notif["platform"])
+            asyncio.create_task(_send_restart_notification())
 
         # Wait for shutdown signal
         await self._shutdown_event.wait()
@@ -558,18 +638,37 @@ class Gateway:
                     logger.exception("Failed to mark resume_pending for %s", session_key)
 
             # Write .clean_shutdown marker to indicate intentional restart
+            # Include restart requestor info so the new process can send a notification
             try:
                 marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
                 marker_path.parent.mkdir(parents=True, exist_ok=True)
-                marker_path.write_text("clean", encoding="utf-8")
+                marker_data = {"reason": "restart"}
+                req = getattr(self, "_restart_requestor", None)
+                if req:
+                    marker_data["requestor_platform"] = req["platform"]
+                    marker_data["requestor_chat_id"] = req["chat_id"]
+                # Record when restart was initiated so new process can measure total time
+                marker_data["initiated_at"] = time.time()
+                marker_path.write_text(json.dumps(marker_data), encoding="utf-8")
                 logger.info("Wrote .clean_shutdown marker at %s", marker_path)
             except Exception as exc:
                 logger.error("Failed to write .clean_shutdown marker: %s", exc)
         except Exception:
-            logger.exception("Graceful restart failed unexpectedly — exiting with code 75 anyway")
+            logger.exception("Graceful restart failed unexpectedly — proceeding with restart anyway")
 
-        logger.info("Graceful restart complete — exiting with code 75")
-        os._exit(75)
+        logger.info("Graceful restart complete — spawning systemctl restart (avoids RestartSec delay)")
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--unit=tyagent-restart-helper",
+                 "systemctl", "--user", "restart", "tyagent-gateway"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.error("Failed to spawn systemctl restart: %s — falling back to exit 75", exc)
+            os._exit(75)
+        os._exit(0)
 
     async def _drain_active_agents(self, timeout: float) -> bool:
         """Wait for all active sessions to complete, up to timeout seconds.
@@ -600,24 +699,8 @@ class Gateway:
             except Exception:
                 logger.exception("Failed to notify session %s", session_key)
 
-    def _check_recovery_on_startup(self) -> None:
-        """Check for .clean_shutdown marker and handle session recovery.
-
-        If the marker exists, it means the previous shutdown was intentional
-        (graceful restart), so we skip suspending sessions. If absent, we
-        assume an unclean shutdown and suspend recently-active sessions.
-        """
-        marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
-        if marker_path.exists():
-            logger.info("Clean shutdown marker found — previous restart was intentional")
-            try:
-                marker_path.unlink()
-                logger.debug("Removed .clean_shutdown marker")
-            except OSError as exc:
-                logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
-            return
-
-        logger.info("No clean shutdown marker — assuming unclean shutdown, suspending recent sessions")
+    def _suspend_recent_sessions(self) -> None:
+        """Suspend sessions that were recently active (unclean shutdown recovery)."""
         try:
             suspended = self.session_store.suspend_recently_active(max_age_seconds=120)
             if suspended:
@@ -626,6 +709,52 @@ class Gateway:
                 logger.debug("No recently-active sessions to suspend")
         except Exception:
             logger.exception("Failed to suspend recent sessions on startup")
+
+    def _check_recovery_on_startup(self) -> None:
+        """Check for .clean_shutdown marker and handle session recovery.
+
+        If the marker exists with restart requestor info, save it as a pending
+        notification to be sent once adapters are connected.
+
+        If the marker exists (intentional restart), skip suspending sessions.
+        If absent, assume unclean shutdown and suspend recently-active sessions.
+        """
+        self._restart_notification_pending: Optional[Dict[str, str]] = None
+        marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+        if not marker_path.exists():
+            logger.info("No clean shutdown marker — assuming unclean shutdown, suspending recent sessions")
+            self._suspend_recent_sessions()
+            return
+
+        # Parse marker — new format is JSON, old format is plain "clean"
+        try:
+            raw = marker_path.read_text(encoding="utf-8").strip()
+            marker = json.loads(raw) if raw.startswith("{") else {"reason": raw}
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to parse .clean_shutdown marker: %s", exc)
+            marker_path.unlink(missing_ok=True)
+            self._suspend_recent_sessions()
+            return
+
+        logger.info("Clean shutdown marker found — previous restart was intentional (reason=%s)", marker.get("reason", "unknown"))
+
+        # Save restart notification for later (adapters aren't connected yet)
+        platform_name = marker.get("requestor_platform")
+        chat_id = marker.get("requestor_chat_id")
+        if platform_name and chat_id:
+            self._restart_notification_pending = {
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "initiated_at": marker.get("initiated_at"),
+            }
+            logger.info("Saved restart notification for %s via %s (will send after adapter connects)", chat_id, platform_name)
+
+        # Clean up marker
+        try:
+            marker_path.unlink(missing_ok=True)
+            logger.debug("Removed .clean_shutdown marker")
+        except OSError as exc:
+            logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
 
 
 async def run_gateway(config_path: Optional[str] = None) -> None:

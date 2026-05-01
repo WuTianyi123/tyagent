@@ -130,7 +130,7 @@ class TyAgentConfig:
     workspace_dir: Path = field(default_factory=lambda: default_workspace)
     sessions_dir: Path = field(default_factory=lambda: default_home / "sessions")
     log_level: str = "INFO"
-    reset_triggers: List[str] = field(default_factory=lambda: ["new", "reset"])
+    reset_triggers: List[str] = field(default_factory=lambda: ["new"])
 
     def get_platform(self, name: str) -> Optional[PlatformConfig]:
         return self.platforms.get(name)
@@ -174,7 +174,7 @@ class TyAgentConfig:
             workspace_dir=workspace,
             sessions_dir=Path(data.get("sessions_dir", str(home / "sessions"))),
             log_level=data.get("log_level", "INFO"),
-            reset_triggers=data.get("reset_triggers", ["new", "reset"]),
+            reset_triggers=data.get("reset_triggers", ["new"]),
         )
 
 
