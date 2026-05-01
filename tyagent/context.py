@@ -184,17 +184,13 @@ async def compress_context(
     if not pre_content:
         return None
 
-    # — Step 4: ask a lightweight LLM to summarise pre_content —
+    # — Step 4: ask the base LLM to summarise pre_content —
     serialized = json.dumps([
         {
             "role": m.get("role", ""),
             "content": m.get("content") or "",
             "reasoning_content": m.get("reasoning_content"),
-            "tool_calls": (
-                [tc.get("function", {}).get("name", "?")
-                 for tc in (m.get("tool_calls") or [])]
-                if m.get("tool_calls") else None
-            ),
+            "tool_calls": m.get("tool_calls") or None,
             "tool_call_id": m.get("tool_call_id"),
         }
         for m in pre_content
