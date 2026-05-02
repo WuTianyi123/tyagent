@@ -21,6 +21,7 @@ import httpx
 from tyagent.config import CompressionConfig
 from tyagent.context import compress_context
 from tyagent.events import EventCollector
+from tyagent.types import AgentOutput, ReplyTarget
 
 logger = logging.getLogger(__name__)
 
@@ -66,21 +67,6 @@ def _is_context_overflow(status_code: int, body: str) -> bool:
         return False
     body_lower = body.lower()
     return any(p in body_lower for p in _CONTEXT_OVERFLOW_PATTERNS)
-
-
-@dataclass
-class AgentOutput:
-    """Single output from the agent loop. reply_target is set for user-triggered replies."""
-    text: str
-    reply_target: "Optional[ReplyTarget]" = None
-
-
-@dataclass
-class ReplyTarget:
-    """Route information for where to send a reply."""
-    platform: str = ""
-    chat_id: str = ""
-    message_id: str = ""
 
 
 class TyAgent:

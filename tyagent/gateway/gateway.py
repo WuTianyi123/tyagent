@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
+from tyagent.types import ReplyTarget
 from tyagent.config import PlatformConfig, TyAgentConfig
 from tyagent.gateway.commands import CommandRegistry
 from tyagent.gateway.consumer import StreamConsumer
@@ -181,6 +182,10 @@ class Gateway:
         self._restart_notification_pending: Optional[Dict[str, str]] = None
         self._session_to_adapter: Dict[str, str] = {}
         self._active_chat_ids: Dict[str, str] = {}
+        # Actor-model session agents
+        self._session_agents: Dict[str, TyAgent] = {}
+        self._session_adapters: Dict[str, Any] = {}
+        self._session_output_tasks: Dict[str, asyncio.Task] = {}
         # Subsystems
         self.commands = CommandRegistry(self)
         self.supervisor = GatewaySupervisor(self)
@@ -315,122 +320,146 @@ class Gateway:
         self._active_sessions.add(session_key)
         self._session_to_adapter[session_key] = adapter.platform_name
         self._active_chat_ids[session_key] = event.chat_id or ""
+        self._session_adapters[session_key] = adapter
+
         try:
-            # Sanitize message chain (strip orphaned tool_calls at end)
-            sanitized = _sanitize_message_chain(session.messages)
-
-            # Inject persistent memory into the last user message content
-            memory_block = self.memory_store.get_all_formatted()
-            if memory_block and sanitized and sanitized[-1].get("role") == "user":
-                sanitized[-1] = dict(sanitized[-1])
-                existing = sanitized[-1].get("content") or ""
-                sanitized[-1]["content"] = (
-                    existing + "\n\n[记忆上下文]\n" + memory_block
-                )
-
             # Define the persistence callback for tool loop messages
-            _persist_sid = getattr(
-                session.metadata, "current_session_id", None
-            ) or getattr(session, "current_session_id", None)
+            _persist_sid = getattr(session.metadata, "current_session_id", None) or \
+                           getattr(session, "current_session_id", None)
 
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(
-                    session_key,
-                    role,
-                    content,
-                    session_id=_persist_sid,
-                    **extras,
+                    session_key, role, content,
+                    session_id=_persist_sid, **extras,
                 )
 
-            agent = self._get_or_create_agent(session_key)
-
-            # Create progress sender and wire it to the agent
+            # Create progress sender
             progress_sender = ProgressSender(
-                adapter,
-                event.chat_id or "",
+                adapter, event.chat_id or "",
                 reply_to_message_id=event.message_id,
                 enabled=bool(event.chat_id) and not event.is_command(),
             )
-            _progress_cb = progress_sender.on_tool_started
             progress_task = asyncio.create_task(progress_sender.run())
+            _progress_cb = progress_sender.on_tool_started
 
-            try:
-                # Streaming path for platform chat messages (non-command)
-                if event.chat_id and not event.is_command():
-                    consumer = StreamConsumer(
-                        adapter,
-                        event.chat_id,
-                        reply_to_message_id=event.message_id,
-                    )
-                    consumer_task = asyncio.create_task(consumer.run())
-                    try:
-                        response = await agent.chat(
-                            sanitized,
-                            tools=tool_defs,
-                            stream=True,
-                            stream_delta_callback=consumer.on_delta,
-                            on_segment_break=consumer.on_segment_break,
-                            on_message=persist_message,
-                            tool_progress_callback=_progress_cb,
-                        )
-                        streaming_ok = True
-                    except Exception:
-                        streaming_ok = False
-                        logger.exception(
-                            "Agent streaming chat failed, propagating to outer handler"
-                        )
-                        raise
-                    finally:
-                        consumer.finish()
-                        try:
-                            await consumer_task
-                        except asyncio.CancelledError:
-                            pass  # Normal cancellation
-                        except Exception:
-                            if streaming_ok:
-                                raise
-                            logger.exception(
-                                "StreamConsumer task failed during cleanup "
-                                "(agent also failed)"
-                            )
-
-                    # Response is already sent via StreamConsumer editing
-                    return response
-
-                # Non-streaming path for commands and fallback
-                response = await agent.chat(
-                    sanitized,
-                    tools=tool_defs,
-                    on_message=persist_message,
-                    tool_progress_callback=_progress_cb,
-                )
-            except AgentError as exc:
-                logger.error("Agent error: %s", exc)
-                response = f"❌ 错误: {exc}"
-            except Exception:
-                logger.exception("Unexpected agent error")
-                response = "Sorry, something went wrong."
-            finally:
-                # Clean up progress sender
-                progress_sender.finish()
-                try:
-                    await progress_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        finally:
-            self._active_sessions.discard(session_key)
-            self._active_chat_ids.pop(session_key, None)
-            self._session_to_adapter.pop(session_key, None)
-
-        # Send response back to the platform
-        if response and event.chat_id:
-            await adapter.send_message(
-                event.chat_id,
-                response,
-                reply_to_message_id=event.message_id,
+            # Ensure session agent is running (starts loop if new session)
+            agent = await self._ensure_session_agent(
+                session_key, session,
+                adapter, event.chat_id or "",
+                persist_message,
             )
 
-        return response
+            # Inject memory into user message
+            memory_block = self.memory_store.get_all_formatted()
+            final_text = user_message
+            if memory_block:
+                final_text = f"{user_message}\n\n[记忆上下文]\n{memory_block}"
+
+            # Send message to agent loop (fire-and-forget)
+            reply_target = ReplyTarget(
+                platform=adapter.platform_name,
+                chat_id=event.chat_id or "",
+                message_id=event.message_id or "",
+            )
+            agent._tool_progress_callback = _progress_cb
+            await agent.send_message(final_text, reply_target=reply_target)
+
+        except AgentError as exc:
+            logger.error("Agent error: %s", exc)
+            await adapter.send_message(
+                event.chat_id or "", f"❌ 错误: {exc}",
+                reply_to_message_id=event.message_id,
+            )
+        except Exception:
+            logger.exception("Unexpected agent error")
+            await adapter.send_message(
+                event.chat_id or "", "Sorry, something went wrong.",
+                reply_to_message_id=event.message_id,
+            )
+        finally:
+            # Clean up progress sender
+            progress_sender.finish()
+            try: await progress_task
+            except: pass
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Actor-model session agent management
+    # ------------------------------------------------------------------
+
+    async def _ensure_session_agent(
+        self, session_key: str, session,
+        adapter, chat_id: str,
+        persist_message: Callable,
+    ) -> TyAgent:
+        """Get or create agent with running loop. Starts _consume_output."""
+        if session_key in self._session_agents:
+            return self._session_agents[session_key]
+
+        agent = self._get_or_create_agent(session_key)
+
+        # Start the permanent agent loop with history and persistence
+        await agent.start(
+            history=session.messages,
+            on_message=persist_message,
+        )
+
+        self._session_agents[session_key] = agent
+        self._session_adapters[session_key] = adapter
+
+        # Start background output consumer
+        self._session_output_tasks[session_key] = asyncio.create_task(
+            self._consume_output(session_key)
+        )
+
+        return agent
+
+    async def _consume_output(self, session_key: str):
+        """Long-running task: consume agent outputs and send to platform."""
+        agent = self._session_agents.get(session_key)
+        if agent is None:
+            return
+
+        while self._running:
+            try:
+                output = await asyncio.wait_for(agent._output_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            adapter = self._session_adapters.get(session_key)
+            chat_id = self._active_chat_ids.get(session_key, "")
+            if adapter is None:
+                continue
+
+            if output.reply_target:
+                # User-message-driven reply
+                await adapter.send_message(
+                    output.reply_target.chat_id,
+                    output.text,
+                    reply_to=output.reply_target.message_id,
+                )
+            else:
+                # Auto-reply (child completion triggered)
+                await adapter.send_message(chat_id, output.text)
+
+            # Persist to session store
+            try:
+                self.session_store.add_message(session_key, "assistant", output.text)
+            except Exception:
+                logger.exception("Failed to persist output for %s", session_key)
+
+    def _stop_session_agent(self, session_key: str):
+        """Stop and clean up a session's agent loop and consumer."""
+        task = self._session_output_tasks.pop(session_key, None)
+        if task is not None:
+            task.cancel()
+        agent = self._session_agents.pop(session_key, None)
+        if agent is not None:
+            asyncio.create_task(agent.stop())
+        self._session_adapters.pop(session_key, None)
 
     def _find_adapter_for_event(
         self, event: MessageEvent
@@ -488,6 +517,10 @@ class Gateway:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Stop all session agents (actor model loops)
+        for session_key in list(self._session_agents.keys()):
+            self._stop_session_agent(session_key)
 
         # Close all cached agents
         for key, cached_agent in list(self._agent_cache.items()):

@@ -107,12 +107,16 @@ class TestGatewayInit:
 class TestOnMessage:
     @pytest.mark.asyncio
     async def test_normal_message_flow(self, tmp_path):
-        """Normal message flow: non-command messages go through streaming path
-        and response is sent via StreamConsumer."""
+        """Normal message flow: non-command messages go through actor model
+        and response is sent via _consume_output background task."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.chat = AsyncMock(return_value="Hi there!")
         agent.model = "test-model"
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock()
+        agent._output_queue = asyncio.Queue()
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -121,10 +125,14 @@ class TestOnMessage:
         event = _make_event(text="hello")
         result = await gw._on_message(event)
 
-        # Streaming path: returns the agent response directly
-        assert result == "Hi there!"
-        # Streaming path does NOT call adapter.send_message at the end
-        # (StreamConsumer handles message delivery internally)
+        # Actor model: returns None (response is sent via background consumer)
+        assert result is None
+        # agent.start was called with history
+        agent.start.assert_called_once()
+        # agent.send_message was called with the user text
+        agent.send_message.assert_called_once()
+        call_text = agent.send_message.call_args[0][0]
+        assert "hello" in call_text
         # User message is persisted by gateway directly.
         assert gw.session_store.get_message_count("feishu:chat1") >= 1
         gw.session_store.close()
@@ -194,7 +202,9 @@ class TestOnMessage:
     async def test_agent_error_returns_fallback(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
-        agent.chat = AsyncMock(side_effect=AgentError("API error"))
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock(side_effect=AgentError("API error"))
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -203,14 +213,20 @@ class TestOnMessage:
         event = _make_event()
         result = await gw._on_message(event)
 
-        assert "error" in result.lower() or "sorry" in result.lower()
+        # Error is sent via adapter.send_message, result is None
+        assert result is None
+        adapter.send_message.assert_called_once()
+        sent_text = adapter.send_message.call_args[0][1]
+        assert "error" in sent_text.lower()
         gw.session_store.close()
 
     @pytest.mark.asyncio
     async def test_unexpected_exception_returns_fallback(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
-        agent.chat = AsyncMock(side_effect=RuntimeError("boom"))
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -219,7 +235,11 @@ class TestOnMessage:
         event = _make_event()
         result = await gw._on_message(event)
 
-        assert "sorry" in result.lower() or "wrong" in result.lower()
+        # Error is sent via adapter.send_message, result is None
+        assert result is None
+        adapter.send_message.assert_called_once()
+        sent_text = adapter.send_message.call_args[0][1]
+        assert "sorry" in sent_text.lower() or "wrong" in sent_text.lower()
         gw.session_store.close()
 
     @pytest.mark.asyncio
@@ -228,6 +248,10 @@ class TestOnMessage:
         agent = MagicMock()
         agent.chat = AsyncMock(return_value="Got it")
         agent.model = "test-model"
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock()
+        agent._output_queue = asyncio.Queue()
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -238,7 +262,7 @@ class TestOnMessage:
         event.media_types = ["image"]
         result = await gw._on_message(event)
 
-        assert result == "Got it"
+        assert result is None
         msgs = gw.session_store.get_messages("feishu:chat1")
         user_msg = msgs[0]["content"]
         assert "Attached image" in user_msg or "img_key_123" in user_msg
@@ -249,6 +273,10 @@ class TestOnMessage:
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.chat = AsyncMock(return_value="reply")
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock()
+        agent._output_queue = asyncio.Queue()
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -264,11 +292,15 @@ class TestOnMessage:
 
     @pytest.mark.asyncio
     async def test_normal_message_flow_on_message_callback(self, tmp_path):
-        """Verify on_message callback is passed to agent.chat()."""
+        """Verify on_message callback is passed to agent.start()."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.chat = AsyncMock(return_value="Hi!")
         agent.model = "test-model"
+        agent.start = AsyncMock()
+        agent.send_message = AsyncMock()
+        agent._output_queue = asyncio.Queue()
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
 
         adapter = _make_adapter()
@@ -277,8 +309,8 @@ class TestOnMessage:
         event = _make_event(text="hello")
         await gw._on_message(event)
 
-        # Verify agent.chat was called with on_message
-        call_kwargs = agent.chat.call_args[1]
+        # Verify agent.start was called with on_message
+        call_kwargs = agent.start.call_args[1]
         assert "on_message" in call_kwargs
         assert callable(call_kwargs["on_message"])
         gw.session_store.close()
@@ -494,32 +526,37 @@ class TestGatewayDrainAndRestart:
 
     @pytest.mark.asyncio
     async def test_active_session_tracking(self, tmp_path):
-        """session_key is added to _active_sessions during agent.chat()."""
+        """session_key is added to _active_sessions during agent processing."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
 
-        async def delayed_chat(*args, **kwargs):
+        async def delayed_start(*args, **kwargs):
             await asyncio.sleep(0.05)
-            return "done"
 
-        agent.chat = AsyncMock(side_effect=delayed_chat)
+        async def delayed_send(*args, **kwargs):
+            await asyncio.sleep(0.05)
+
+        agent.start = AsyncMock(side_effect=delayed_start)
+        agent.send_message = AsyncMock(side_effect=delayed_send)
+        agent.chat = AsyncMock(return_value="done")
         agent.model = "test-model"
+        agent._output_queue = asyncio.Queue()
+        agent._tool_progress_callback = None
         gw = Gateway(config, agent=agent)
         adapter = _make_adapter()
         gw.adapters["feishu"] = adapter
 
         async def check_active():
             event = _make_event(text="hello")
-            # Start _on_message in background since it's async
             async def run():
                 return await gw._on_message(event)
             task = asyncio.create_task(run())
             await asyncio.sleep(0.01)
-            # During agent.chat(), session_key should be in active_sessions
+            # During _on_message(), session_key should be in active_sessions
             assert "feishu:chat1" in gw._active_sessions
             await task
-            # After finish, should be removed
-            assert "feishu:chat1" not in gw._active_sessions
+            # After finish, session stays active (actor model runs in background)
+            assert "feishu:chat1" in gw._active_sessions
 
         await check_active()
         gw.session_store.close()

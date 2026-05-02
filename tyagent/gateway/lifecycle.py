@@ -81,6 +81,15 @@ class GatewaySupervisor:
             )
             drained = await self._drain_active_agents(gw._restart_drain_timeout)
 
+            # Stop all session agents (actor model loops)
+            for session_key in list(gw._session_agents.keys()):
+                try:
+                    gw._stop_session_agent(session_key)
+                except Exception:
+                    logger.exception(
+                        "Failed to stop session agent for %s", session_key
+                    )
+
             if not drained:
                 logger.warning(
                     "Drain timeout reached — forcing restart with %d active session(s)",
