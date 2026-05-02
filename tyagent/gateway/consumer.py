@@ -196,6 +196,13 @@ class StreamConsumer:
                                             self._message_id = result.message_id
                                             self._already_sent = True
                                             self._last_sent_text = self._accumulated
+                                    else:
+                                        # tail为空 → 全部内容已带▉发送过，发完整版覆盖光标
+                                        result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
+                                        if result.success:
+                                            self._message_id = result.message_id
+                                            self._already_sent = True
+                                            self._last_sent_text = self._accumulated
                                 else:
                                     result = await self.adapter.send_message(self.chat_id, self._accumulated, reply_to_message_id=self._reply_to_message_id)
                                     if result.success:
