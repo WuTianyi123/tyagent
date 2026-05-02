@@ -32,79 +32,6 @@ DEFAULT_SUBAGENT_MAX_TOOL_TURNS = 30
 
 
 # ---------------------------------------------------------------------------
-# Subagent run helper (sync wrapper around async child.chat)
-# ---------------------------------------------------------------------------
-
-
-def _run_child_sync(
-    model: str,
-    api_key: str,
-    base_url: str,
-    system_prompt: str,
-    reasoning_effort: Optional[str],
-    goal: str,
-    tool_names: List[str],
-    max_tool_turns: int,
-    context: Optional[str],
-    compression: Any = None,
-    tool_progress_callback: Any = None,
-) -> Dict[str, Any]:
-    """Run a child agent synchronously and return a result dict."""
-    t0 = time.monotonic()
-    child_system = system_prompt
-    if context:
-        child_system = f"{system_prompt}\n\nTask context: {context}"
-
-    child = TyAgent(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        max_tool_turns=max_tool_turns,
-        system_prompt=child_system,
-        reasoning_effort=reasoning_effort,
-        compression=compression,
-    )
-    child_messages = [{"role": "user", "content": goal}]
-    tool_defs = registry.get_definitions(names=tool_names)
-
-    async def _run() -> str:
-        try:
-            return await child.chat(
-                child_messages,
-                tools=tool_defs,
-                tool_progress_callback=tool_progress_callback,
-            )
-        finally:
-            try:
-                await asyncio.shield(child.close())
-            except Exception:
-                logger.exception("delegate_task: child.close() failed")
-
-    loop: asyncio.AbstractEventLoop | None = None
-    try:
-        loop = asyncio.new_event_loop()
-        timeout = 600.0  # wall-clock timeout for child agent
-        summary = loop.run_until_complete(asyncio.wait_for(_run(), timeout=timeout))
-    except BaseException as exc:
-        return {
-            "success": False,
-            "summary": None,
-            "error": str(exc),
-            "duration_seconds": round(time.monotonic() - t0, 2),
-        }
-    finally:
-        if loop is not None:
-            loop.close()
-
-    return {
-        "success": True,
-        "summary": summary.strip() if summary else "",
-        "error": None,
-        "duration_seconds": round(time.monotonic() - t0, 2),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Tool handler
 # ---------------------------------------------------------------------------
 
@@ -333,13 +260,10 @@ def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> str:
 
 
 def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
-    """Handle delegate_task tool calls.
+    """Convenience wrapper: spawn_task + immediate wait_task, flattened result.
 
-    Spawns a child TyAgent with restricted tools, runs it synchronously,
-    and returns a JSON result with summary + metadata.
-
-    *parent_agent* is the TyAgent instance that owns this session —
-    injected by registry.dispatch via chat() for race-free concurrency.
+    Kept for backward compatibility. Equivalent to the original blocking
+    delegate_task behavior but uses the new async sub-agent infrastructure.
     """
     goal = args.get("goal", "").strip()
     if not goal:
@@ -348,8 +272,6 @@ def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str
     context = args.get("context") or None
     toolsets: Optional[List[str]] = args.get("toolsets") or None
     max_tool_turns = args.get("max_tool_turns", DEFAULT_SUBAGENT_MAX_TOOL_TURNS)
-
-    # Coerce max_tool_turns safely
     try:
         max_tool_turns = int(max_tool_turns)
     except (TypeError, ValueError):
@@ -358,50 +280,32 @@ def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str
         return tool_error("max_tool_turns must be at least 1.")
     if max_tool_turns > 200:
         return tool_error("max_tool_turns must be at most 200.")
-
     if parent_agent is None:
         return tool_error("No parent agent context — delegate_task requires a session agent.")
 
-    # Build allowed tool names (parent tools minus blocked)
-    all_names = registry.get_all_names()
-    allowed = [n for n in all_names if n not in DELEGATE_BLOCKED_TOOLS]
+    # Delegate to spawn_task
+    spawn_args = {"goal": goal}
+    if context:
+        spawn_args["context"] = context
     if toolsets:
-        allowed = [n for n in toolsets if n in allowed]
+        spawn_args["toolsets"] = toolsets
+    if max_tool_turns != DEFAULT_SUBAGENT_MAX_TOOL_TURNS:
+        spawn_args["max_tool_turns"] = max_tool_turns
 
-    logger.info(
-        "delegate_task: spawning subagent goal=%r, tools=%d, max_turns=%d",
-        goal[:80], len(allowed), max_tool_turns,
+    spawn_result = json.loads(_handle_spawn_task(spawn_args, parent_agent=parent_agent))
+    if "error" in spawn_result:
+        return json.dumps(spawn_result, ensure_ascii=False)
+
+    task_id = spawn_result["task_id"]
+
+    # Immediately wait
+    wait_result = json.loads(
+        _handle_wait_task({"task_ids": [task_id]}, parent_agent=parent_agent)
     )
 
-    # Build child progress callback: relay subagent tool calls to parent's
-    # ProgressSender with a 📤 prefix so the user can distinguish them.
-    parent_cb = getattr(parent_agent, "_tool_progress_callback", None)
-    child_cb = None
-    if parent_cb is not None:
-        def _child_progress(tool_name: str, args: dict) -> None:
-            parent_cb(tool_name, args, prefix="📤 ")
-        child_cb = _child_progress
-
-    result = _run_child_sync(
-        model=parent_agent.model,
-        api_key=parent_agent.api_key,
-        base_url=parent_agent.base_url,
-        system_prompt=parent_agent.system_prompt,
-        reasoning_effort=parent_agent.reasoning_effort,
-        goal=goal,
-        tool_names=allowed,
-        max_tool_turns=max_tool_turns,
-        context=context,
-        compression=_build_parent_compression(parent_agent),
-        tool_progress_callback=child_cb,
-    )
-
-    logger.info(
-        "delegate_task: subagent done success=%s, dur=%.1fs",
-        result["success"], result["duration_seconds"],
-    )
-
-    return json.dumps(result, ensure_ascii=False)
+    # Flatten: delegate_task returns one result dict, not {task_id: result}
+    single = wait_result.get(task_id, {"error": "Unknown error"})
+    return json.dumps(single, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
