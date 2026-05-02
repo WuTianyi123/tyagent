@@ -346,6 +346,11 @@ class Gateway:
                 enabled=bool(event.chat_id) and not event.is_command(),
             )
             progress_task = asyncio.create_task(progress_sender.run())
+            # Suppress "Task exception was never retrieved" warning by
+            # draining any exception in a done callback.
+            progress_task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
             _progress_cb = progress_sender.on_tool_started
 
             # Ensure session agent is running (starts loop if new session)
@@ -361,32 +366,44 @@ class Gateway:
             if memory_block:
                 final_text = f"{user_message}\n\n[记忆上下文]\n{memory_block}"
 
-            # Send message to agent loop (fire-and-forget)
+            # Send message to agent loop (fire-and-forget), with per-message
+            # progress callbacks so ProgressSender stays alive until the
+            # agent's turn completes.
             reply_target = ReplyTarget(
                 platform=adapter.platform_name,
                 chat_id=event.chat_id or "",
                 message_id=event.message_id or "",
             )
-            agent._tool_progress_callback = _progress_cb
-            await agent.send_message(final_text, reply_target=reply_target)
+            # Capture progress_sender in closure so turn_done finishes it
+            _ps = progress_sender
+            def _turn_done() -> None:
+                _ps.finish()
+
+            await agent.send_message(
+                final_text,
+                reply_target=reply_target,
+                tool_progress_cb=_progress_cb,
+                turn_done_cb=_turn_done,
+            )
 
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
+            progress_sender.finish()
+            try: await progress_task
+            except: pass
             await adapter.send_message(
                 event.chat_id or "", f"❌ 错误: {exc}",
                 reply_to_message_id=event.message_id,
             )
         except Exception:
             logger.exception("Unexpected agent error")
+            progress_sender.finish()
+            try: await progress_task
+            except: pass
             await adapter.send_message(
                 event.chat_id or "", "Sorry, something went wrong.",
                 reply_to_message_id=event.message_id,
             )
-        finally:
-            # Clean up progress sender
-            progress_sender.finish()
-            try: await progress_task
-            except: pass
 
         return None
 

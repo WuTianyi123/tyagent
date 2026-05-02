@@ -1,7 +1,7 @@
 """Shared type definitions for tyagent actor model."""
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -24,3 +24,5 @@ class InboxMessage:
     """A user message going into the agent loop."""
     text: str
     reply_target: Optional[ReplyTarget] = None
+    tool_progress_cb: Optional[Any] = None
+    turn_done_cb: Optional[Any] = None

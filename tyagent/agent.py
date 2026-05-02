@@ -526,13 +526,22 @@ class TyAgent:
                 except asyncio.CancelledError: pass
             self._loop_task = None
 
-    async def send_message(self, text: str, reply_target: Optional[ReplyTarget] = None) -> None:
+    async def send_message(
+        self, text: str,
+        reply_target: Optional[ReplyTarget] = None,
+        tool_progress_cb: Any = None,
+        turn_done_cb: Any = None,
+    ) -> None:
         """Send a message to the agent loop (fire-and-forget)."""
         if not self._running:
             raise RuntimeError("Agent loop not running. Call start() first.")
         if not text:
             return
-        await self._inbox.put(InboxMessage(text=text, reply_target=reply_target))
+        await self._inbox.put(InboxMessage(
+            text=text, reply_target=reply_target,
+            tool_progress_cb=tool_progress_cb,
+            turn_done_cb=turn_done_cb,
+        ))
 
     async def _agent_loop(self) -> None:
         """Permanent agent event loop — select! over inbox, collector, stop."""
@@ -572,15 +581,24 @@ class TyAgent:
                     self._messages.append({"role": "user", "content": inject})
 
             # Process user message
+            current_reply = None
+            current_tool_cb = None
+            current_turn_done = None
             if inbox_task in done:
                 msg = inbox_task.result()
                 self._messages.append({"role": "user", "content": msg.text})
                 current_reply = msg.reply_target
+                current_tool_cb = msg.tool_progress_cb
+                current_turn_done = msg.turn_done_cb
 
             # Run turn with error handling
             tools = registry.get_definitions()
             try:
+                # Activate per-message tool progress callback
+                prev_tool_cb = self._tool_progress_callback
+                self._tool_progress_callback = current_tool_cb
                 content = await self._run_turn(tools=tools)
+                self._tool_progress_callback = prev_tool_cb
                 if content.strip():
                     await self._output_queue.put(AgentOutput(
                         text=content,
@@ -594,16 +612,25 @@ class TyAgent:
                     ))
             except AgentError as exc:
                 logger.error("Agent loop error: %s", exc)
+                self._tool_progress_callback = prev_tool_cb
                 await self._output_queue.put(AgentOutput(
                     text=f"❌ 错误: {exc}",
                     reply_target=current_reply,
                 ))
             except Exception as exc:
                 logger.exception("Unexpected error in agent loop")
+                self._tool_progress_callback = prev_tool_cb
                 await self._output_queue.put(AgentOutput(
                     text=f"❌ 内部错误: {exc}",
                     reply_target=current_reply,
                 ))
+            finally:
+                # Signal that this message's turn is done
+                if current_turn_done:
+                    try:
+                        current_turn_done()
+                    except Exception:
+                        pass
 
     async def close(self) -> None:
         """Close agent and clean up."""
