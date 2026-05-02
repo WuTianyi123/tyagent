@@ -80,6 +80,9 @@ tyagent/
 - 异步工具（spawn_task 等）在 `_run_turn()` 中直接 `await` 分发；同步工具通过 `run_in_executor`
 - 测试中 `_format_status` 从 `commands.py` 导入，不是 Gateway 方法
 - feishu.py 的 `_add_reaction` 受 `FEISHU_REACTIONS` 环境变量控制（默认 true）
+- 飞书 edit 用 `update` 非 `patch`（patch 仅卡片）。编辑上限 `230072` 不设禁用（fallback 续新消息）
+- 飞书 Reaction 编排：`feishu.py:_handle_with_reaction()` 单协程包裹 reaction→handler→cleanup，避免多协程竞态
+- patch 修改 markdown 代码块注意缩进问题；大段改写建议 write_file 而非逐个 patch
 
 ## 预装 Skill
 
