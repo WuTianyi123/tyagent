@@ -108,7 +108,10 @@ class TestChatBasic:
             await agent.chat(messages)
 
         assert messages[0]["role"] == "system"
-        assert messages[0]["content"] == "Be helpful"
+        # Identity is built by prompt_builder: tyagent identity + user override
+        content = messages[0]["content"]
+        assert "tyagent" in content
+        assert "Be helpful" in content
 
     @pytest.mark.asyncio
     async def test_existing_system_prompt_not_duplicated(self):

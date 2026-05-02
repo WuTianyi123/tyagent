@@ -21,6 +21,7 @@ import httpx
 from tyagent.config import CompressionConfig
 from tyagent.context import compress_context
 from tyagent.events import EventCollector
+from tyagent.prompt_builder import build_system_prompt
 from tyagent.types import AgentOutput, InboxMessage, ReplyTarget
 
 logger = logging.getLogger(__name__)
@@ -101,8 +102,9 @@ class TyAgent:
         self._client = httpx.AsyncClient(timeout=120.0)
         # Real token usage from the last API response
         self.last_usage: Optional[Dict[str, int]] = None
-        # Cached system message dict for prompt caching (built once per session)
-        self._system_msg: Optional[Dict[str, Any]] = None
+        # Cached full system prompt string (built once per session, invalidated
+        # after context compression).
+        self._cached_system_prompt: Optional[str] = None
         # Boundary index for append-only api_messages mode
         self._prev_msg_count: int = 0
         # Token tracking: (message_count, cumulative_prompt_tokens) per API call.
@@ -120,6 +122,25 @@ class TyAgent:
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
         self._event_collector: Optional[EventCollector] = None
+
+    # ── System prompt ──────────────────────────────────────────
+
+    def _ensure_system_prompt(self) -> str:
+        """Return the system prompt, building and caching it on first call."""
+        if self._cached_system_prompt is None:
+            self._cached_system_prompt = build_system_prompt(
+                model=self.model,
+                user_prompt=self.system_prompt,
+            )
+        return self._cached_system_prompt
+
+    def _insert_system_prompt(self, messages: List[Dict[str, Any]]) -> None:
+        """Insert the system message at messages[0] if not already present."""
+        prompt = self._ensure_system_prompt()
+        if not messages or messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": prompt})
+
+    # ── Chat (backward-compat) ─────────────────────────────────
 
     async def chat(
         self,
@@ -152,10 +173,7 @@ class TyAgent:
                 "Content-Type": "application/json",
                 "User-Agent": "KimiCLI/1.30.0",
             }
-            if self._system_msg is None:
-                self._system_msg = {"role": "system", "content": self.system_prompt}
-            if not messages or messages[0].get("role") != "system":
-                messages.insert(0, self._system_msg)
+            self._insert_system_prompt(messages)
             self._prev_msg_count = 0
             self._token_history = []
             api_messages = list(messages)
@@ -330,10 +348,7 @@ class TyAgent:
         messages = self._messages
 
         # System prompt injection
-        if self._system_msg is None:
-            self._system_msg = {"role": "system", "content": self.system_prompt}
-        if not messages or messages[0].get("role") != "system":
-            messages.insert(0, self._system_msg)
+        self._insert_system_prompt(messages)
 
         self._prev_msg_count = 0
         self._token_history = []
@@ -420,6 +435,7 @@ class TyAgent:
                             api_messages = compressed
                             self._prev_msg_count = len(messages)
                             self._token_history = []
+                            self._cached_system_prompt = None  # rebuild next turn
                             payload_base["messages"] = api_messages
                             continue
                     raise AgentError("Context too long even after compression.")
