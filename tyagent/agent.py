@@ -564,6 +564,18 @@ class TyAgent:
                 t.cancel()
 
             if stop_task in done:
+                # Drain any pending inbox messages — their turn_done
+                # callbacks must be fired so ProgressSenders are finished.
+                while not self._inbox.empty():
+                    try:
+                        msg = self._inbox.get_nowait()
+                        if msg.turn_done_cb:
+                            try:
+                                msg.turn_done_cb()
+                            except Exception:
+                                pass
+                    except asyncio.QueueEmpty:
+                        break
                 break
 
             # Inject child completions (auto-replies have no reply_target)

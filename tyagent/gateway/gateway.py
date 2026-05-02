@@ -346,11 +346,16 @@ class Gateway:
                 enabled=bool(event.chat_id) and not event.is_command(),
             )
             progress_task = asyncio.create_task(progress_sender.run())
-            # Suppress "Task exception was never retrieved" warning by
-            # draining any exception in a done callback.
-            progress_task.add_done_callback(
-                lambda t: t.exception() if not t.cancelled() else None
-            )
+            # Suppress "Task exception was never retrieved" warning and log
+            # any unhandled exception. ProgressSender.run() handles its own
+            # exceptions, so this is belt-and-suspenders.
+            def _on_progress_done(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    logger.error("ProgressSender task crashed: %s", exc)
+            progress_task.add_done_callback(_on_progress_done)
             _progress_cb = progress_sender.on_tool_started
 
             # Ensure session agent is running (starts loop if new session)
