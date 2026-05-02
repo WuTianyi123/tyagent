@@ -356,6 +356,8 @@ class Gateway:
                 if tasks:
                     try:
                         tasks.remove(t)
+                        if not tasks:
+                            self._progress_tasks.pop(session_key, None)
                     except ValueError:
                         pass
                 if t.cancelled():
