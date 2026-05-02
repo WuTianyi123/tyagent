@@ -192,6 +192,7 @@ class Gateway:
         self._session_agents: Dict[str, TyAgent] = {}
         self._session_adapters: Dict[str, Any] = {}
         self._session_output_tasks: Dict[str, asyncio.Task] = {}
+        self._progress_tasks: Dict[str, List[asyncio.Task]] = {}
         # Subsystems
         self.commands = CommandRegistry(self)
         self.supervisor = GatewaySupervisor(self)
@@ -357,6 +358,7 @@ class Gateway:
                     logger.error("ProgressSender task crashed: %s", exc)
             progress_task.add_done_callback(_on_progress_done)
             _progress_cb = progress_sender.on_tool_started
+            self._progress_tasks.setdefault(session_key, []).append(progress_task)
 
             # Ensure session agent is running (starts loop if new session)
             agent = await self._ensure_session_agent(
@@ -370,6 +372,13 @@ class Gateway:
             final_text = user_message
             if memory_block:
                 final_text = f"{user_message}\n\n[记忆上下文]\n{memory_block}"
+
+            # Skip agent interaction for empty messages (image-only, sticker, etc.)
+            if not final_text.strip():
+                progress_sender.finish()
+                try: await progress_task
+                except: pass
+                return None
 
             # Send message to agent loop (fire-and-forget), with per-message
             # progress callbacks so ProgressSender stays alive until the
@@ -491,6 +500,12 @@ class Gateway:
         agent = self._session_agents.pop(session_key, None)
         if agent is not None:
             await agent.stop()
+        # Cancel any lingering progress tasks
+        for pt in self._progress_tasks.pop(session_key, []):
+            if not pt.done():
+                pt.cancel()
+                try: await pt
+                except (asyncio.CancelledError, asyncio.TimeoutError): pass
         self._session_adapters.pop(session_key, None)
         self._active_sessions.discard(session_key)
         self._session_to_adapter.pop(session_key, None)
