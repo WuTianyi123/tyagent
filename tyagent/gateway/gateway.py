@@ -137,8 +137,14 @@ def register_platform(name: str, adapter_class: Type[BasePlatformAdapter]) -> No
 
 
 def _load_builtin_platforms() -> None:
-    """Import the built-in platform modules so they self-register."""
-    import tyagent.platforms.feishu  # noqa: F401
+    """Load built-in platform adapters by importing them so they self-register."""
+    try:
+        from tyagent.platforms.feishu import FeishuAdapter
+        _PLATFORM_REGISTRY["feishu"] = FeishuAdapter
+    except ImportError as exc:
+        logger.debug("Feishu adapter not available: %s", exc)
+    except Exception as exc:
+        logger.error("Failed to load feishu adapter: %s", exc)
 
 
 # ---------------------------------------------------------------------------
