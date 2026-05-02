@@ -645,6 +645,11 @@ class TyAgent:
                     text=f"❌ 内部错误: {exc}",
                     reply_target=current_reply,
                 ))
+            except asyncio.CancelledError:
+                # CancelledError is BaseException in 3.11+, not caught above.
+                # Restore callback before letting cancellation propagate.
+                self._tool_progress_callback = prev_tool_cb
+                raise
             finally:
                 # Signal that this message's turn is done
                 if current_turn_done:
