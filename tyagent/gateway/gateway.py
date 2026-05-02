@@ -351,6 +351,13 @@ class Gateway:
             # any unhandled exception. ProgressSender.run() handles its own
             # exceptions, so this is belt-and-suspenders.
             def _on_progress_done(t: asyncio.Task) -> None:
+                # Clean up task reference to prevent memory leak
+                tasks = self._progress_tasks.get(session_key)
+                if tasks:
+                    try:
+                        tasks.remove(t)
+                    except ValueError:
+                        pass
                 if t.cancelled():
                     return
                 exc = t.exception()
