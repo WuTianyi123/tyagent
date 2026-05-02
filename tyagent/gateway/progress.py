@@ -163,20 +163,23 @@ class ProgressSender:
         self._done = False
         self._progress_msg_type: str | None = None
 
-    def on_tool_started(self, tool_name: str, args: dict | None = None) -> None:
+    def on_tool_started(self, tool_name: str, args: dict | None = None, prefix: str = "") -> None:
         """Called by the agent when a tool starts executing.
 
         Fires from the event loop thread (before ``await run_in_executor``),
         so ``put_nowait`` is safe without thread-safety wrappers.
+
+        *prefix* is an optional string prepended to the progress line
+        (used by subagent progress relay, e.g. ``"📤 "``).
         """
         if not self.enabled:
             return
         emoji = get_tool_emoji(tool_name)
         preview = build_tool_preview(tool_name, args or {})
         if preview:
-            msg = f"{emoji} {tool_name}: \"{preview}\""
+            msg = f"{prefix}{emoji} {tool_name}: \"{preview}\""
         else:
-            msg = f"{emoji} {tool_name}..."
+            msg = f"{prefix}{emoji} {tool_name}..."
 
         # Queue from the event loop thread (agent.chat() fires this callback
         # on the event loop before awaiting run_in_executor).
