@@ -536,7 +536,7 @@ class TyAgent:
 
     async def _agent_loop(self) -> None:
         """Permanent agent event loop — select! over inbox, collector, stop."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         from tyagent.tools.registry import registry
 
         while self._running:
