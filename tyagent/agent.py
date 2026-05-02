@@ -21,7 +21,7 @@ import httpx
 from tyagent.config import CompressionConfig
 from tyagent.context import compress_context
 from tyagent.events import EventCollector
-from tyagent.types import AgentOutput, ReplyTarget
+from tyagent.types import AgentOutput, InboxMessage, ReplyTarget
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class TyAgent:
         # Used by compression to find precise cut points without a tokenizer.
         self._token_history: List[tuple] = []
         # ── Actor model lifecycle ─────────────────────────────────
-        self._inbox: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self._inbox: asyncio.Queue["InboxMessage"] = asyncio.Queue()
         self._output_queue: asyncio.Queue[AgentOutput] = asyncio.Queue()
         self._running: bool = False
         self._loop_task: Optional[asyncio.Task] = None
@@ -302,10 +302,15 @@ class TyAgent:
                     if tool_progress_callback:
                         try: tool_progress_callback(func_name, func_args)
                         except Exception: pass
-                    _loop = asyncio.get_running_loop()
-                    result = await _loop.run_in_executor(
-                        None, registry.dispatch, func_name, func_args, self,
-                    )
+                    # Check if handler is async (sub-agent tools)
+                    entry = registry._tools.get(func_name)
+                    if entry and asyncio.iscoroutinefunction(entry.handler):
+                        result = await entry.handler(func_args, parent_agent=self)
+                    else:
+                        _loop = asyncio.get_running_loop()
+                        result = await _loop.run_in_executor(
+                            None, registry.dispatch, func_name, func_args, self,
+                        )
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
                     if on_message:
                         on_message("tool", result, tool_call_id=tc_id)
@@ -470,10 +475,14 @@ class TyAgent:
                     try: self._tool_progress_callback(func_name, func_args)
                     except Exception: pass
 
-                _loop = asyncio.get_running_loop()
-                result = await _loop.run_in_executor(
-                    None, registry.dispatch, func_name, func_args, self,
-                )
+                entry = registry._tools.get(func_name)
+                if entry and asyncio.iscoroutinefunction(entry.handler):
+                    result = await entry.handler(func_args, parent_agent=self)
+                else:
+                    _loop = asyncio.get_running_loop()
+                    result = await _loop.run_in_executor(
+                        None, registry.dispatch, func_name, func_args, self,
+                    )
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
                 if self._on_message:
                     self._on_message("tool", result, tool_call_id=tc_id)
@@ -521,11 +530,14 @@ class TyAgent:
         """Send a message to the agent loop (fire-and-forget)."""
         if not self._running:
             raise RuntimeError("Agent loop not running. Call start() first.")
-        await self._inbox.put({"text": text, "reply_target": reply_target})
+        if not text:
+            return
+        await self._inbox.put(InboxMessage(text=text, reply_target=reply_target))
 
     async def _agent_loop(self) -> None:
         """Permanent agent event loop — select! over inbox, collector, stop."""
         loop = asyncio.get_event_loop()
+        from tyagent.tools.registry import registry
 
         while self._running:
             inbox_task = loop.create_task(self._inbox.get())
@@ -562,17 +574,36 @@ class TyAgent:
             # Process user message
             if inbox_task in done:
                 msg = inbox_task.result()
-                self._messages.append({"role": "user", "content": msg["text"]})
-                current_reply = msg.get("reply_target")
+                self._messages.append({"role": "user", "content": msg.text})
+                current_reply = msg.reply_target
 
-            # Run turn
-            content = await self._run_turn()
-
-            # Output — single pipe
-            await self._output_queue.put(AgentOutput(
-                text=content,
-                reply_target=current_reply,
-            ))
+            # Run turn with error handling
+            tools = registry.get_definitions()
+            try:
+                content = await self._run_turn(tools=tools)
+                if content.strip():
+                    await self._output_queue.put(AgentOutput(
+                        text=content,
+                        reply_target=current_reply,
+                    ))
+                elif current_reply is not None:
+                    # Non-empty response required but got empty — put placeholder
+                    await self._output_queue.put(AgentOutput(
+                        text="(no response)",
+                        reply_target=current_reply,
+                    ))
+            except AgentError as exc:
+                logger.error("Agent loop error: %s", exc)
+                await self._output_queue.put(AgentOutput(
+                    text=f"❌ 错误: {exc}",
+                    reply_target=current_reply,
+                ))
+            except Exception as exc:
+                logger.exception("Unexpected error in agent loop")
+                await self._output_queue.put(AgentOutput(
+                    text=f"❌ 内部错误: {exc}",
+                    reply_target=current_reply,
+                ))
 
     async def close(self) -> None:
         """Close agent and clean up."""

@@ -114,7 +114,7 @@ def _build_allowed_tools(toolsets: Optional[List[str]] = None) -> List[str]:
     return allowed
 
 
-def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
+async def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Spawn a child agent as an asyncio task. Returns task_id immediately."""
     goal = args.get("goal", "").strip()
     if not goal:
@@ -162,15 +162,14 @@ def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
         collector=parent_agent._event_collector,
     )
 
-    loop = asyncio.get_event_loop()
-    child_task = loop.create_task(child_coro)
+    child_task = asyncio.get_running_loop().create_task(child_coro)
     parent_agent._bg_tasks[task_id] = child_task
 
     logger.info("spawn_task: launched %s goal=%r", task_id, goal[:80])
     return json.dumps({"task_id": task_id, "status": "running"}, ensure_ascii=False)
 
 
-def _handle_wait_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
+async def _handle_wait_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Wait for spawned child agents. Uses asyncio.wait() with timeout."""
     task_ids = args.get("task_ids", [])
     if not task_ids:
@@ -223,13 +222,12 @@ def _handle_wait_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
                 else:
                     results[tid] = {"error": f"Timed out after {timeout}s"}
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_wait_all())
+        await _wait_all()
 
     return json.dumps(results, ensure_ascii=False)
 
 
-def _handle_close_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
+async def _handle_close_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Close (cancel) a running child agent."""
     task_id = args.get("task_id", "").strip()
     if not task_id:
@@ -248,7 +246,7 @@ def _handle_close_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
         return json.dumps({"success": True, "message": f"{task_id} already completed"})
 
 
-def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> str:
+async def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """List all spawned child agents and their status."""
     if parent_agent is None:
         return tool_error("list_tasks requires a session agent.")
@@ -259,7 +257,7 @@ def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> str:
     return json.dumps(tasks, ensure_ascii=False)
 
 
-def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
+async def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Convenience wrapper: spawn_task + immediate wait_task, flattened result.
 
     Kept for backward compatibility. Equivalent to the original blocking
@@ -292,7 +290,9 @@ def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str
     if max_tool_turns != DEFAULT_SUBAGENT_MAX_TOOL_TURNS:
         spawn_args["max_tool_turns"] = max_tool_turns
 
-    spawn_result = json.loads(_handle_spawn_task(spawn_args, parent_agent=parent_agent))
+    spawn_result = json.loads(
+        await _handle_spawn_task(spawn_args, parent_agent=parent_agent)
+    )
     if "error" in spawn_result:
         return json.dumps(spawn_result, ensure_ascii=False)
 
@@ -300,7 +300,7 @@ def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str
 
     # Immediately wait
     wait_result = json.loads(
-        _handle_wait_task({"task_ids": [task_id]}, parent_agent=parent_agent)
+        await _handle_wait_task({"task_ids": [task_id]}, parent_agent=parent_agent)
     )
 
     # Flatten: delegate_task returns one result dict, not {task_id: result}

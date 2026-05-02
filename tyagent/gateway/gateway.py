@@ -451,15 +451,22 @@ class Gateway:
             except Exception:
                 logger.exception("Failed to persist output for %s", session_key)
 
-    def _stop_session_agent(self, session_key: str):
+    async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
         task = self._session_output_tasks.pop(session_key, None)
         if task is not None:
             task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         agent = self._session_agents.pop(session_key, None)
         if agent is not None:
-            asyncio.create_task(agent.stop())
+            await agent.stop()
         self._session_adapters.pop(session_key, None)
+        self._active_sessions.discard(session_key)
+        self._session_to_adapter.pop(session_key, None)
+        self._active_chat_ids.pop(session_key, None)
 
     def _find_adapter_for_event(
         self, event: MessageEvent
@@ -520,7 +527,7 @@ class Gateway:
 
         # Stop all session agents (actor model loops)
         for session_key in list(self._session_agents.keys()):
-            self._stop_session_agent(session_key)
+            await self._stop_session_agent(session_key)
 
         # Close all cached agents
         for key, cached_agent in list(self._agent_cache.items()):

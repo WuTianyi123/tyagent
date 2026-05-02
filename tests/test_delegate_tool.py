@@ -39,9 +39,9 @@ def _make_agent(**overrides) -> MagicMock:
     return agent
 
 
-def _call_handler(args: dict, parent_agent=None) -> dict:
+async def _call_handler(args: dict, parent_agent=None) -> dict:
     """Call _handle_delegate_task and parse JSON result."""
-    result = _handle_delegate_task(args, parent_agent=parent_agent)
+    result = await _handle_delegate_task(args, parent_agent=parent_agent)
     return json.loads(result)
 
 
@@ -75,47 +75,54 @@ class TestDelegateTaskRegistration:
 
 
 class TestDelegateTaskValidation:
-    def test_missing_goal(self):
-        result = _call_handler({}, parent_agent=_make_agent())
+    @pytest.mark.asyncio
+    async def test_missing_goal(self):
+        result = await _call_handler({}, parent_agent=_make_agent())
         assert "error" in result
         assert "goal" in result["error"].lower()
 
-    def test_empty_goal(self):
-        result = _call_handler({"goal": "  "}, parent_agent=_make_agent())
+    @pytest.mark.asyncio
+    async def test_empty_goal(self):
+        result = await _call_handler({"goal": "  "}, parent_agent=_make_agent())
         assert "error" in result
         assert "goal" in result["error"].lower()
 
-    def test_missing_parent_agent(self):
-        result = _call_handler({"goal": "do something"})
+    @pytest.mark.asyncio
+    async def test_missing_parent_agent(self):
+        result = await _call_handler({"goal": "do something"})
         assert "error" in result
         assert "parent" in result["error"].lower()
 
-    def test_max_tool_turns_not_integer(self):
-        result = _call_handler(
+    @pytest.mark.asyncio
+    async def test_max_tool_turns_not_integer(self):
+        result = await _call_handler(
             {"goal": "test", "max_tool_turns": "abc"},
             parent_agent=_make_agent(),
         )
         assert "error" in result
         assert "integer" in result["error"].lower()
 
-    def test_max_tool_turns_zero(self):
-        result = _call_handler(
+    @pytest.mark.asyncio
+    async def test_max_tool_turns_zero(self):
+        result = await _call_handler(
             {"goal": "test", "max_tool_turns": 0},
             parent_agent=_make_agent(),
         )
         assert "error" in result
         assert "at least 1" in result["error"]
 
-    def test_max_tool_turns_negative(self):
-        result = _call_handler(
+    @pytest.mark.asyncio
+    async def test_max_tool_turns_negative(self):
+        result = await _call_handler(
             {"goal": "test", "max_tool_turns": -5},
             parent_agent=_make_agent(),
         )
         assert "error" in result
         assert "at least 1" in result["error"]
 
-    def test_max_tool_turns_exceeds_max(self):
-        result = _call_handler(
+    @pytest.mark.asyncio
+    async def test_max_tool_turns_exceeds_max(self):
+        result = await _call_handler(
             {"goal": "test", "max_tool_turns": 999},
             parent_agent=_make_agent(),
         )
@@ -129,7 +136,8 @@ class TestDelegateTaskValidation:
 
 
 class TestDelegateTaskToolsetFiltering:
-    def test_unknown_toolset_removed(self):
+    @pytest.mark.asyncio
+    async def test_unknown_toolset_removed(self):
         """Toolsets not in registry are silently dropped."""
         agent = _make_agent()
         with patch.object(delegate_tool, "_handle_spawn_task") as mock_spawn, \
@@ -138,7 +146,7 @@ class TestDelegateTaskToolsetFiltering:
             mock_wait.return_value = json.dumps({
                 "abc": {"success": True, "summary": "ok", "error": None, "duration_seconds": 1.0}
             })
-            result = _call_handler(
+            result = await _call_handler(
                 {"goal": "test", "toolsets": ["nonexistent_tool", "read_file"]},
                 parent_agent=agent,
             )
@@ -182,7 +190,8 @@ class TestDelegateTaskBlockedTools:
 
 
 class TestDelegateTaskBackwardCompat:
-    def test_delegate_task_spawns_and_waits(self):
+    @pytest.mark.asyncio
+    async def test_delegate_task_spawns_and_waits(self):
         agent = _make_agent()
         with patch.object(delegate_tool, "_handle_spawn_task") as mock_spawn, \
              patch.object(delegate_tool, "_handle_wait_task") as mock_wait:
@@ -191,14 +200,15 @@ class TestDelegateTaskBackwardCompat:
                 "abc123": {"success": True, "summary": "ok", "error": None, "duration_seconds": 1}
             })
 
-            result = json.loads(_handle_delegate_task({"goal": "test"}, parent_agent=agent))
+            result = json.loads(await _handle_delegate_task({"goal": "test"}, parent_agent=agent))
 
         assert result["success"] is True
         assert result["summary"] == "ok"
 
-    def test_delegate_task_error_on_spawn_failure(self):
+    @pytest.mark.asyncio
+    async def test_delegate_task_error_on_spawn_failure(self):
         agent = _make_agent()
-        result = json.loads(_handle_delegate_task({"goal": ""}, parent_agent=agent))
+        result = json.loads(await _handle_delegate_task({"goal": ""}, parent_agent=agent))
         assert "error" in result
 
 
@@ -354,7 +364,8 @@ class TestRunChildAsync:
 class TestSubagentProgressRelay:
     """Tests for child agent tool progress relay via spawn_task."""
 
-    def test_parent_callback_is_read(self):
+    @pytest.mark.asyncio
+    async def test_parent_callback_is_read(self):
         """Parent's _tool_progress_callback is available when spawning."""
         parent_cb = MagicMock()
         agent = _make_agent()
@@ -366,13 +377,14 @@ class TestSubagentProgressRelay:
             mock_wait.return_value = json.dumps({
                 "abc": {"success": True, "summary": "ok", "error": None, "duration_seconds": 1}
             })
-            _call_handler({"goal": "test"}, parent_agent=agent)
+            await _call_handler({"goal": "test"}, parent_agent=agent)
 
         # spawn_task is called with the parent agent; it reads the callback internally
         mock_spawn.assert_called_once()
         assert mock_spawn.call_args[1].get("parent_agent") is agent
 
-    def test_no_callback_when_parent_has_none(self):
+    @pytest.mark.asyncio
+    async def test_no_callback_when_parent_has_none(self):
         """When parent has no progress callback, spawn_task still works."""
         agent = _make_agent()
 
@@ -382,7 +394,7 @@ class TestSubagentProgressRelay:
             mock_wait.return_value = json.dumps({
                 "abc": {"success": True, "summary": "ok", "error": None, "duration_seconds": 1}
             })
-            _call_handler({"goal": "test"}, parent_agent=agent)
+            await _call_handler({"goal": "test"}, parent_agent=agent)
 
         mock_spawn.assert_called_once()
         assert mock_spawn.call_args[1].get("parent_agent") is agent

@@ -84,7 +84,7 @@ class GatewaySupervisor:
             # Stop all session agents (actor model loops)
             for session_key in list(gw._session_agents.keys()):
                 try:
-                    gw._stop_session_agent(session_key)
+                    await gw._stop_session_agent(session_key)
                 except Exception:
                     logger.exception(
                         "Failed to stop session agent for %s", session_key
