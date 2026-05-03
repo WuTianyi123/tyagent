@@ -997,27 +997,19 @@ class FeishuAdapter(BasePlatformAdapter):
             raw_message=data,
         )
 
-        # Handle media
-        if msg_type == _MSG_TYPE_IMAGE:
-            image_key = content.get("image_key", "") if isinstance(content, dict) else ""
-            if image_key:
-                event.media_urls = [image_key]
-                event.media_types = ["image"]
-        elif msg_type == _MSG_TYPE_FILE:
-            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
-            if file_key:
-                event.media_urls = [file_key]
-                event.media_types = ["file"]
-        elif msg_type == _MSG_TYPE_AUDIO:
-            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
-            if file_key:
-                event.media_urls = [file_key]
-                event.media_types = ["audio"]
-        elif msg_type == _MSG_TYPE_MEDIA:
-            file_key = content.get("file_key", "") if isinstance(content, dict) else ""
-            if file_key:
-                event.media_urls = [file_key]
-                event.media_types = ["media"]
+        # Handle media — dict-driven dispatch replaces 4 near-identical blocks
+        _MEDIA_KEYS = {
+            _MSG_TYPE_IMAGE: ("image_key", "image"),
+            _MSG_TYPE_FILE:  ("file_key",  "file"),
+            _MSG_TYPE_AUDIO: ("file_key",  "audio"),
+            _MSG_TYPE_MEDIA: ("file_key",  "media"),
+        }
+        if msg_type in _MEDIA_KEYS:
+            key_name, media_type = _MEDIA_KEYS[msg_type]
+            key_val = content.get(key_name, "") if isinstance(content, dict) else ""
+            if key_val:
+                event.media_urls = [key_val]
+                event.media_types = [media_type]
 
         return event
 
