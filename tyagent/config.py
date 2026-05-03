@@ -22,6 +22,36 @@ except (ImportError, KeyError):
 DEFAULT_PROFILE = "tyagent"
 default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 
+# Canonical config schema — every key that should exist in config.yaml.
+# Used at startup to auto-fill missing fields (user values are never overwritten).
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "platforms": {},
+    "agent": {},
+    "compression": {},
+    "workspace": {
+        "lock": "off",
+    },
+    "log_level": "INFO",
+    "reset_triggers": ["new"],
+}
+
+
+def _deep_merge_defaults(user: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
+    """Recursively add missing keys from *defaults* into *user* dict in-place.
+
+    Returns True if any key was added (caller should re-save config.yaml).
+    Never overwrites an existing user value — only fills absent keys.
+    """
+    changed = False
+    for key, default_val in defaults.items():
+        if key not in user:
+            user[key] = default_val
+            changed = True
+        elif isinstance(default_val, dict) and isinstance(user[key], dict):
+            if _deep_merge_defaults(user[key], default_val):
+                changed = True
+    return changed
+
 
 @dataclass
 class PlatformConfig:
@@ -241,7 +271,18 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
     yaml_path = profile_dir / "config.yaml"
     json_path = profile_dir / "config.json"
     if yaml_path.exists():
-        cfg = _load_from_path(yaml_path)
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        if _deep_merge_defaults(raw, DEFAULT_CONFIG):
+            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.dump(raw, f, default_flow_style=False, allow_unicode=True)
+            try:
+                os.chmod(yaml_path, 0o600)
+            except OSError:
+                pass
+            logger.info("Config schema updated with new defaults.")
+        cfg = TyAgentConfig.from_dict(raw)
         # Override home_dir / sessions_dir to use the actual profile
         # directory, not whatever is stored in the config file.
         cfg.home_dir = profile_dir
