@@ -97,6 +97,14 @@ class WorkspaceConfig:
     lock: str = "off"
     locked_directory: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.lock not in ("on", "off"):
+            logger.warning(
+                "workspace.lock must be 'on' or 'off', got %r — treating as 'off'",
+                self.lock,
+            )
+            object.__setattr__(self, "lock", "off")
+
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"lock": self.lock}
         if self.locked_directory:
@@ -105,8 +113,15 @@ class WorkspaceConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> WorkspaceConfig:
+        lock = data.get("lock", "off")
+        if lock not in ("on", "off"):
+            logger.warning(
+                "workspace.lock must be 'on' or 'off', got %r — treating as 'off'",
+                lock,
+            )
+            lock = "off"
         return cls(
-            lock=data.get("lock", "off"),
+            lock=lock,
             locked_directory=data.get("locked_directory"),
         )
 

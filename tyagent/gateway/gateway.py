@@ -722,7 +722,7 @@ async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgen
                         "falling back to $HOME", saved_path,
                     )
         if workspace is None:
-            workspace = real_home
+            workspace = Path(real_home)
             logger.info("Workspace (follow, no saved state): %s", workspace)
         else:
             logger.info("Workspace (follow, restored): %s", workspace)
