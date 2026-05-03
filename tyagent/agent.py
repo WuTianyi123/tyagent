@@ -22,6 +22,7 @@ import httpx
 from tyagent.config import CompressionConfig
 from tyagent.context import compress_context
 from tyagent.events import EventCollector
+from tyagent.model_metadata import get_model_context_length
 from tyagent.prompt_builder import build_system_prompt
 from tyagent.types import AgentOutput, InboxMessage, ReplyTarget
 
@@ -103,6 +104,9 @@ class TyAgent:
         self.compress_base_url = c.base_url or self.base_url
         self.compress_cut_ratio = c.cut_ratio
         self._compression_config = compression  # stored for child agent cloning
+        self._effective_context_length = get_model_context_length(
+            model, context_length=context_length,
+        )
         self._client = httpx.AsyncClient(timeout=120.0)
         # Real token usage from the last API response
         self.last_usage: Optional[Dict[str, int]] = None
@@ -275,7 +279,7 @@ class TyAgent:
                                 model=self.compress_model or self.model,
                                 api_key=self.compress_api_key, base_url=self.compress_base_url,
                                 token_history=self._token_history,
-                                context_window=self.context_length or 128000,
+                                context_window=self._effective_context_length,
                                 cut_ratio=self.compress_cut_ratio,
                             )
                             if compressed is not None:
@@ -433,7 +437,7 @@ class TyAgent:
                             api_key=self.compress_api_key,
                             base_url=self.compress_base_url,
                             token_history=self._token_history,
-                            context_window=self.context_length or 128000,
+                            context_window=self._effective_context_length,
                             cut_ratio=self.compress_cut_ratio,
                         )
                         if compressed is not None:
