@@ -602,7 +602,7 @@ def _resolve_extension(
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark platform adapter."""
 
-    def __init__(self, config: Any):
+    def __init__(self, config: Any, home_dir: Optional[Path] = None):
         super().__init__(config, "feishu")
         if not FEISHU_AVAILABLE:
             raise ImportError(
@@ -630,7 +630,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Cache dir for media and dedup state
-        self._cache_dir = default_home / "cache" / "feishu"
+        _base = home_dir if home_dir is not None else default_home
+        self._cache_dir = _base / "cache" / "feishu"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Persistent message dedup state

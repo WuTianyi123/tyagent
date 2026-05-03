@@ -598,3 +598,50 @@ class TestSaveConfig:
 
         loaded = load_config(out_path)
         assert loaded.agent.system_prompt == "你好世界 🌍"
+
+
+class TestLoadConfigProfile:
+    """Tests for load_config(profile=...)."""
+
+    def test_profile_sets_home_dir(self, monkeypatch, tmp_path):
+        """load_config(profile='x') sets home_dir to ~/.tyagent/x/."""
+        import tyagent.config as cfg_mod
+
+        tyagent_root = tmp_path / ".tyagent"
+        monkeypatch.setattr(cfg_mod, "_usr_home", tmp_path)
+        monkeypatch.setattr(cfg_mod, "default_home", tyagent_root / "tyagent")
+
+        profile_dir = tyagent_root / "mytest"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("agent:\n  model: gpt-4o\n")
+
+        cfg = load_config(profile="mytest")
+        assert cfg.home_dir == profile_dir
+        assert cfg.sessions_dir == profile_dir / "sessions"
+        assert cfg.agent.model == "gpt-4o"
+
+    def test_profile_missing_dir_uses_defaults(self, monkeypatch, tmp_path):
+        """load_config(profile='nonexistent') uses defaults with correct paths."""
+        import tyagent.config as cfg_mod
+
+        tyagent_root = tmp_path / ".tyagent"
+        monkeypatch.setattr(cfg_mod, "_usr_home", tmp_path)
+        monkeypatch.setattr(cfg_mod, "default_home", tyagent_root / "tyagent")
+
+        expected_dir = tyagent_root / "ghost"
+        cfg = load_config(profile="ghost")
+        assert cfg.home_dir == expected_dir
+        assert cfg.sessions_dir == expected_dir / "sessions"
+
+    def test_config_path_takes_precedence_over_profile(self, tmp_path):
+        """Explicit --config path bypasses profile."""
+        explicit = tmp_path / "explicit.yaml"
+        explicit.write_text("agent:\n  model: explicit-model\n")
+
+        profile_dir = tmp_path / ".tyagent" / "mytest"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("agent:\n  model: profile-model\n")
+
+        # With explicit path, load_config ignores profile
+        cfg = load_config(config_path=explicit, profile="mytest")
+        assert cfg.agent.model == "explicit-model"

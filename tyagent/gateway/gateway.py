@@ -214,7 +214,7 @@ class Gateway:
                 logger.warning("No adapter registered for platform: %s", name)
                 continue
             try:
-                adapter = adapter_cls(platform_cfg)
+                adapter = adapter_cls(platform_cfg, home_dir=self.config.home_dir)
                 adapter.set_message_handler(self._on_message)
                 self.adapters[name] = adapter
                 logger.info("Loaded adapter: %s", name)
@@ -642,9 +642,14 @@ def _maybe_migrate_legacy_home(home_dir: Path) -> None:
     Only triggers when:
       - Legacy ~/.tyagent/config.yaml exists
       - Target home_dir/config.yaml does NOT exist
-      - home_dir is under ~/.tyagent/ (not a custom path)
+      - home_dir is the default profile (not a custom path or other profile)
     """
-    legacy_home = home_dir.parent  # ~/.tyagent/
+    from tyagent.config import default_home as _default_home
+
+    if home_dir != _default_home:
+        return  # not the default profile — don't touch legacy data
+
+    legacy_home = _default_home.parent  # ~/.tyagent/
     legacy_config = legacy_home / "config.yaml"
     if not legacy_config.exists():
         return
@@ -653,16 +658,12 @@ def _maybe_migrate_legacy_home(home_dir: Path) -> None:
     if (home_dir / "config.yaml").exists():
         return
 
-    # Only migrate if home_dir is a direct child of legacy_home
-    # (i.e., we're using the default profile, not a custom absolute path)
-    if home_dir.parent != legacy_home:
-        return
-
     logger = logging.getLogger(__name__)
     logger.info("Migrating legacy ~/.tyagent/ → %s/", home_dir)
     home_dir.mkdir(parents=True, exist_ok=True)
 
-    for item in ["config.yaml", "memories", "sessions", "cache", "home", ".clean_shutdown"]:
+    # Move data dirs first, config.yaml last — its presence signals migration done.
+    for item in ["memories", "sessions", "cache", "home", ".clean_shutdown", "config.yaml"]:
         src = legacy_home / item
         dst = home_dir / item
         if src.exists() and not dst.exists():
