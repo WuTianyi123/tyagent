@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 # Type alias for the on_message callback
 OnMessageCallback = Callable[..., Any]
 
+import functools
 import httpx
 
 from tyagent.config import CompressionConfig
@@ -27,6 +28,9 @@ from tyagent.prompt_builder import build_system_prompt
 from tyagent.types import AgentOutput, InboxMessage, ReplyTarget
 
 logger = logging.getLogger(__name__)
+
+# ── Constants ────────────────────────────────────────────────
+USER_AGENT = "tyagent/1.0"
 
 
 class ContextOverflow(Exception):
@@ -133,6 +137,268 @@ class TyAgent:
 
     # ── System prompt ──────────────────────────────────────────
 
+    def _build_headers(self) -> Dict[str, str]:
+        """Return standard HTTP headers for LLM API requests."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
+
+    def _build_payload_base(self, tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Return the base payload for a chat completion request."""
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+        }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        return payload
+
+    @staticmethod
+    def _build_assistant_msg(
+        content: Optional[str],
+        reasoning_content: Optional[str],
+        tool_calls: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Build an assistant message dict for the conversation history."""
+        msg: Dict[str, Any] = {"role": "assistant"}
+        if content is not None:
+            msg["content"] = content
+        if reasoning_content is not None:
+            msg["reasoning_content"] = reasoning_content
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return msg
+
+    def _dispatch_on_message(
+        self, content: Optional[str],
+        tool_calls: Optional[List[Dict[str, Any]]],
+        reasoning_content: Optional[str],
+    ) -> None:
+        """Notify the on_message callback about an assistant response."""
+        if self._on_message:
+            kwargs: Dict[str, Any] = {}
+            if tool_calls:
+                kwargs["tool_calls"] = tool_calls
+            if reasoning_content:
+                kwargs["reasoning"] = reasoning_content
+            self._on_message("assistant", content or "", **kwargs)
+
+    def _record_token_history(self, api_messages: List[Dict[str, Any]]) -> None:
+        """Record a (message_count, prompt_tokens) data point from last_usage."""
+        if self.last_usage and self.last_usage.get("prompt_tokens"):
+            self._token_history.append(
+                (len(api_messages), self.last_usage["prompt_tokens"])
+            )
+
+    async def _execute_tool_calls(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        messages: List[Dict[str, Any]],
+        registry: Any,
+    ) -> None:
+        """Execute all tool calls, appending results to *messages*."""
+        for tc in tool_calls:
+            tc_id = tc.get("id", "")
+            func_name = tc.get("function", {}).get("name", "")
+            func_args_str = tc.get("function", {}).get("arguments", "")
+
+            if not func_name:
+                messages.append({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": json.dumps({"error": "Malformed tool call"}),
+                })
+                continue
+            try:
+                func_args = json.loads(func_args_str) if func_args_str else {}
+            except json.JSONDecodeError:
+                messages.append({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": json.dumps({"error": f"Invalid JSON: {func_args_str}"}),
+                })
+                continue
+
+            if self._tool_progress_callback:
+                try:
+                    self._tool_progress_callback(func_name, func_args)
+                except Exception:
+                    pass
+
+            entry = registry._tools.get(func_name)
+            if entry and asyncio.iscoroutinefunction(entry.handler):
+                result = await entry.handler(func_args, parent_agent=self)
+            else:
+                _loop = asyncio.get_running_loop()
+                result = await _loop.run_in_executor(
+                    None, registry.dispatch, func_name, func_args, self,
+                )
+
+            messages.append({
+                "role": "tool", "tool_call_id": tc_id, "content": result,
+            })
+            if self._on_message:
+                self._on_message("tool", result, tool_call_id=tc_id)
+
+    async def _call_api_nonstreaming(
+        self, payload: Dict[str, Any], headers: Dict[str, str],
+    ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
+        """Make a non-streaming API call. Raises ContextOverflow on 400/413."""
+        resp = await self._client.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers, json=payload,
+        )
+        if resp.status_code >= 400:
+            body_str = resp.text[:2000]
+            logger.error("LLM API error: %s - %s", resp.status_code, body_str)
+            if _is_context_overflow(resp.status_code, body_str):
+                raise ContextOverflow(body_str)
+            raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
+        data = resp.json()
+        usage = data.get("usage")
+        if usage:
+            self.last_usage = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+        choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        return (message.get("content"), message.get("reasoning_content"), message.get("tool_calls"))
+
+    async def _call_api_streaming(
+        self, payload: Dict[str, Any], headers: Dict[str, str], *,
+        stream_delta_callback: Optional[Callable[[str], None]] = None,
+        reasoning_callback: Optional[Callable[[str], None]] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
+        """Make a streaming API call. Raises ContextOverflow on 400/413."""
+        async with self._client.stream(
+            "POST", f"{self.base_url}/chat/completions",
+            json=payload, headers=headers,
+        ) as resp:
+            if resp.status_code >= 400:
+                error_body = b""
+                async for chunk in resp.aiter_raw(chunk_size=4096):
+                    error_body += chunk
+                body_str = error_body.decode("utf-8", errors="replace")[:2000]
+                if _is_context_overflow(resp.status_code, body_str):
+                    raise ContextOverflow(body_str)
+                raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
+
+            content_parts: List[str] = []
+            tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+            reasoning_parts: List[str] = []
+            usage_obj = None
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                if not data_str:
+                    continue
+                chunk = json.loads(data_str)
+                if not chunk.get("choices"):
+                    if chunk.get("usage"):
+                        usage_obj = chunk["usage"]
+                    continue
+                delta = chunk["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    if not tool_calls_acc and stream_delta_callback:
+                        stream_delta_callback(delta["content"])
+                if delta.get("tool_calls"):
+                    for tc_delta in delta["tool_calls"]:
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc_delta.get("id", ""),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        acc = tool_calls_acc[idx]
+                        if tc_delta.get("id"):
+                            acc["id"] = tc_delta["id"]
+                        if tc_delta.get("function", {}).get("name"):
+                            acc["function"]["name"] = tc_delta["function"]["name"]
+                        if tc_delta.get("function", {}).get("arguments"):
+                            acc["function"]["arguments"] += tc_delta["function"]["arguments"]
+                if delta.get("reasoning_content"):
+                    reasoning_parts.append(delta["reasoning_content"])
+                    if reasoning_callback:
+                        reasoning_callback(delta["reasoning_content"])
+
+            content = "".join(content_parts) if content_parts else None
+            reasoning = "".join(reasoning_parts) if reasoning_parts else None
+            tc_list = list(tool_calls_acc.values()) if tool_calls_acc else None
+
+            if usage_obj:
+                self.last_usage = {
+                    "prompt_tokens": usage_obj.get("prompt_tokens", 0)
+                    if isinstance(usage_obj, dict)
+                    else getattr(usage_obj, "prompt_tokens", 0),
+                    "completion_tokens": usage_obj.get("completion_tokens", 0)
+                    if isinstance(usage_obj, dict)
+                    else getattr(usage_obj, "completion_tokens", 0),
+                    "total_tokens": usage_obj.get("total_tokens", 0)
+                    if isinstance(usage_obj, dict)
+                    else getattr(usage_obj, "total_tokens", 0),
+                }
+
+            return content, reasoning, tc_list
+
+    async def _api_call_with_compression_retry(
+        self,
+        messages: List[Dict[str, Any]],
+        api_messages: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        *,
+        api_caller: Callable[..., Any],
+    ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
+        """Call the LLM API with single-pass compression retry.
+
+        *api_caller* is an async callable ``(payload, headers) -> (content,
+        reasoning, tool_calls)``.  On ContextOverflow, compresses once
+        and retries.  *api_messages* is mutated in place and *payload*
+        updated on compression.
+        """
+        _compressed = False
+        while True:
+            self.last_usage = None
+            try:
+                return await api_caller(payload, headers)
+            except ContextOverflow:
+                if not _compressed:
+                    _compressed = True
+                    logger.info("Context overflow — applying single-pass compression")
+                    compressed = await compress_context(
+                        api_messages, self._client,
+                        model=self.compress_model or self.model,
+                        api_key=self.compress_api_key,
+                        base_url=self.compress_base_url,
+                        token_history=self._token_history,
+                        context_window=self._effective_context_length,
+                        cut_ratio=self.compress_cut_ratio,
+                    )
+                    if compressed is not None:
+                        api_messages[:] = compressed
+                        self._prev_msg_count = len(messages)
+                        self._token_history = []
+                        self._cached_system_prompt = None
+                        payload["messages"] = api_messages
+                        continue
+                raise AgentError("Context too long even after compression.")
+            except AgentError:
+                raise
+            except Exception as exc:
+                raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+
     def _ensure_system_prompt(self) -> str:
         """Return the system prompt, building and caching it on first call."""
         if self._cached_system_prompt is None:
@@ -174,34 +440,22 @@ class TyAgent:
         if stream:
             # Keep original streaming path for backward compat
             # (gateway/consumer.py uses this)
-            import copy
             from tyagent.tools.registry import registry
 
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "KimiCLI/1.30.0",
-            }
+            headers = self._build_headers()
             self._insert_system_prompt(messages)
             self._prev_msg_count = 0
             self._token_history = []
             api_messages = list(messages)
             self._prev_msg_count = len(messages)
-            payload_base = {
-                "model": self.model, "max_tokens": 4096, "temperature": 0.7,
-            }
-            if self.reasoning_effort:
-                payload_base["reasoning_effort"] = self.reasoning_effort
-            if tools:
-                payload_base["tools"] = tools
-                payload_base["tool_choice"] = "auto"
+            payload_base = self._build_payload_base(tools)
 
             tool_turn = 0
             content = None
             reasoning_content = None
             tool_calls = None
             while True:
-                if self.max_tool_turns and tool_turn >= self.max_tool_turns:
+                if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
                     break
                 if tool_turn > 0:
                     api_messages.extend(messages[self._prev_msg_count:])
@@ -209,138 +463,34 @@ class TyAgent:
                 payload = {**payload_base, "messages": api_messages,
                            "stream": True, "stream_options": {"include_usage": True}}
 
-                _compressed = False
-                while True:
-                    self.last_usage = None
-                    try:
-                        async with self._client.stream("POST", f"{self.base_url}/chat/completions",
-                                                       json=payload, headers=headers) as resp:
-                            if resp.status_code >= 400:
-                                error_body = b""
-                                async for chunk in resp.aiter_raw(chunk_size=4096):
-                                    error_body += chunk
-                                body_str = error_body.decode("utf-8", errors="replace")[:2000]
-                                if _is_context_overflow(resp.status_code, body_str):
-                                    raise ContextOverflow(body_str)
-                                raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
-                            content_parts = []
-                            tool_calls_acc = {}
-                            reasoning_parts = []
-                            usage_obj = None
-                            async for line in resp.aiter_lines():
-                                if not line.startswith("data: "): continue
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]": break
-                                if not data_str: continue
-                                chunk = json.loads(data_str)
-                                if not chunk.get("choices"):
-                                    if chunk.get("usage"): usage_obj = chunk["usage"]
-                                    continue
-                                delta = chunk["choices"][0].get("delta", {})
-                                if delta.get("content"):
-                                    content_parts.append(delta["content"])
-                                    if not tool_calls_acc and stream_delta_callback:
-                                        stream_delta_callback(delta["content"])
-                                if delta.get("tool_calls"):
-                                    for tc_delta in delta["tool_calls"]:
-                                        idx = tc_delta.get("index", 0)
-                                        if idx not in tool_calls_acc:
-                                            tool_calls_acc[idx] = {
-                                                "id": tc_delta.get("id", ""),
-                                                "type": "function",
-                                                "function": {"name": "", "arguments": ""},
-                                            }
-                                        acc = tool_calls_acc[idx]
-                                        if tc_delta.get("id"): acc["id"] = tc_delta["id"]
-                                        if tc_delta.get("function", {}).get("name"):
-                                            acc["function"]["name"] = tc_delta["function"]["name"]
-                                        if tc_delta.get("function", {}).get("arguments"):
-                                            acc["function"]["arguments"] += tc_delta["function"]["arguments"]
-                                if delta.get("reasoning_content"):
-                                    reasoning_parts.append(delta["reasoning_content"])
-                                    if reasoning_callback:
-                                        reasoning_callback(delta["reasoning_content"])
-                            content = "".join(content_parts) if content_parts else None
-                            reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
-                            tool_calls = list(tool_calls_acc.values()) if tool_calls_acc else None
-                            if usage_obj:
-                                self.last_usage = {
-                                    "prompt_tokens": usage_obj.get("prompt_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "prompt_tokens", 0),
-                                    "completion_tokens": usage_obj.get("completion_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "completion_tokens", 0),
-                                    "total_tokens": usage_obj.get("total_tokens", 0) if isinstance(usage_obj, dict) else getattr(usage_obj, "total_tokens", 0),
-                                }
-                        break
-                    except ContextOverflow:
-                        if not _compressed:
-                            _compressed = True
-                            from tyagent.context import compress_context
-                            compressed = await compress_context(
-                                api_messages, self._client,
-                                model=self.compress_model or self.model,
-                                api_key=self.compress_api_key, base_url=self.compress_base_url,
-                                token_history=self._token_history,
-                                context_window=self._effective_context_length,
-                                cut_ratio=self.compress_cut_ratio,
-                            )
-                            if compressed is not None:
-                                api_messages = compressed
-                                self._prev_msg_count = len(messages)
-                                self._token_history = []
-                                payload["messages"] = api_messages
-                                continue
-                        raise AgentError("Context too long even after compression.")
-                    except AgentError: raise
-                    except Exception as exc:
-                        raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+                _stream_caller = functools.partial(
+                    self._call_api_streaming,
+                    stream_delta_callback=stream_delta_callback,
+                    reasoning_callback=reasoning_callback,
+                )
+                content, reasoning_content, tool_calls = \
+                    await self._api_call_with_compression_retry(
+                        messages, api_messages, payload, headers,
+                        api_caller=_stream_caller,
+                    )
 
-                if self.last_usage and self.last_usage.get("prompt_tokens"):
-                    self._token_history.append((len(api_messages), self.last_usage["prompt_tokens"]))
+                self._record_token_history(api_messages)
 
-                assistant_msg = {"role": "assistant"}
-                if content is not None: assistant_msg["content"] = content
-                if reasoning_content is not None: assistant_msg["reasoning_content"] = reasoning_content
-                if tool_calls: assistant_msg["tool_calls"] = tool_calls
+                assistant_msg = self._build_assistant_msg(content, reasoning_content, tool_calls)
                 messages.append(assistant_msg)
-                if on_message:
-                    msg_kwargs = {}
-                    if tool_calls: msg_kwargs["tool_calls"] = tool_calls
-                    if reasoning_content: msg_kwargs["reasoning"] = reasoning_content
-                    on_message("assistant", content or "", **msg_kwargs)
+                self._dispatch_on_message(content, tool_calls, reasoning_content)
+
                 if not tool_calls:
                     return (content or reasoning_content or "")
+
                 if stream and on_segment_break:
-                    try: on_segment_break()
-                    except Exception: pass
-                tool_turn += 1
-                for tc in tool_calls:
-                    tc_id = tc.get("id", "")
-                    func_name = tc.get("function", {}).get("name", "")
-                    func_args_str = tc.get("function", {}).get("arguments", "")
-                    if not func_name:
-                        messages.append({"role": "tool", "tool_call_id": tc_id,
-                                         "content": json.dumps({"error": "Malformed"})})
-                        continue
                     try:
-                        func_args = json.loads(func_args_str) if func_args_str else {}
-                    except json.JSONDecodeError:
-                        messages.append({"role": "tool", "tool_call_id": tc_id,
-                                         "content": json.dumps({"error": f"Invalid JSON: {func_args_str}"})})
-                        continue
-                    if tool_progress_callback:
-                        try: tool_progress_callback(func_name, func_args)
-                        except Exception: pass
-                    # Check if handler is async (sub-agent tools)
-                    entry = registry._tools.get(func_name)
-                    if entry and asyncio.iscoroutinefunction(entry.handler):
-                        result = await entry.handler(func_args, parent_agent=self)
-                    else:
-                        _loop = asyncio.get_running_loop()
-                        result = await _loop.run_in_executor(
-                            None, registry.dispatch, func_name, func_args, self,
-                        )
-                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-                    if on_message:
-                        on_message("tool", result, tool_call_id=tc_id)
+                        on_segment_break()
+                    except Exception:
+                        pass
+
+                tool_turn += 1
+                await self._execute_tool_calls(tool_calls, messages, registry)
         else:
             # Non-streaming: delegate to _run_turn()
             self._messages = messages
@@ -364,22 +514,9 @@ class TyAgent:
         api_messages = list(messages)
         self._prev_msg_count = len(messages)
 
-        payload_base: Dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": 4096,
-            "temperature": 0.7,
-        }
-        if self.reasoning_effort:
-            payload_base["reasoning_effort"] = self.reasoning_effort
-        if tools:
-            payload_base["tools"] = tools
-            payload_base["tool_choice"] = "auto"
+        payload_base = self._build_payload_base(tools)
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "KimiCLI/1.30.0",
-        }
+        headers = self._build_headers()
 
         tool_turn = 0
         content: Optional[str] = None
@@ -395,122 +532,23 @@ class TyAgent:
             self._prev_msg_count = len(messages)
             payload_base["messages"] = api_messages
 
-            _compressed = False
-            while True:
-                self.last_usage = None
-                try:
-                    # Non-streaming path only
-                    resp = await self._client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload_base,
-                    )
-                    if resp.status_code >= 400:
-                        body_str = resp.text[:2000]
-                        logger.error("LLM API error: %s - %s", resp.status_code, body_str)
-                        if _is_context_overflow(resp.status_code, body_str):
-                            raise ContextOverflow(body_str)
-                        raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
-                    data = resp.json()
-                    usage = data.get("usage")
-                    if usage:
-                        self.last_usage = {
-                            "prompt_tokens": usage.get("prompt_tokens", 0),
-                            "completion_tokens": usage.get("completion_tokens", 0),
-                            "total_tokens": usage.get("total_tokens", 0),
-                        }
-                    choice = data.get("choices", [{}])[0]
-                    message = choice.get("message", {})
-                    content = message.get("content")
-                    tool_calls = message.get("tool_calls")
-                    reasoning_content = message.get("reasoning_content")
-                    break
+            content, reasoning_content, tool_calls = \
+                await self._api_call_with_compression_retry(
+                    messages, api_messages, payload_base, headers,
+                    api_caller=self._call_api_nonstreaming,
+                )
 
-                except ContextOverflow:
-                    if not _compressed:
-                        _compressed = True
-                        logger.info("Context overflow — applying single-pass compression")
-                        from tyagent.context import compress_context
-                        compressed = await compress_context(
-                            api_messages, self._client,
-                            model=self.compress_model or self.model,
-                            api_key=self.compress_api_key,
-                            base_url=self.compress_base_url,
-                            token_history=self._token_history,
-                            context_window=self._effective_context_length,
-                            cut_ratio=self.compress_cut_ratio,
-                        )
-                        if compressed is not None:
-                            api_messages = compressed
-                            self._prev_msg_count = len(messages)
-                            self._token_history = []
-                            self._cached_system_prompt = None  # rebuild next turn
-                            payload_base["messages"] = api_messages
-                            continue
-                    raise AgentError("Context too long even after compression.")
-                except AgentError:
-                    raise
-                except Exception as exc:
-                    raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
+            self._record_token_history(api_messages)
 
-            if self.last_usage and self.last_usage.get("prompt_tokens"):
-                self._token_history.append((len(api_messages), self.last_usage["prompt_tokens"]))
-
-            # Build assistant message
-            assistant_msg: Dict[str, Any] = {"role": "assistant"}
-            if content is not None:
-                assistant_msg["content"] = content
-            if reasoning_content is not None:
-                assistant_msg["reasoning_content"] = reasoning_content
-            if tool_calls:
-                assistant_msg["tool_calls"] = tool_calls
+            assistant_msg = self._build_assistant_msg(content, reasoning_content, tool_calls)
             messages.append(assistant_msg)
-
-            # Persist via callback
-            if self._on_message:
-                msg_kwargs: Dict = {}
-                if tool_calls:
-                    msg_kwargs["tool_calls"] = tool_calls
-                if reasoning_content:
-                    msg_kwargs["reasoning"] = reasoning_content
-                self._on_message("assistant", content or "", **msg_kwargs)
+            self._dispatch_on_message(content, tool_calls, reasoning_content)
 
             if not tool_calls:
                 return (content or reasoning_content or "")
 
-            # Execute tool calls
             tool_turn += 1
-            for tc in tool_calls:
-                tc_id = tc.get("id", "")
-                func_name = tc.get("function", {}).get("name", "")
-                func_args_str = tc.get("function", {}).get("arguments", "")
-
-                if not func_name:
-                    messages.append({"role": "tool", "tool_call_id": tc_id,
-                                     "content": json.dumps({"error": "Malformed tool call"})})
-                    continue
-                try:
-                    func_args = json.loads(func_args_str) if func_args_str else {}
-                except json.JSONDecodeError:
-                    messages.append({"role": "tool", "tool_call_id": tc_id,
-                                     "content": json.dumps({"error": f"Invalid JSON: {func_args_str}"})})
-                    continue
-
-                if self._tool_progress_callback:
-                    try: self._tool_progress_callback(func_name, func_args)
-                    except Exception: pass
-
-                entry = registry._tools.get(func_name)
-                if entry and asyncio.iscoroutinefunction(entry.handler):
-                    result = await entry.handler(func_args, parent_agent=self)
-                else:
-                    _loop = asyncio.get_running_loop()
-                    result = await _loop.run_in_executor(
-                        None, registry.dispatch, func_name, func_args, self,
-                    )
-                messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-                if self._on_message:
-                    self._on_message("tool", result, tool_call_id=tc_id)
+            await self._execute_tool_calls(tool_calls, messages, registry)
 
         return (content or reasoning_content or "")
 
