@@ -152,6 +152,36 @@ def _load_builtin_platforms() -> None:
 # ---------------------------------------------------------------------------
 
 
+class SessionContext:
+    """Per-session state container — replaces six parallel dicts.
+
+    Previously each session_key mapped to entries in _session_agents,
+    _session_adapters, _session_output_tasks, _progress_tasks,
+    _session_to_adapter, and _active_chat_ids — six independent
+    collections that could drift out of sync.
+    """
+
+    __slots__ = (
+        "agent", "adapter", "platform_name", "chat_id",
+        "output_task", "progress_tasks",
+    )
+
+    def __init__(
+        self,
+        agent: "TyAgent",
+        adapter: "Any",
+        *,
+        platform_name: str = "",
+        chat_id: str = "",
+    ):
+        self.agent = agent
+        self.adapter = adapter
+        self.platform_name = platform_name
+        self.chat_id = chat_id
+        self.output_task: "Optional[asyncio.Task[None]]" = None
+        self.progress_tasks: "List[asyncio.Task[Any]]" = []
+
+
 class Gateway:
     """Main gateway managing platform adapters and AI agent interactions."""
 
@@ -183,17 +213,11 @@ class Gateway:
         # Graceful restart / drain support
         self._restart_requested = False
         self._draining = False
-        self._active_sessions: set[str] = set()
+        # Per-session state — session_key → SessionContext
+        self._sessions: Dict[str, SessionContext] = {}
         self._restart_drain_timeout: float = 60.0
         self._restart_requestor: Optional[Dict[str, str]] = None
         self._restart_notification_pending: Optional[Dict[str, str]] = None
-        self._session_to_adapter: Dict[str, str] = {}
-        self._active_chat_ids: Dict[str, str] = {}
-        # Actor-model session agents
-        self._session_agents: Dict[str, TyAgent] = {}
-        self._session_adapters: Dict[str, Any] = {}
-        self._session_output_tasks: Dict[str, asyncio.Task] = {}
-        self._progress_tasks: Dict[str, List[asyncio.Task]] = {}
         # Subsystems
         self.commands = CommandRegistry(self)
         self.supervisor = GatewaySupervisor(self)
@@ -325,10 +349,7 @@ class Gateway:
         tool_defs = registry.get_definitions()
 
         # Track this session as actively processing
-        self._active_sessions.add(session_key)
-        self._session_to_adapter[session_key] = adapter.platform_name
-        self._active_chat_ids[session_key] = event.chat_id or ""
-        self._session_adapters[session_key] = adapter
+        # (per-session state is created by _ensure_session_agent below)
 
         try:
             # Define the persistence callback for tool loop messages
@@ -353,14 +374,15 @@ class Gateway:
             # exceptions, so this is belt-and-suspenders.
             def _on_progress_done(t: asyncio.Task) -> None:
                 # Clean up task reference to prevent memory leak
-                tasks = self._progress_tasks.get(session_key)
+                ctx = self._sessions.get(session_key)
+                tasks = ctx.progress_tasks if ctx else []
                 if tasks:
                     try:
                         tasks.remove(t)
-                        if not tasks:
-                            self._progress_tasks.pop(session_key, None)
                     except ValueError:
                         pass
+                if not tasks and ctx:
+                    ctx.progress_tasks.clear()
                 if t.cancelled():
                     return
                 exc = t.exception()
@@ -368,14 +390,18 @@ class Gateway:
                     logger.error("ProgressSender task crashed: %s", exc)
             progress_task.add_done_callback(_on_progress_done)
             _progress_cb = progress_sender.on_tool_started
-            self._progress_tasks.setdefault(session_key, []).append(progress_task)
 
-            # Ensure session agent is running (starts loop if new session)
+            # Ensure session agent is running (creates SessionContext if new)
             agent = await self._ensure_session_agent(
                 session_key, session,
                 adapter, event.chat_id or "",
                 persist_message,
             )
+
+            # Register progress task in session context
+            ctx = self._sessions.get(session_key)
+            if ctx:
+                ctx.progress_tasks.append(progress_task)
 
             # Inject memory into user message
             memory_block = self.memory_store.get_all_formatted()
@@ -441,8 +467,8 @@ class Gateway:
         persist_message: Callable,
     ) -> TyAgent:
         """Get or create agent with running loop. Starts _consume_output."""
-        if session_key in self._session_agents:
-            return self._session_agents[session_key]
+        if session_key in self._sessions:
+            return self._sessions[session_key].agent
 
         agent = self._get_or_create_agent(session_key)
 
@@ -452,11 +478,15 @@ class Gateway:
             on_message=persist_message,
         )
 
-        self._session_agents[session_key] = agent
-        self._session_adapters[session_key] = adapter
+        self._sessions[session_key] = SessionContext(
+            agent, adapter,
+            platform_name=adapter.platform_name,
+            chat_id=chat_id,
+        )
 
         # Start background output consumer
-        self._session_output_tasks[session_key] = asyncio.create_task(
+        ctx = self._sessions[session_key]
+        ctx.output_task = asyncio.create_task(
             self._consume_output(session_key)
         )
 
@@ -464,7 +494,8 @@ class Gateway:
 
     async def _consume_output(self, session_key: str):
         """Long-running task: consume agent outputs and send to platform."""
-        agent = self._session_agents.get(session_key)
+        ctx = self._sessions.get(session_key)
+        agent = ctx.agent if ctx else None
         if agent is None:
             return
 
@@ -476,8 +507,8 @@ class Gateway:
             except asyncio.CancelledError:
                 break
 
-            adapter = self._session_adapters.get(session_key)
-            chat_id = self._active_chat_ids.get(session_key, "")
+            adapter = ctx.adapter if ctx else None
+            chat_id = ctx.chat_id if ctx else ""
             if adapter is None:
                 continue
 
@@ -500,27 +531,25 @@ class Gateway:
 
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
-        task = self._session_output_tasks.pop(session_key, None)
-        if task is not None:
-            task.cancel()
+        ctx = self._sessions.pop(session_key, None)
+        if ctx is None:
+            return
+        # Cancel output consumer
+        if ctx.output_task is not None:
+            ctx.output_task.cancel()
             try:
-                await task
+                await ctx.output_task
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-        agent = self._session_agents.pop(session_key, None)
+        # Stop agent
         self._agent_cache.pop(session_key, None)  # also evict from LRU cache
-        if agent is not None:
-            await agent.stop()
+        await ctx.agent.stop()
         # Cancel any lingering progress tasks
-        for pt in self._progress_tasks.pop(session_key, []):
+        for pt in ctx.progress_tasks:
             if not pt.done():
                 pt.cancel()
                 try: await pt
                 except (asyncio.CancelledError, asyncio.TimeoutError): pass
-        self._session_adapters.pop(session_key, None)
-        self._active_sessions.discard(session_key)
-        self._session_to_adapter.pop(session_key, None)
-        self._active_chat_ids.pop(session_key, None)
 
     def _find_adapter_for_event(
         self, event: MessageEvent
@@ -580,7 +609,7 @@ class Gateway:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Stop all session agents (actor model loops)
-        for session_key in list(self._session_agents.keys()):
+        for session_key in list(self._sessions.keys()):
             await self._stop_session_agent(session_key)
 
         # Close all cached agents

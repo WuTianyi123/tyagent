@@ -464,8 +464,8 @@ class TestGatewayDrainAndRestart:
         gw = Gateway(config)
         assert hasattr(gw, "_restart_requested")
         assert hasattr(gw, "_draining")
-        assert hasattr(gw, "_active_sessions")
-        assert isinstance(gw._active_sessions, set)
+        assert hasattr(gw, "_sessions")
+        assert isinstance(gw._sessions, dict)
         assert hasattr(gw, "_restart_drain_timeout")
         assert gw._restart_drain_timeout == 60.0
         assert gw._restart_requested is False
@@ -538,7 +538,7 @@ class TestGatewayDrainAndRestart:
 
     @pytest.mark.asyncio
     async def test_active_session_tracking(self, tmp_path):
-        """session_key is added to _active_sessions during agent processing."""
+        """session_key is added to _sessions during agent processing."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.clone = MagicMock(return_value=agent)  # per-session clone
@@ -564,12 +564,12 @@ class TestGatewayDrainAndRestart:
             async def run():
                 return await gw._on_message(event)
             task = asyncio.create_task(run())
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)  # wait for _ensure_session_agent to create SessionContext
             # During _on_message(), session_key should be in active_sessions
-            assert "feishu:chat1" in gw._active_sessions
+            assert "feishu:chat1" in gw._sessions
             await task
             # After finish, session stays active (actor model runs in background)
-            assert "feishu:chat1" in gw._active_sessions
+            assert "feishu:chat1" in gw._sessions
 
         await check_active()
         gw.session_store.close()
@@ -624,12 +624,9 @@ class TestGatewayDrainAndRestart:
         adapter = _make_adapter()
         gw.adapters["feishu"] = adapter
 
-        gw._active_sessions.add("feishu:sess1")
-        gw._active_sessions.add("feishu:sess2")
-        gw._session_to_adapter["feishu:sess1"] = "feishu"
-        gw._session_to_adapter["feishu:sess2"] = "feishu"
-        gw._active_chat_ids["feishu:sess1"] = "chat1"
-        gw._active_chat_ids["feishu:sess2"] = "chat2"
+        from tyagent.gateway.gateway import SessionContext
+        gw._sessions["feishu:sess1"] = SessionContext(agent, adapter, platform_name="feishu", chat_id="chat1")
+        gw._sessions["feishu:sess2"] = SessionContext(agent, adapter, platform_name="feishu", chat_id="chat2")
 
         await gw.supervisor._notify_active_sessions()
         assert adapter.send_message.call_count == 2

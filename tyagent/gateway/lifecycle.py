@@ -77,12 +77,12 @@ class GatewaySupervisor:
             logger.info(
                 "Graceful restart: draining up to %.0f seconds (%d active sessions)",
                 gw._restart_drain_timeout,
-                len(gw._active_sessions),
+                len(gw._sessions),
             )
             drained = await self._drain_active_agents(gw._restart_drain_timeout)
 
             # Stop all session agents (actor model loops)
-            for session_key in list(gw._session_agents.keys()):
+            for session_key in list(gw._sessions.keys()):
                 try:
                     await gw._stop_session_agent(session_key)
                 except Exception:
@@ -93,11 +93,11 @@ class GatewaySupervisor:
             if not drained:
                 logger.warning(
                     "Drain timeout reached — forcing restart with %d active session(s)",
-                    len(gw._active_sessions),
+                    len(gw._sessions),
                 )
 
             # Mark pending sessions for resume, so the new process can pick them up
-            for session_key in list(gw._active_sessions):
+            for session_key in list(gw._sessions):
                 try:
                     gw.session_store.mark_resume_pending(
                         session_key, reason="restart_timeout"
@@ -174,11 +174,11 @@ class GatewaySupervisor:
         Returns True if all sessions drained, False on timeout.
         """
         gw = self._gateway
-        if not gw._active_sessions:
+        if not gw._sessions:
             return True
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        while gw._active_sessions:
+        while gw._sessions:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
@@ -192,10 +192,11 @@ class GatewaySupervisor:
             "⚠️ Gateway is restarting for an update. "
             "Active requests will complete before restart."
         )
-        for session_key in list(gw._active_sessions):
+        for session_key in list(gw._sessions):
             try:
-                adapter_name = gw._session_to_adapter.get(session_key)
-                chat_id = gw._active_chat_ids.get(session_key, "")
+                ctx = gw._sessions.get(session_key)
+                adapter_name = ctx.platform_name if ctx else ""
+                chat_id = ctx.chat_id if ctx else ""
                 adapter = gw.adapters.get(adapter_name) if adapter_name else None
                 if adapter is not None and chat_id:
                     await adapter.send_message(chat_id, message)
