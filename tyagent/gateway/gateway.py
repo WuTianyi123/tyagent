@@ -508,6 +508,7 @@ class Gateway:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         agent = self._session_agents.pop(session_key, None)
+        self._agent_cache.pop(session_key, None)  # also evict from LRU cache
         if agent is not None:
             await agent.stop()
         # Cancel any lingering progress tasks

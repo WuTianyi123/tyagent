@@ -175,7 +175,7 @@ class StreamConsumer:
                                         self._edit_supported = True
                                         self._flood_strikes = 0
                                 except Exception:
-                                    pass
+                                    logger.exception("Fallback send failed, content: %d chars", len(display))
                     self._last_edit_time = time.monotonic()
 
                 # Segment break: finalize current message

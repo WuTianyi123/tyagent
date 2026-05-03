@@ -153,6 +153,9 @@ class CommandRegistry:
         gw = self._gateway
         gw.session_store.archive(session_key)
         gw.session_store.freshen_session(session_key)
+        # Stop and remove cached agent so the next message creates
+        # a fresh agent with the new session_id (empty history).
+        await gw._stop_session_agent(session_key)
         await adapter.send_message(
             event.chat_id or "",
             "✅ 已归档旧会话，开始新的对话。历史记录已保留。",
