@@ -93,9 +93,10 @@ class TestGatewayInit:
     def test_custom_agent_and_store(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         store = SessionStore(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config, session_store=store, agent=agent)
-        assert gw._agent_cache.get("_default") is agent
+        assert gw._default_agent_template is agent
         assert gw.session_store is store
 
 
@@ -111,6 +112,7 @@ class TestOnMessage:
         and response is sent via _consume_output background task."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock(return_value="Hi there!")
         agent.model = "test-model"
         agent.start = AsyncMock()
@@ -150,6 +152,7 @@ class TestOnMessage:
     async def test_reset_command_archives(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock()
         gw = Gateway(config, agent=agent)
 
@@ -183,6 +186,7 @@ class TestOnMessage:
     async def test_status_command(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.model = "test-model"
         gw = Gateway(config, agent=agent)
 
@@ -202,6 +206,7 @@ class TestOnMessage:
     async def test_agent_error_returns_fallback(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.start = AsyncMock()
         agent.send_message = AsyncMock(side_effect=AgentError("API error"))
         agent._tool_progress_callback = None
@@ -224,6 +229,7 @@ class TestOnMessage:
     async def test_unexpected_exception_returns_fallback(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.start = AsyncMock()
         agent.send_message = AsyncMock(side_effect=RuntimeError("boom"))
         agent._tool_progress_callback = None
@@ -246,6 +252,7 @@ class TestOnMessage:
     async def test_media_attached_to_message(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock(return_value="Got it")
         agent.model = "test-model"
         agent.start = AsyncMock()
@@ -272,6 +279,7 @@ class TestOnMessage:
     async def test_send_failure_logged(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock(return_value="reply")
         agent.start = AsyncMock()
         agent.send_message = AsyncMock()
@@ -295,6 +303,7 @@ class TestOnMessage:
         """Verify on_message callback is passed to agent.start()."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock(return_value="Hi!")
         agent.model = "test-model"
         agent.start = AsyncMock()
@@ -325,6 +334,7 @@ class TestFormatStatus:
     def test_status_includes_key_info(self, tmp_path):
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.model = "my-model"
         gw = Gateway(config, agent=agent)
         gw.adapters["feishu"] = _make_adapter()
@@ -479,6 +489,7 @@ class TestGatewayDrainAndRestart:
         """When draining, _on_message sends 'restarting' and returns None."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock()
         gw = Gateway(config, agent=agent)
         adapter = _make_adapter()
@@ -499,6 +510,7 @@ class TestGatewayDrainAndRestart:
         """Suspended session is archived, fresh created, user notified."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         agent.chat = AsyncMock(return_value="I'm back!")
         agent.model = "test-model"
         gw = Gateway(config, agent=agent)
@@ -529,6 +541,7 @@ class TestGatewayDrainAndRestart:
         """session_key is added to _active_sessions during agent processing."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
 
         async def delayed_start(*args, **kwargs):
             await asyncio.sleep(0.05)
@@ -606,6 +619,7 @@ class TestGatewayDrainAndRestart:
         """_notify_active_sessions_of_restart sends message to active sessions."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
+        agent.clone = MagicMock(return_value=agent)  # per-session clone
         gw = Gateway(config, agent=agent)
         adapter = _make_adapter()
         gw.adapters["feishu"] = adapter

@@ -714,6 +714,24 @@ class TyAgent:
             context_length=getattr(config, "context_length", None),
         )
 
+    def clone(self) -> "TyAgent":
+        """Create an independent copy with identical configuration.
+
+        The new agent gets its own HTTP client, message history,
+        and event loop state — safe for concurrent use in
+        different sessions.
+        """
+        return TyAgent(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            max_tool_turns=self.max_tool_turns,
+            system_prompt=self.system_prompt,
+            reasoning_effort=self.reasoning_effort,
+            compression=self._compression_config,
+            home_dir=self.home_dir,
+            context_length=self.context_length,
+        )
 
 class AgentError(Exception):
     """Raised when the AI agent encounters an error."""

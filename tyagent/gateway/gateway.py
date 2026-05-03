@@ -169,8 +169,9 @@ class Gateway:
         )
         self._agent_cache: OrderedDict[str, TyAgent] = OrderedDict()
         self._AGENT_CACHE_MAX_SIZE = 100
-        if agent is not None:
-            self._agent_cache["_default"] = agent
+        # Template agent — cloned per session to avoid races on mutable
+        # instance state across concurrent sessions.
+        self._default_agent_template: Optional[TyAgent] = agent
         # Initialize persistent memory store
         memories_dir = config.home_dir / "memories"
         self.memory_store = memory_tool.MemoryStore(memories_dir)
@@ -233,13 +234,13 @@ class Gateway:
             self._agent_cache.move_to_end(session_key)
             return agent
 
-        # If a default agent was explicitly provided, use it for all sessions.
-        # ⚠️ TyAgent mutates instance state (_prev_msg_count, last_usage) during
-        # chat(), creating a race condition with concurrent sessions.
-        # For single-session use (e.g. CLI), this is fine.
-        if "_default" in self._agent_cache:
-            agent = self._agent_cache["_default"]
-            self._agent_cache.move_to_end("_default")
+        # If a default agent template was provided, clone it per session
+        # so that concurrent sessions don't race on mutable instance state
+        # (_prev_msg_count, last_usage, etc.).
+        if self._default_agent_template is not None:
+            agent = self._default_agent_template.clone()
+            self._agent_cache[session_key] = agent
+            self._agent_cache.move_to_end(session_key)
             return agent
 
         # Create a new per-session agent
