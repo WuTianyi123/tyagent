@@ -17,6 +17,13 @@ import yaml
 from tyagent.config import load_config, save_config, TyAgentConfig
 
 
+def _load_config_from_args(args: argparse.Namespace) -> TyAgentConfig:
+    """Load config respecting --config > --profile > default precedence."""
+    if args.config:
+        return load_config(config_path=Path(args.config))
+    return load_config(profile=args.profile)
+
+
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -29,7 +36,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     from tyagent.gateway import run_gateway
 
     setup_logging(args.log_level or "INFO")
-    asyncio.run(run_gateway(config_path=args.config))
+    config = _load_config_from_args(args)
+    asyncio.run(run_gateway(config=config))
     return 0
 
 
@@ -118,7 +126,7 @@ def cmd_setup_feishu(args: argparse.Namespace) -> int:
         print(f"    bot_name:   {result['bot_name']}")
 
     # Save to config
-    config = load_config(Path(args.config) if args.config else None)
+    config = _load_config_from_args(args)
     config.platforms["feishu"] = PlatformConfig(
         enabled=True,
         extra={
@@ -136,7 +144,7 @@ def cmd_setup_feishu(args: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     """Show current configuration (sensitive values redacted)."""
-    config = load_config(Path(args.config) if args.config else None)
+    config = _load_config_from_args(args)
     import copy
 
     data = copy.deepcopy(config.to_dict())
@@ -162,7 +170,7 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 def cmd_set_model(args: argparse.Namespace) -> int:
     """Set AI model configuration."""
-    config = load_config(Path(args.config) if args.config else None)
+    config = _load_config_from_args(args)
 
     if args.model:
         config.agent.model = args.model
@@ -188,7 +196,7 @@ def cmd_test_llm(args: argparse.Namespace) -> int:
     from tyagent.config import load_config
     from tyagent.agent import TyAgent
 
-    config = load_config(Path(args.config) if args.config else None)
+    config = _load_config_from_args(args)
     agent = TyAgent.from_config(config.agent)
 
     messages = [{"role": "user", "content": args.message or "你好，请用一句话介绍自己"}]
@@ -218,7 +226,7 @@ def cmd_configure(args: argparse.Namespace) -> int:
     """Interactive configuration wizard for tyagent."""
     import os
 
-    config = load_config(Path(args.config) if args.config else None)
+    config = _load_config_from_args(args)
 
     print("=" * 50)
     print("  tyagent Configuration Wizard")
@@ -434,6 +442,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Path to config file",
     )
     parser.add_argument(
+        "-p", "--profile",
+        default=None,
+        help="Profile name (default: tyagent). Uses ~/.tyagent/<profile>/",
+    )
+    parser.add_argument(
         "-l", "--log-level",
         default="INFO",
         help="Logging level",
@@ -510,7 +523,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     test_parser.add_argument("--message", "-m", help="Test message to send")
     test_parser.set_defaults(func=cmd_test_llm)
 
-    args = parser.parse_args(argv)
+    # Pre-parse --profile from argv so it works before OR after the subcommand.
+    # argparse requires parent-parser flags before the subcommand; this
+    # manual extraction allows 'tyagent config --profile foo' as well as
+    # 'tyagent --profile foo config'.
+    _argv = list(argv) if argv is not None else sys.argv[1:]
+    _profile_arg = None
+    _new_argv: list[str] = []
+    _skip = False
+    for i, a in enumerate(_argv):
+        if _skip:
+            _skip = False
+            continue
+        if a in ("-p", "--profile"):
+            if i + 1 < len(_argv):
+                _profile_arg = _argv[i + 1]
+                _skip = True
+            continue
+        _new_argv.append(a)
+    args = parser.parse_args(_new_argv)
+    if _profile_arg is not None:
+        args.profile = _profile_arg
     if not args.command:
         parser.print_help()
         return 1

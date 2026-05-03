@@ -179,18 +179,41 @@ class TyAgentConfig:
         )
 
 
-def load_config(config_path: Optional[Path] = None) -> TyAgentConfig:
+def load_config(config_path: Optional[Path] = None, profile: Optional[str] = None) -> TyAgentConfig:
+    """Load tyagent configuration.
+
+    Precedence:
+    1. *config_path* — explicit file path
+    2. *profile* — ~/.tyagent/<profile>/config.yaml
+    3. default — ~/.tyagent/tyagent/config.yaml
+    """
     if config_path:
         return _load_from_path(config_path)
-    home = default_home
-    yaml_path = home / "config.yaml"
-    json_path = home / "config.json"
+
+    if profile:
+        profile_dir = _usr_home / ".tyagent" / profile
+    else:
+        profile_dir = default_home
+
+    yaml_path = profile_dir / "config.yaml"
+    json_path = profile_dir / "config.json"
     if yaml_path.exists():
-        return _load_from_path(yaml_path)
+        cfg = _load_from_path(yaml_path)
+        # Override home_dir / sessions_dir to use the actual profile
+        # directory, not whatever is stored in the config file.
+        cfg.home_dir = profile_dir
+        cfg.sessions_dir = profile_dir / "sessions"
+        return cfg
     if json_path.exists():
-        return _load_from_path(json_path)
-    logger.info("No config file found, using defaults.")
-    return TyAgentConfig()
+        cfg = _load_from_path(json_path)
+        cfg.home_dir = profile_dir
+        cfg.sessions_dir = profile_dir / "sessions"
+        return cfg
+    logger.info("No config file found for profile %s, using defaults.", profile or DEFAULT_PROFILE)
+    cfg = TyAgentConfig()
+    cfg.home_dir = profile_dir
+    cfg.sessions_dir = profile_dir / "sessions"
+    return cfg
 
 
 def _load_from_path(path: Path) -> TyAgentConfig:

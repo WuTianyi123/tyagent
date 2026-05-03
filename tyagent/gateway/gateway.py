@@ -634,13 +634,21 @@ class Gateway:
 # ---------------------------------------------------------------------------
 
 
-async def run_gateway(config_path: Optional[str] = None) -> None:
-    """Entry point to start the gateway."""
+async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgentConfig] = None) -> None:
+    """Entry point to start the gateway.
+
+    Precedence: *config* object > *config_path* > default profile.
+    """
     from pathlib import Path
 
     from tyagent.config import load_config
 
-    config = load_config(Path(config_path) if config_path else None)
+    if config is not None:
+        pass  # use the provided config object directly
+    elif config_path:
+        config = load_config(Path(config_path))
+    else:
+        config = load_config()
 
     # Setup logging
     logging.basicConfig(
