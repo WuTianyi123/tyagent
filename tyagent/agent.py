@@ -589,14 +589,16 @@ class TyAgent:
 
         while self._running:
             inbox_task = loop.create_task(self._inbox.get())
-            child_task = loop.create_task(
-                self._event_collector.wait_next() if self._event_collector
-                else asyncio.sleep(999999)  # never completes if no collector
-            )
             stop_task = loop.create_task(self._stop_event.wait())
 
+            tasks = [inbox_task, stop_task]
+            child_task = None
+            if self._event_collector:
+                child_task = loop.create_task(self._event_collector.wait_next())
+                tasks.append(child_task)
+
             done, pending = await asyncio.wait(
-                [inbox_task, child_task, stop_task],
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for t in pending:
@@ -627,7 +629,6 @@ class TyAgent:
                 break
 
             # Inject child completions (auto-replies have no reply_target)
-            current_reply = None
             if self._event_collector is not None:
                 child_events = self._event_collector.drain_completed()
                 for event in child_events:
@@ -653,12 +654,10 @@ class TyAgent:
 
             # Run turn with error handling
             tools = registry.get_definitions()
+            prev_tool_cb = self._tool_progress_callback
+            self._tool_progress_callback = current_tool_cb
             try:
-                # Activate per-message tool progress callback
-                prev_tool_cb = self._tool_progress_callback
-                self._tool_progress_callback = current_tool_cb
                 content = await self._run_turn(tools=tools)
-                self._tool_progress_callback = prev_tool_cb
                 if content.strip():
                     await self._output_queue.put(AgentOutput(
                         text=content,
@@ -672,24 +671,18 @@ class TyAgent:
                     ))
             except AgentError as exc:
                 logger.error("Agent loop error: %s", exc)
-                self._tool_progress_callback = prev_tool_cb
                 await self._output_queue.put(AgentOutput(
                     text=f"❌ 错误: {exc}",
                     reply_target=current_reply,
                 ))
             except Exception as exc:
                 logger.exception("Unexpected error in agent loop")
-                self._tool_progress_callback = prev_tool_cb
                 await self._output_queue.put(AgentOutput(
                     text=f"❌ 内部错误: {exc}",
                     reply_target=current_reply,
                 ))
-            except asyncio.CancelledError:
-                # CancelledError is BaseException in 3.11+, not caught above.
-                # Restore callback before letting cancellation propagate.
-                self._tool_progress_callback = prev_tool_cb
-                raise
             finally:
+                self._tool_progress_callback = prev_tool_cb
                 # Signal that this message's turn is done
                 if current_turn_done:
                     try:
