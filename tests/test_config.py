@@ -119,11 +119,13 @@ class TestAgentConfigDefaults:
 
     def test_defaults(self):
         cfg = AgentConfig()
+        assert cfg.provider == "deepseek"
         assert cfg.model == "anthropic/claude-sonnet-4"
         assert cfg.api_key is None
         assert cfg.base_url is None
         assert cfg.max_tool_turns == 200
         assert cfg.system_prompt == "You are a helpful assistant."
+        assert cfg.context_length is None
 
 
 class TestAgentConfigToDict:
@@ -133,8 +135,8 @@ class TestAgentConfigToDict:
         cfg = AgentConfig()
         d = cfg.to_dict()
         assert d == {
+            "provider": "deepseek",
             "model": "anthropic/claude-sonnet-4",
-            "api_key": None,
             "base_url": None,
             "max_tool_turns": 200,
             "system_prompt": "You are a helpful assistant.",
@@ -143,18 +145,22 @@ class TestAgentConfigToDict:
 
     def test_custom_to_dict(self):
         cfg = AgentConfig(
+            provider="openai",
             model="openai/gpt-4o",
             api_key="sk-test",
             base_url="https://api.example.com",
             max_tool_turns=100,
             system_prompt="Be concise.",
+            context_length=200000,
         )
         d = cfg.to_dict()
+        assert d["provider"] == "openai"
         assert d["model"] == "openai/gpt-4o"
-        assert d["api_key"] == "sk-test"
+        assert "api_key" not in d  # lives in .env
         assert d["base_url"] == "https://api.example.com"
         assert d["max_tool_turns"] == 100
         assert d["system_prompt"] == "Be concise."
+        assert d["context_length"] == 200000
 
 
 class TestAgentConfigFromDict:
@@ -162,26 +168,31 @@ class TestAgentConfigFromDict:
 
     def test_empty_dict(self):
         cfg = AgentConfig.from_dict({})
+        assert cfg.provider == "deepseek"
         assert cfg.model == "anthropic/claude-sonnet-4"
         assert cfg.api_key is None
         assert cfg.base_url is None
         assert cfg.max_tool_turns == 200
         assert cfg.system_prompt == "You are a helpful assistant."
+        assert cfg.context_length is None
 
     def test_full_dict(self):
         data = {
+            "provider": "openai",
             "model": "openai/gpt-4o",
-            "api_key": "sk-test",
             "base_url": "https://api.example.com",
             "max_tool_turns": 100,
             "system_prompt": "Be concise.",
+            "context_length": 200000,
         }
         cfg = AgentConfig.from_dict(data)
+        assert cfg.provider == "openai"
         assert cfg.model == "openai/gpt-4o"
-        assert cfg.api_key == "sk-test"
+        assert cfg.api_key is None  # loaded from .env, not config
         assert cfg.base_url == "https://api.example.com"
         assert cfg.max_tool_turns == 100
         assert cfg.system_prompt == "Be concise."
+        assert cfg.context_length == 200000
 
     def test_partial_dict(self):
         data = {"model": "custom-model", "max_tool_turns": 20}
@@ -193,14 +204,21 @@ class TestAgentConfigFromDict:
 
     def test_roundtrip(self):
         original = AgentConfig(
+            provider="openai",
             model="openai/gpt-4o",
-            api_key="sk-test",
             base_url="https://api.example.com",
             max_tool_turns=75,
             system_prompt="Custom prompt",
+            context_length=200000,
         )
         restored = AgentConfig.from_dict(original.to_dict())
-        assert restored == original
+        assert restored.provider == original.provider
+        assert restored.model == original.model
+        assert restored.base_url == original.base_url
+        assert restored.max_tool_turns == original.max_tool_turns
+        assert restored.system_prompt == original.system_prompt
+        assert restored.context_length == original.context_length
+        # api_key is NOT round-tripped through to_dict (lives in .env)
 
 
 # ---------------------------------------------------------------------------

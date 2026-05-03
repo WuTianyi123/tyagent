@@ -87,10 +87,12 @@ class TyAgent:
         reasoning_effort: Optional[str] = "high",
         compression: Optional[CompressionConfig] = None,
         home_dir: Optional[Path] = None,
+        context_length: Optional[int] = None,
     ):
         self.model = model
         self.home_dir = home_dir
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.context_length = context_length
+        self.api_key = api_key or os.environ.get("TYAGENT_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.max_tool_turns = max_tool_turns
         self.system_prompt = system_prompt
@@ -99,7 +101,6 @@ class TyAgent:
         self.compress_model = c.model
         self.compress_api_key = c.api_key or self.api_key
         self.compress_base_url = c.base_url or self.base_url
-        self.compress_context_window = c.context_window
         self.compress_cut_ratio = c.cut_ratio
         self._compression_config = compression  # stored for child agent cloning
         self._client = httpx.AsyncClient(timeout=120.0)
@@ -274,7 +275,7 @@ class TyAgent:
                                 model=self.compress_model or self.model,
                                 api_key=self.compress_api_key, base_url=self.compress_base_url,
                                 token_history=self._token_history,
-                                context_window=self.compress_context_window,
+                                context_window=self.context_length or 128000,
                                 cut_ratio=self.compress_cut_ratio,
                             )
                             if compressed is not None:
@@ -432,7 +433,7 @@ class TyAgent:
                             api_key=self.compress_api_key,
                             base_url=self.compress_base_url,
                             token_history=self._token_history,
-                            context_window=self.compress_context_window,
+                            context_window=self.context_length or 128000,
                             cut_ratio=self.compress_cut_ratio,
                         )
                         if compressed is not None:
@@ -692,13 +693,14 @@ class TyAgent:
         compression = getattr(config, "compression", None)
         return cls(
             model=config.model,
-            api_key=config.api_key,
+            api_key=getattr(config, "api_key", None),
             base_url=config.base_url,
             max_tool_turns=getattr(config, "max_tool_turns", 200),
             system_prompt=config.system_prompt,
             reasoning_effort=getattr(config, "reasoning_effort", "high"),
             compression=compression,
             home_dir=home_dir,
+            context_length=getattr(config, "context_length", None),
         )
 
 

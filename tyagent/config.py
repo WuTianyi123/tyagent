@@ -29,6 +29,7 @@ default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 DEFAULT_CONFIG: Dict[str, Any] = {
     "platforms": {},
     "agent": {
+        "provider": "deepseek",
         "model": "anthropic/claude-sonnet-4",
         "max_tool_turns": 200,
         "reasoning_effort": "high",
@@ -93,12 +94,12 @@ class CompressionConfig:
     """Configuration for context compression (LLM summarization on overflow).
 
     All fields optional — None falls back to the agent model (model/api_key/base_url).
-    context_window and cut_ratio control the single-pass compression cut point.
+    cut_ratio controls the single-pass compression cut point: the cut lands at
+    roughly ``context_length * cut_ratio`` tokens into the conversation.
     """
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
-    context_window: int = 128000
     cut_ratio: float = 0.5
 
     def to_dict(self) -> Dict[str, Any]:
@@ -109,7 +110,6 @@ class CompressionConfig:
             d["api_key"] = self.api_key
         if self.base_url:
             d["base_url"] = self.base_url
-        d["context_window"] = self.context_window
         d["cut_ratio"] = self.cut_ratio
         return d
 
@@ -119,7 +119,6 @@ class CompressionConfig:
             model=data.get("model"),
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
-            context_window=int(_v) if (_v := data.get("context_window")) is not None else 128000,
             cut_ratio=float(_v) if (_v := data.get("cut_ratio")) is not None else 0.5,
         )
 
@@ -167,18 +166,26 @@ class WorkspaceConfig:
 
 @dataclass
 class AgentConfig:
-    """Configuration for the AI agent."""
+    """Configuration for the AI agent.
+
+    api_key lives in ``home_dir/.env`` as TYAGENT_API_KEY, not in config.yaml.
+    context_length defaults to None (auto-detect from model when possible).
+    """
+    provider: str = "deepseek"
     model: str = "anthropic/claude-sonnet-4"
-    api_key: Optional[str] = None
     base_url: Optional[str] = None
     max_tool_turns: Optional[int] = 200  # None = no limit
     system_prompt: str = "You are a helpful assistant."
     reasoning_effort: Optional[str] = "high"  # None/"" = don't send
+    context_length: Optional[int] = None
+
+    # ―― runtime only, set by CLI / gateway after .env loading ―――
+    api_key: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
+            "provider": self.provider,
             "model": self.model,
-            "api_key": self.api_key,
             "base_url": self.base_url,
             "system_prompt": self.system_prompt,
         }
@@ -186,17 +193,23 @@ class AgentConfig:
             d["max_tool_turns"] = self.max_tool_turns
         if self.reasoning_effort:
             d["reasoning_effort"] = self.reasoning_effort
+        if self.context_length is not None:
+            d["context_length"] = self.context_length
+        # api_key deliberately excluded — lives in .env
         return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> AgentConfig:
+        cl = data.get("context_length")
         return cls(
+            provider=data.get("provider", "deepseek"),
             model=data.get("model", "anthropic/claude-sonnet-4"),
-            api_key=data.get("api_key"),
             base_url=data.get("base_url"),
             max_tool_turns=data.get("max_tool_turns", 200),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
             reasoning_effort=data.get("reasoning_effort", "high"),
+            context_length=int(cl) if cl is not None else None,
+            # api_key is loaded from .env, not config.yaml
         )
 
 
@@ -258,6 +271,57 @@ class TyAgentConfig:
         )
 
 
+def _load_profile_env(profile_dir: Path) -> None:
+    """Load ``profile_dir/.env`` into os.environ (if it exists)."""
+    env_path = profile_dir / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_path, override=True)
+    except ImportError:
+        # Fallback: simple KEY=VALUE parser
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip("\"'")
+            if key:
+                os.environ[key] = value
+
+
+def _migrate_api_key_to_env(raw: Dict[str, Any], profile_dir: Path) -> bool:
+    """One-time: move ``agent.api_key`` from config.yaml → .env.
+
+    Returns True if migration was performed.
+    """
+    agent_section = raw.get("agent") or {}
+    if not isinstance(agent_section, dict):
+        return False
+    api_key = agent_section.pop("api_key", None)
+    if not api_key:
+        return False
+    env_path = profile_dir / ".env"
+    existing_lines: List[str] = []
+    has_key = False
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("TYAGENT_API_KEY="):
+                has_key = True
+            existing_lines.append(line)
+    if has_key:
+        # .env already has the key — just remove from config
+        return True
+    existing_lines.append(f"TYAGENT_API_KEY={api_key}")
+    env_path.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+    return True
+
+
 def load_config(config_path: Optional[Path] = None, profile: Optional[str] = None) -> TyAgentConfig:
     """Load tyagent configuration.
 
@@ -265,11 +329,11 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
     1. *config_path* — explicit file path
     2. *profile* — ~/.tyagent/<profile>/config.yaml
     3. default — ~/.tyagent/tyagent/config.yaml
+
+    Side-effects: loads .env, auto-fills missing schema keys, migrates
+    api_key from config.yaml → .env on first encounter.
     """
     if config_path:
-        # Explicit path — trust the file as-is.  Unlike profile mode we do
-        # NOT override home_dir / sessions_dir here: the user specified an
-        # exact file and may have intentional custom paths in it.
         return _load_from_path(config_path)
 
     if profile:
@@ -277,18 +341,20 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
     else:
         profile_dir = default_home
 
+    # ── Load .env (API keys) ───────────────────────────────────
+    _load_profile_env(profile_dir)
+
     yaml_path = profile_dir / "config.yaml"
     json_path = profile_dir / "config.json"
     if yaml_path.exists():
         with open(yaml_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
-        if _deep_merge_defaults(raw, DEFAULT_CONFIG):
-            yaml_path.parent.mkdir(parents=True, exist_ok=True)
+        # ── Migrate api_key from config.yaml → .env ────────────
+        if _migrate_api_key_to_env(raw, profile_dir):
             _yaml_dump(raw, yaml_path)
-            try:
-                os.chmod(yaml_path, 0o600)
-            except OSError:
-                pass
+            logger.info("Migrated api_key to .env")
+        if _deep_merge_defaults(raw, DEFAULT_CONFIG):
+            _yaml_dump(raw, yaml_path)
             logger.info("Config schema updated with new defaults.")
         cfg = TyAgentConfig.from_dict(raw)
         # Override home_dir / sessions_dir to use the actual profile
