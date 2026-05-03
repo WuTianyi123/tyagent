@@ -24,10 +24,19 @@ default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 
 # Canonical config schema — every key that should exist in config.yaml.
 # Used at startup to auto-fill missing fields (user values are never overwritten).
+# Only user-configurable leaf fields are listed; runtime-derived values (like
+# context_window from the model) stay in dataclass constructors only.
 DEFAULT_CONFIG: Dict[str, Any] = {
     "platforms": {},
-    "agent": {},
-    "compression": {},
+    "agent": {
+        "model": "anthropic/claude-sonnet-4",
+        "max_tool_turns": 200,
+        "reasoning_effort": "high",
+        "system_prompt": "You are a helpful assistant.",
+    },
+    "compression": {
+        "cut_ratio": 0.5,
+    },
     "workspace": {
         "lock": "off",
     },
@@ -275,8 +284,7 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
             raw = yaml.safe_load(f) or {}
         if _deep_merge_defaults(raw, DEFAULT_CONFIG):
             yaml_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(yaml_path, "w", encoding="utf-8") as f:
-                yaml.dump(raw, f, default_flow_style=False, allow_unicode=True)
+            _yaml_dump(raw, yaml_path)
             try:
                 os.chmod(yaml_path, 0o600)
             except OSError:
@@ -351,12 +359,24 @@ def migrate_legacy_home(home_dir: Path) -> None:
                 logger.warning("  Failed to move %s: %s", item, exc)
 
 
+def _yaml_dump(data: Dict[str, Any], path: Path) -> None:
+    """Write *data* to *path* as YAML, using '~' for None."""
+    class _TyDumper(yaml.Dumper):
+        pass
+
+    def _repr_none(self, _data):
+        return self.represent_scalar("tag:yaml.org,2002:null", "~")
+
+    _TyDumper.add_representer(type(None), _repr_none)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, Dumper=_TyDumper, default_flow_style=False, allow_unicode=True)
+
+
 def save_config(config: TyAgentConfig, path: Optional[Path] = None) -> None:
     if path is None:
         path = config.home_dir / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(config.to_dict(), f, default_flow_style=False, allow_unicode=True)
+    _yaml_dump(config.to_dict(), path)
     try:
         os.chmod(path, 0o600)
     except OSError:
