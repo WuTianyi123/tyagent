@@ -115,10 +115,13 @@ class GatewaySupervisor:
             )
 
         logger.info(
-            "Graceful restart complete — spawning systemctl restart (avoids RestartSec delay)"
+            "Graceful restart complete — spawning systemctl restart and shutting down"
         )
         import subprocess
 
+        # Spawn the restart command in the background.  If it fails we
+        # still shut down gracefully; the process manager (systemd) will
+        # restart us via its own Restart= policy.
         try:
             subprocess.Popen(
                 [
@@ -136,11 +139,13 @@ class GatewaySupervisor:
             )
         except Exception as exc:
             logger.error(
-                "Failed to spawn systemctl restart: %s — falling back to exit 75",
+                "Failed to spawn systemctl restart: %s — relying on Restart= policy",
                 exc,
             )
-            os._exit(75)
-        os._exit(0)
+
+        # Trigger the normal gateway shutdown path so that all cleanup
+        # (adapters, session agents, cached agents) runs before exit.
+        self.shutdown()
 
     def _write_clean_shutdown_marker(self) -> None:
         """Write .clean_shutdown marker with restart requestor info."""
