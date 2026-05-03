@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,10 @@ class BasePlatformAdapter(ABC):
 
     MAX_MESSAGE_LENGTH: int = 4096
 
-    def __init__(self, config: Any, platform_name: str):
+    def __init__(self, config: Any, platform_name: str, *, home_dir: Optional[Path] = None):
         self.config = config
         self.platform_name = platform_name
+        self.home_dir = home_dir
         self._message_handler: Optional[MessageHandler] = None
         self._running = False
 

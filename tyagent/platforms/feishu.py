@@ -603,7 +603,7 @@ class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark platform adapter."""
 
     def __init__(self, config: Any, home_dir: Optional[Path] = None):
-        super().__init__(config, "feishu")
+        super().__init__(config, "feishu", home_dir=home_dir)
         if not FEISHU_AVAILABLE:
             raise ImportError(
                 "lark_oapi is required for Feishu support. "
@@ -630,7 +630,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Cache dir for media and dedup state
-        _base = home_dir if home_dir is not None else default_home
+        if self.home_dir is None:
+            logger.warning("FeishuAdapter created without home_dir — using default %s. Profile isolation may be broken.", default_home)
+            _base = default_home
+        else:
+            _base = self.home_dir
         self._cache_dir = _base / "cache" / "feishu"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 

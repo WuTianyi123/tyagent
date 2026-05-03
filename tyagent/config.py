@@ -203,16 +203,20 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
         # directory, not whatever is stored in the config file.
         cfg.home_dir = profile_dir
         cfg.sessions_dir = profile_dir / "sessions"
+        migrate_legacy_home(cfg.home_dir)
         return cfg
     if json_path.exists():
         cfg = _load_from_path(json_path)
         cfg.home_dir = profile_dir
         cfg.sessions_dir = profile_dir / "sessions"
+        migrate_legacy_home(cfg.home_dir)
         return cfg
     logger.info("No config file found for profile %s, using defaults.", profile or DEFAULT_PROFILE)
     cfg = TyAgentConfig()
     cfg.home_dir = profile_dir
     cfg.sessions_dir = profile_dir / "sessions"
+    # Check for legacy migration on first use
+    migrate_legacy_home(cfg.home_dir)
     return cfg
 
 
@@ -223,6 +227,44 @@ def _load_from_path(path: Path) -> TyAgentConfig:
         else:
             data = json.load(f)
     return TyAgentConfig.from_dict(data)
+
+
+def migrate_legacy_home(home_dir: Path) -> None:
+    """One-time migration: old flat ~/.tyagent/ → new profile directory.
+
+    Only triggers when:
+      - Legacy ~/.tyagent/config.yaml exists
+      - Target home_dir/config.yaml does NOT exist
+      - home_dir is the default profile (not a custom path or other profile)
+
+    Safe to call from any CLI entry point; no-op if conditions not met.
+    """
+    import shutil
+
+    if home_dir != default_home:
+        return  # not the default profile
+
+    legacy_home = default_home.parent  # ~/.tyagent/
+    legacy_config = legacy_home / "config.yaml"
+    if not legacy_config.exists():
+        return
+
+    if (home_dir / "config.yaml").exists():
+        return  # target already has config — migration done or not needed
+
+    logger.info("Migrating legacy ~/.tyagent/ → %s/", home_dir)
+    home_dir.mkdir(parents=True, exist_ok=True)
+
+    # Move data dirs first, config.yaml last — its presence signals migration done.
+    for item in ["memories", "sessions", "cache", "home", ".clean_shutdown", "config.yaml"]:
+        src = legacy_home / item
+        dst = home_dir / item
+        if src.exists() and not dst.exists():
+            try:
+                shutil.move(str(src), str(dst))
+                logger.info("  Moved %s/ → %s/", item, dst)
+            except OSError as exc:
+                logger.warning("  Failed to move %s: %s", item, exc)
 
 
 def save_config(config: TyAgentConfig, path: Optional[Path] = None) -> None:

@@ -625,7 +625,7 @@ class TestGatewayDrainAndRestart:
 
 
 class TestLegacyMigration:
-    """Tests for _maybe_migrate_legacy_home()."""
+    """Tests for migrate_legacy_home()."""
 
     def test_migration_default_profile(self, tmp_path):
         """Migration triggers for default profile with legacy data.
@@ -635,7 +635,7 @@ class TestLegacyMigration:
 
         So default_home = ~/.tyagent/tyagent, legacy = ~/.tyagent/
         """
-        from tyagent.gateway.gateway import _maybe_migrate_legacy_home
+        from tyagent.config import migrate_legacy_home
         import tyagent.config as cfg_mod
 
         profile = tmp_path / "tyagent"
@@ -645,7 +645,7 @@ class TestLegacyMigration:
             cfg_mod.default_home = profile
             (legacy_home / "config.yaml").write_text("legacy: true")
 
-            _maybe_migrate_legacy_home(profile)
+            migrate_legacy_home(profile)
 
             assert (profile / "config.yaml").exists()
             assert not (legacy_home / "config.yaml").exists()
@@ -654,7 +654,7 @@ class TestLegacyMigration:
 
     def test_migration_skips_non_default_profile(self, tmp_path):
         """Migration skips non-default profiles."""
-        from tyagent.gateway.gateway import _maybe_migrate_legacy_home
+        from tyagent.config import migrate_legacy_home
         import tyagent.config as cfg_mod
 
         profile = tmp_path / "coder"  # not default_home
@@ -664,7 +664,7 @@ class TestLegacyMigration:
             cfg_mod.default_home = tmp_path / "tyagent"  # default is a DIFFERENT dir
             (legacy_home / "config.yaml").write_text("legacy: true")
 
-            _maybe_migrate_legacy_home(profile)
+            migrate_legacy_home(profile)
 
             # Legacy data should NOT have moved
             assert (legacy_home / "config.yaml").exists()
@@ -674,7 +674,7 @@ class TestLegacyMigration:
 
     def test_migration_skips_when_target_exists(self, tmp_path):
         """Migration skips when target already has config.yaml."""
-        from tyagent.gateway.gateway import _maybe_migrate_legacy_home
+        from tyagent.config import migrate_legacy_home
         import tyagent.config as cfg_mod
 
         profile = tmp_path / "tyagent"
@@ -686,7 +686,7 @@ class TestLegacyMigration:
             profile.mkdir(parents=True)
             (profile / "config.yaml").write_text("new")
 
-            _maybe_migrate_legacy_home(profile)
+            migrate_legacy_home(profile)
 
             # Target should remain unchanged
             assert (profile / "config.yaml").read_text() == "new"
