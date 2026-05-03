@@ -434,16 +434,16 @@ def _yaml_dump(data: Dict[str, Any], path: Path) -> None:
         return self.represent_scalar("tag:yaml.org,2002:null", "~")
 
     _TyDumper.add_representer(type(None), _repr_none)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, Dumper=_TyDumper, default_flow_style=False, allow_unicode=True)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def save_config(config: TyAgentConfig, path: Optional[Path] = None) -> None:
     if path is None:
         path = config.home_dir / "config.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
     _yaml_dump(config.to_dict(), path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
