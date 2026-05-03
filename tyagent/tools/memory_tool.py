@@ -273,8 +273,21 @@ class MemoryStore:
         return [e for e in entries if e]
 
     @staticmethod
+    def _atomic_replace(tmp_path: Path, target: Path) -> None:
+        """Atomically move tmp_path onto target, preserving symlinks.
+
+        ``os.replace`` atomically swaps tmp into place.  When *target* is a
+        symlink, the symlink itself gets replaced with a regular file —
+        silently detaching managed deployments that symlink MEMORY.md/USER.md
+        from their profile home.  This resolves the symlink first so the
+        real file is replaced in-place while the symlink survives.
+        """
+        real_path = os.path.realpath(target) if os.path.islink(target) else target
+        os.replace(tmp_path, real_path)
+
+    @staticmethod
     def _write_file(path: Path, entries: List[str]) -> None:
-        """Atomic write via tempfile + os.replace."""
+        """Atomic write via tempfile + fsync + atomic rename (symlink-safe)."""
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), suffix=".tmp", prefix=".mem_"
@@ -284,7 +297,7 @@ class MemoryStore:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, str(path))  # Atomic on same filesystem
+            MemoryStore._atomic_replace(Path(tmp_path), path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
