@@ -566,8 +566,8 @@ class TestGatewayDrainAndRestart:
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)
 
-        # Create the marker file
-        home_dir = Path.home() / ".tyagent"
+        # Create the marker file in the config's home_dir
+        home_dir = config.home_dir
         home_dir.mkdir(parents=True, exist_ok=True)
         marker = home_dir / ".clean_shutdown"
         marker.write_text("clean")
@@ -585,8 +585,8 @@ class TestGatewayDrainAndRestart:
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)
 
-        # Ensure no marker file
-        home_dir = Path.home() / ".tyagent"
+        # Ensure no marker file in config home_dir
+        home_dir = config.home_dir
         marker = home_dir / ".clean_shutdown"
         if marker.exists():
             marker.unlink()

@@ -146,7 +146,7 @@ class GatewaySupervisor:
         """Write .clean_shutdown marker with restart requestor info."""
         gw = self._gateway
         try:
-            marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+            marker_path = gw.config.home_dir / ".clean_shutdown"
             marker_path.parent.mkdir(parents=True, exist_ok=True)
             marker_data: dict = {"reason": "restart"}
             req = getattr(gw, "_restart_requestor", None)
@@ -212,7 +212,7 @@ class GatewaySupervisor:
         """
         gw = self._gateway
         gw._restart_notification_pending = None  # type: ignore[assignment]
-        marker_path = Path.home() / ".tyagent" / ".clean_shutdown"
+        marker_path = gw.config.home_dir / ".clean_shutdown"
 
         if not marker_path.exists():
             logger.info(

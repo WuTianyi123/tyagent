@@ -26,6 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from tyagent.config import default_home
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
@@ -629,7 +630,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Cache dir for media and dedup state
-        self._cache_dir = Path.home() / ".tyagent" / "cache" / "feishu"
+        self._cache_dir = default_home / "cache" / "feishu"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Persistent message dedup state

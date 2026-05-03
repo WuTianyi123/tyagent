@@ -65,10 +65,10 @@ tyagent/
 
 ## 配置
 
-- 默认路径：`~/.tyagent/config.yaml`
+- 默认路径：`~/.tyagent/tyagent/config.yaml`（或 `--profile` 指定的 profile 目录）
 - 环境变量覆盖：`OPENAI_API_KEY`、`DEEPSEEK_API_KEY` 等
 - systemd 服务：`tyagent-gateway`（user scope）
-- 重启标记：`~/.tyagent/.clean_shutdown`（JSON，含 requestor 和时间戳）
+- 重启标记：`<home_dir>/.clean_shutdown`（JSON，含 requestor 和时间戳，位于 profile 目录下）
 
 ## 已知陷阱
 

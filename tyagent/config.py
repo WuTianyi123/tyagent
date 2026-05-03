@@ -19,7 +19,8 @@ try:
     _usr_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
 except (ImportError, KeyError):
     pass
-default_home = _usr_home / ".tyagent"
+DEFAULT_PROFILE = "tyagent"
+default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 default_workspace = _usr_home
 
 
