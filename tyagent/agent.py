@@ -7,17 +7,16 @@ Supports OpenAI-compatible APIs, model routing, and function calling (tools).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # Type alias for the on_message callback
 OnMessageCallback = Callable[..., Any]
 
-import functools
 import httpx
 
 from tyagent.config import CompressionConfig
@@ -429,79 +428,38 @@ class TyAgent:
         reasoning_callback: Optional[Callable[[str], None]] = None,
         tool_progress_callback: Optional[Callable[..., Any]] = None,
     ) -> str:
-        """Backward-compatible one-shot chat. Delegates to _run_turn() for non-streaming.
+        """Backward-compatible one-shot chat. Delegates to :meth:`_run_turn`.
 
-        For streaming calls, runs the original streaming logic inline.
-        Used by sub-agents and existing tests.
+        Sets instance callbacks (*_on_message*, *_tool_progress_callback*,
+        *_messages*) so that :meth:`_run_turn` finds them — safe because
+        sub-agents use a fresh ``TyAgent`` instance per task.
         """
         self._tool_progress_callback = tool_progress_callback
         self._on_message = on_message
-
-        if stream:
-            # Keep original streaming path for backward compat
-            # (gateway/consumer.py uses this)
-            from tyagent.tools.registry import registry
-
-            headers = self._build_headers()
-            self._insert_system_prompt(messages)
-            self._prev_msg_count = 0
-            self._token_history = []
-            api_messages = list(messages)
-            self._prev_msg_count = len(messages)
-            payload_base = self._build_payload_base(tools)
-
-            tool_turn = 0
-            content = None
-            reasoning_content = None
-            tool_calls = None
-            while True:
-                if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
-                    break
-                if tool_turn > 0:
-                    api_messages.extend(messages[self._prev_msg_count:])
-                self._prev_msg_count = len(messages)
-                payload = {**payload_base, "messages": api_messages,
-                           "stream": True, "stream_options": {"include_usage": True}}
-
-                _stream_caller = functools.partial(
-                    self._call_api_streaming,
-                    stream_delta_callback=stream_delta_callback,
-                    reasoning_callback=reasoning_callback,
-                )
-                content, reasoning_content, tool_calls = \
-                    await self._api_call_with_compression_retry(
-                        messages, api_messages, payload, headers,
-                        api_caller=_stream_caller,
-                    )
-
-                self._record_token_history(api_messages)
-
-                assistant_msg = self._build_assistant_msg(content, reasoning_content, tool_calls)
-                messages.append(assistant_msg)
-                self._dispatch_on_message(content, tool_calls, reasoning_content)
-
-                if not tool_calls:
-                    return (content or reasoning_content or "")
-
-                if stream and on_segment_break:
-                    try:
-                        on_segment_break()
-                    except Exception:
-                        pass
-
-                tool_turn += 1
-                await self._execute_tool_calls(tool_calls, messages, registry)
-        else:
-            # Non-streaming: delegate to _run_turn()
-            self._messages = messages
-            return await self._run_turn(tools=tools)
+        self._messages = messages
+        return await self._run_turn(
+            tools=tools,
+            stream=stream,
+            stream_delta_callback=stream_delta_callback,
+            reasoning_callback=reasoning_callback,
+            on_segment_break=on_segment_break if stream else None,
+        )
 
     async def _run_turn(
         self,
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
+        stream_delta_callback: Optional[Callable[[str], None]] = None,
+        reasoning_callback: Optional[Callable[[str], None]] = None,
+        on_segment_break: Optional[Callable[[], None]] = None,
     ) -> str:
-        """Run one LLM+tool-call turn to completion. Mutates self._messages in place."""
+        """Run one LLM+tool-call turn to completion. Mutates self._messages in place.
+
+        When *stream* is True, uses SSE streaming and invokes
+        *stream_delta_callback*, *reasoning_callback*, and
+        *on_segment_break* at the appropriate points.
+        """
         from tyagent.tools.registry import registry
 
         messages = self._messages
@@ -509,7 +467,6 @@ class TyAgent:
         # System prompt injection
         self._insert_system_prompt(messages)
 
-        self._prev_msg_count = 0
         self._token_history = []
         api_messages = list(messages)
         self._prev_msg_count = len(messages)
@@ -530,12 +487,25 @@ class TyAgent:
             if tool_turn > 0:
                 api_messages.extend(messages[self._prev_msg_count:])
             self._prev_msg_count = len(messages)
-            payload_base["messages"] = api_messages
+
+            if stream:
+                payload: Dict[str, Any] = {
+                    **payload_base, "messages": api_messages,
+                    "stream": True, "stream_options": {"include_usage": True},
+                }
+                _api_caller = functools.partial(
+                    self._call_api_streaming,
+                    stream_delta_callback=stream_delta_callback,
+                    reasoning_callback=reasoning_callback,
+                )
+            else:
+                payload = {**payload_base, "messages": api_messages}
+                _api_caller = self._call_api_nonstreaming
 
             content, reasoning_content, tool_calls = \
                 await self._api_call_with_compression_retry(
-                    messages, api_messages, payload_base, headers,
-                    api_caller=self._call_api_nonstreaming,
+                    messages, api_messages, payload, headers,
+                    api_caller=_api_caller,
                 )
 
             self._record_token_history(api_messages)
@@ -546,6 +516,12 @@ class TyAgent:
 
             if not tool_calls:
                 return (content or reasoning_content or "")
+
+            if on_segment_break:
+                try:
+                    on_segment_break()
+                except Exception:
+                    pass
 
             tool_turn += 1
             await self._execute_tool_calls(tool_calls, messages, registry)
