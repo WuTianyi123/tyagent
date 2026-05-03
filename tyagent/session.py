@@ -10,6 +10,7 @@ import logging
 import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -84,7 +85,6 @@ class Session:
         with self._store._metadata_lock:
             current_sid = self.metadata.get("current_session_id", "")
             if not current_sid:
-                import uuid
                 current_sid = uuid.uuid4().hex[:16]
                 self.metadata["current_session_id"] = current_sid
                 self._store._db.update_session_metadata(self.session_key, self.metadata)
@@ -204,7 +204,6 @@ class SessionStore:
             session_dict, _ = self._db.get_or_create_session(session_key)
             metadata = session_dict["metadata"]
             if "current_session_id" not in metadata:
-                import uuid
                 metadata["current_session_id"] = uuid.uuid4().hex[:16]
                 self._db.update_session_metadata(session_key, metadata)
                 session_dict["metadata"] = metadata
@@ -235,7 +234,6 @@ class SessionStore:
                 session_dict, _ = self._db.get_or_create_session(session_key)
                 session_id = session_dict["metadata"].get("current_session_id", "")
                 if not session_id:
-                    import uuid
                     session_id = uuid.uuid4().hex[:16]
                     session_dict["metadata"]["current_session_id"] = session_id
                     self._db.update_session_metadata(session_key, session_dict["metadata"])
@@ -277,7 +275,6 @@ class SessionStore:
         only return messages tagged with the new ID. Old messages remain
         in the database with the previous session_id.
         """
-        import uuid
         with self._metadata_lock:
             session_dict, _ = self._db.get_or_create_session(session_key)
             metadata = session_dict["metadata"]
@@ -304,7 +301,6 @@ class SessionStore:
             self._db.get_or_create_session_after_archive(session_key)
             sd, _ = self._db.get_or_create_session(session_key)
             metadata = sd["metadata"]
-            import uuid
             if old_sid:
                 metadata["prev_session_id"] = old_sid
             metadata["current_session_id"] = uuid.uuid4().hex[:16]

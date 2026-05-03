@@ -22,6 +22,10 @@ except (ImportError, KeyError):
 DEFAULT_PROFILE = "tyagent"
 default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 
+# Canonical defaults shared across DEFAULT_CONFIG, AgentConfig dataclass, and from_dict
+_DEFAULT_PROVIDER = "deepseek"
+_DEFAULT_MODEL = "anthropic/claude-sonnet-4"
+
 # Canonical config schema — every key that should exist in config.yaml.
 # Used at startup to auto-fill missing fields (user values are never overwritten).
 # Only user-configurable leaf fields are listed; runtime-derived values (like
@@ -29,8 +33,8 @@ default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
 DEFAULT_CONFIG: Dict[str, Any] = {
     "platforms": {},
     "agent": {
-        "provider": "deepseek",
-        "model": "anthropic/claude-sonnet-4",
+        "provider": _DEFAULT_PROVIDER,
+        "model": _DEFAULT_MODEL,
         "max_tool_turns": 200,
         "reasoning_effort": "high",
         "system_prompt": "You are a helpful assistant.",
@@ -175,8 +179,8 @@ class AgentConfig:
     api_key lives in ``home_dir/.env`` as TYAGENT_API_KEY, not in config.yaml.
     context_length defaults to None (auto-detect from model when possible).
     """
-    provider: str = "deepseek"
-    model: str = "anthropic/claude-sonnet-4"
+    provider: str = _DEFAULT_PROVIDER
+    model: str = _DEFAULT_MODEL
     base_url: Optional[str] = None
     max_tool_turns: Optional[int] = 200  # None = no limit
     system_prompt: str = "You are a helpful assistant."
@@ -214,8 +218,8 @@ class AgentConfig:
     def from_dict(cls, data: Dict[str, Any]) -> AgentConfig:
         cl = data.get("context_length")
         return cls(
-            provider=data.get("provider", "deepseek"),
-            model=data.get("model", "anthropic/claude-sonnet-4"),
+            provider=data.get("provider", _DEFAULT_PROVIDER),
+            model=data.get("model", _DEFAULT_MODEL),
             base_url=data.get("base_url"),
             max_tool_turns=data.get("max_tool_turns", 200),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),

@@ -91,7 +91,7 @@ def _import_json_file(
 ) -> int:
     """Import a single JSON session file into the store.
 
-    Returns the number of messages imported.
+    Returns 1 if the session was imported, 0 if skipped (e.g., no session_key).
     """
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
