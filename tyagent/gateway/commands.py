@@ -7,8 +7,6 @@ pluggable registry pattern instead of if/elif chains.
 from __future__ import annotations
 
 import logging
-import os
-import signal
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict
 
@@ -139,7 +137,7 @@ class CommandRegistry:
             reply_to_message_id=event.message_id,
         )
         self._gateway.set_restart_requestor(event.platform, event.chat_id or "")
-        os.kill(os.getpid(), signal.SIGUSR1)
+        self._gateway.supervisor._on_sigusr1()
         return "Gateway restart initiated"
 
     async def _cmd_reset(

@@ -33,6 +33,8 @@ from tyagent.tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
+_AGENT_CACHE_MAX_SIZE = 100
+
 
 # ---------------------------------------------------------------------------
 # Message sanitisation (module-level helper)
@@ -198,7 +200,6 @@ class Gateway:
             sessions_dir=config.sessions_dir
         )
         self._agent_cache: OrderedDict[str, TyAgent] = OrderedDict()
-        self._AGENT_CACHE_MAX_SIZE = 100
         # Template agent — cloned per session to avoid races on mutable
         # instance state across concurrent sessions.
         self._default_agent_template: Optional[TyAgent] = agent
@@ -272,7 +273,7 @@ class Gateway:
         self._agent_cache[session_key] = agent
         self._agent_cache.move_to_end(session_key)
         # Evict oldest if over cap
-        while len(self._agent_cache) > self._AGENT_CACHE_MAX_SIZE:
+        while len(self._agent_cache) > _AGENT_CACHE_MAX_SIZE:
             lru_key = next(iter(self._agent_cache))
             lru_agent = self._agent_cache.pop(lru_key)
             loop = asyncio.get_running_loop()
@@ -353,7 +354,7 @@ class Gateway:
 
         try:
             # Define the persistence callback for tool loop messages
-            _persist_sid = getattr(session.metadata, "current_session_id", None) or \
+            _persist_sid = session.metadata.get("current_session_id", "") if isinstance(session.metadata, dict) else getattr(session.metadata, "current_session_id", None) or \
                            getattr(session, "current_session_id", None)
 
             def persist_message(role: str, content: str, **extras) -> None:
