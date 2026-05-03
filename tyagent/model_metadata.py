@@ -138,7 +138,7 @@ DEFAULT_CONTEXT_LENGTHS: Dict[str, int] = {
 # Sorted longest-first for correct substring matching.
 _SORTED_KEYS = sorted(DEFAULT_CONTEXT_LENGTHS, key=len, reverse=True)
 
-FALLBACK_CONTEXT_LENGTH = 128_000
+FALLBACK_CONTEXT_LENGTH = 256_000
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -162,7 +162,7 @@ def get_model_context_length(model: str, *, context_length: int | None = None) -
     Resolution order:
     1. *context_length* — explicit user override
     2. ``DEFAULT_CONTEXT_LENGTHS`` table — longest-substring match
-    3. ``FALLBACK_CONTEXT_LENGTH`` (128K)
+    3. ``FALLBACK_CONTEXT_LENGTH`` (256K)
     """
     if context_length is not None and isinstance(context_length, int) and context_length > 0:
         return context_length
