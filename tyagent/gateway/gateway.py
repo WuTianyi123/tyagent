@@ -243,7 +243,7 @@ class Gateway:
             return agent
 
         # Create a new per-session agent
-        agent = TyAgent.from_config(self.config.agent)
+        agent = TyAgent.from_config(self.config.agent, home_dir=self.config.home_dir)
         self._agent_cache[session_key] = agent
         self._agent_cache.move_to_end(session_key)
         # Evict oldest if over cap

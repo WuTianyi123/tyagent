@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tyagent.agent import TyAgent
@@ -50,6 +51,7 @@ async def _run_child_async(
     compression: Any = None,
     tool_progress_callback: Any = None,
     collector: Optional[EventCollector] = None,
+    home_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run a child agent as an asyncio task in the shared event loop.
     On completion, notifies the collector. Never raises — errors captured in result dict.
@@ -63,6 +65,7 @@ async def _run_child_async(
         model=model, api_key=api_key, base_url=base_url,
         max_tool_turns=max_tool_turns, system_prompt=child_system,
         reasoning_effort=reasoning_effort, compression=compression,
+        home_dir=home_dir,
     )
     child_messages = [{"role": "user", "content": goal}]
     tool_defs = registry.get_definitions(names=tool_names)
@@ -160,6 +163,7 @@ async def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> 
         compression=_build_parent_compression(parent_agent),
         tool_progress_callback=child_cb,
         collector=parent_agent._event_collector,
+        home_dir=getattr(parent_agent, "home_dir", None),
     )
 
     child_task = asyncio.get_running_loop().create_task(child_coro)

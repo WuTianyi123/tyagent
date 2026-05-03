@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # Type alias for the on_message callback
@@ -85,8 +86,10 @@ class TyAgent:
         system_prompt: str = "You are a helpful assistant.",
         reasoning_effort: Optional[str] = "high",
         compression: Optional[CompressionConfig] = None,
+        home_dir: Optional[Path] = None,
     ):
         self.model = model
+        self.home_dir = home_dir
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.max_tool_turns = max_tool_turns
@@ -131,6 +134,7 @@ class TyAgent:
             self._cached_system_prompt = build_system_prompt(
                 model=self.model,
                 user_prompt=self.system_prompt,
+                home_dir=self.home_dir,
             )
         return self._cached_system_prompt
 
@@ -683,7 +687,7 @@ class TyAgent:
         await self._client.aclose()
 
     @classmethod
-    def from_config(cls, config: Any) -> "TyAgent":
+    def from_config(cls, config: Any, *, home_dir: Optional[Path] = None) -> "TyAgent":
         """Create a TyAgent from an AgentConfig."""
         compression = getattr(config, "compression", None)
         return cls(
@@ -694,6 +698,7 @@ class TyAgent:
             system_prompt=config.system_prompt,
             reasoning_effort=getattr(config, "reasoning_effort", "high"),
             compression=compression,
+            home_dir=home_dir,
         )
 
 
