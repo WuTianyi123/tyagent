@@ -690,7 +690,42 @@ async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgen
     logger.info("Real home available via TY_AGENT_REAL_HOME: %s", real_home)
 
     # Change to workspace directory
-    workspace = config.workspace_dir
+    ws_cfg = config.workspace
+    state_file = config.home_dir / ".workspace_cwd"
+
+    if ws_cfg.lock == "on":
+        # ── Locked mode ──
+        if not ws_cfg.locked_directory:
+            logger.error("workspace.lock is on but locked_directory is not set")
+            raise SystemExit(1)
+        try:
+            workspace = Path(ws_cfg.locked_directory).expanduser().resolve()
+        except (OSError, ValueError) as exc:
+            logger.error("Invalid locked_directory path: %s", exc)
+            raise SystemExit(1) from exc
+        if not workspace.is_dir():
+            logger.error("Locked workspace directory does not exist: %s", workspace)
+            raise SystemExit(1)
+        logger.info("Workspace (locked): %s", workspace)
+    else:
+        # ── Follow mode (default) ──
+        workspace = None
+        if state_file.exists():
+            saved = state_file.read_text().strip()
+            if saved:
+                saved_path = Path(saved).expanduser().resolve()
+                if saved_path.is_dir():
+                    workspace = saved_path
+                else:
+                    logger.warning(
+                        "Saved workspace directory no longer exists (%s), "
+                        "falling back to $HOME", saved_path,
+                    )
+        if workspace is None:
+            workspace = real_home
+            logger.info("Workspace (follow, no saved state): %s", workspace)
+        else:
+            logger.info("Workspace (follow, restored): %s", workspace)
     try:
         os.chdir(workspace)
         logger.info("Working directory set to: %s", workspace)

@@ -21,7 +21,6 @@ except (ImportError, KeyError):
     pass
 DEFAULT_PROFILE = "tyagent"
 default_home = _usr_home / ".tyagent" / DEFAULT_PROFILE
-default_workspace = _usr_home
 
 
 @dataclass
@@ -87,6 +86,32 @@ class CompressionConfig:
 
 
 @dataclass
+class WorkspaceConfig:
+    """Workspace (working directory) configuration.
+
+    lock: "on"  → always use locked_directory (error if missing)
+          "off" → follow session state; restore last cwd from state file
+    locked_directory: only meaningful when lock is "on"
+    """
+
+    lock: str = "off"
+    locked_directory: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"lock": self.lock}
+        if self.locked_directory:
+            d["locked_directory"] = self.locked_directory
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> WorkspaceConfig:
+        return cls(
+            lock=data.get("lock", "off"),
+            locked_directory=data.get("locked_directory"),
+        )
+
+
+@dataclass
 class AgentConfig:
     """Configuration for the AI agent."""
     model: str = "anthropic/claude-sonnet-4"
@@ -127,8 +152,8 @@ class TyAgentConfig:
     platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     agent: AgentConfig = field(default_factory=AgentConfig)
     compression: CompressionConfig = field(default_factory=CompressionConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     home_dir: Path = field(default_factory=lambda: default_home)
-    workspace_dir: Path = field(default_factory=lambda: default_workspace)
     sessions_dir: Path = field(default_factory=lambda: default_home / "sessions")
     log_level: str = "INFO"
     reset_triggers: List[str] = field(default_factory=lambda: ["new"])
@@ -152,8 +177,8 @@ class TyAgentConfig:
             "platforms": {k: v.to_dict() for k, v in self.platforms.items()},
             "agent": self.agent.to_dict(),
             "compression": self.compression.to_dict(),
+            "workspace": self.workspace.to_dict(),
             "home_dir": str(self.home_dir),
-            "workspace_dir": str(self.workspace_dir),
             "sessions_dir": str(self.sessions_dir),
             "log_level": self.log_level,
             "reset_triggers": self.reset_triggers,
@@ -166,13 +191,13 @@ class TyAgentConfig:
         for name, pdata in platform_data.items():
             platforms[name] = PlatformConfig.from_dict(pdata)
         home = Path(data.get("home_dir", str(default_home)))
-        workspace = Path(data.get("workspace_dir", str(default_workspace)))
+        ws_data = data.get("workspace") or {}
         return cls(
             platforms=platforms,
             agent=AgentConfig.from_dict(data.get("agent") or {}),
             compression=CompressionConfig.from_dict(data.get("compression") or {}),
+            workspace=WorkspaceConfig.from_dict(ws_data),
             home_dir=home,
-            workspace_dir=workspace,
             sessions_dir=Path(data.get("sessions_dir", str(home / "sessions"))),
             log_level=data.get("log_level", "INFO"),
             reset_triggers=data.get("reset_triggers", ["new"]),

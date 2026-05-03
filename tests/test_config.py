@@ -15,8 +15,8 @@ from tyagent.config import (
     CompressionConfig,
     PlatformConfig,
     TyAgentConfig,
+    WorkspaceConfig,
     default_home,
-    default_workspace,
     load_config,
     save_config,
 )
@@ -214,8 +214,10 @@ class TestTyAgentConfigDefaults:
         cfg = TyAgentConfig()
         assert cfg.platforms == {}
         assert isinstance(cfg.agent, AgentConfig)
+        assert isinstance(cfg.workspace, WorkspaceConfig)
+        assert cfg.workspace.lock == "off"
+        assert cfg.workspace.locked_directory is None
         assert cfg.home_dir == default_home
-        assert cfg.workspace_dir == default_workspace
         assert cfg.sessions_dir == default_home / "sessions"
         assert cfg.log_level == "INFO"
         assert cfg.reset_triggers == ["new"]
@@ -230,8 +232,8 @@ class TestTyAgentConfigToDict:
         assert d["platforms"] == {}
         assert d["agent"] == AgentConfig().to_dict()
         assert d["compression"] == CompressionConfig().to_dict()
+        assert d["workspace"] == {"lock": "off"}
         assert d["home_dir"] == str(default_home)
-        assert d["workspace_dir"] == str(default_workspace)
         assert d["sessions_dir"] == str(default_home / "sessions")
         assert d["log_level"] == "INFO"
         assert d["reset_triggers"] == ["new"]
@@ -252,12 +254,12 @@ class TestTyAgentConfigToDict:
     def test_custom_dirs(self):
         cfg = TyAgentConfig(
             home_dir=Path("/tmp/tyhome"),
-            workspace_dir=Path("/tmp/tywork"),
+            workspace=WorkspaceConfig(lock="on", locked_directory="/tmp/tywork"),
             sessions_dir=Path("/tmp/tyhome/sessions"),
         )
         d = cfg.to_dict()
         assert d["home_dir"] == "/tmp/tyhome"
-        assert d["workspace_dir"] == "/tmp/tywork"
+        assert d["workspace"] == {"lock": "on", "locked_directory": "/tmp/tywork"}
         assert d["sessions_dir"] == "/tmp/tyhome/sessions"
 
 
@@ -279,7 +281,7 @@ class TestTyAgentConfigFromDict:
             },
             "agent": {"model": "gpt-4o", "max_tool_turns": 30, "system_prompt": "Hi"},
             "home_dir": "/opt/ty",
-            "workspace_dir": "/opt/ty/work",
+            "workspace": {"lock": "on", "locked_directory": "/opt/ty/work"},
             "sessions_dir": "/opt/ty/sessions",
             "log_level": "DEBUG",
             "reset_triggers": ["restart"],
@@ -292,7 +294,7 @@ class TestTyAgentConfigFromDict:
         assert cfg.agent.model == "gpt-4o"
         assert cfg.agent.max_tool_turns == 30
         assert cfg.home_dir == Path("/opt/ty")
-        assert cfg.workspace_dir == Path("/opt/ty/work")
+        assert cfg.workspace == WorkspaceConfig(lock="on", locked_directory="/opt/ty/work")
         assert cfg.sessions_dir == Path("/opt/ty/sessions")
         assert cfg.log_level == "DEBUG"
         assert cfg.reset_triggers == ["restart"]
@@ -308,7 +310,7 @@ class TestTyAgentConfigFromDict:
             platforms={"slack": PlatformConfig(enabled=True, token="tok")},
             agent=AgentConfig(model="test-model"),
             home_dir=Path("/tmp/tyhome"),
-            workspace_dir=Path("/tmp/tywork"),
+            workspace=WorkspaceConfig(lock="off"),
             sessions_dir=Path("/tmp/tyhome/sessions"),
             log_level="DEBUG",
             reset_triggers=["reset"],
@@ -542,7 +544,7 @@ class TestSaveConfig:
             platforms={"slack": PlatformConfig(enabled=True, token="tok")},
             agent=AgentConfig(model="roundtrip-model", max_tool_turns=5),
             home_dir=Path("/tmp/tyhome"),
-            workspace_dir=Path("/tmp/tywork"),
+            workspace=WorkspaceConfig(lock="on", locked_directory="/tmp/tywork"),
             sessions_dir=Path("/tmp/tyhome/sessions"),
             log_level="WARNING",
             reset_triggers=["go"],

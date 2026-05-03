@@ -682,7 +682,7 @@ TERMINAL_SCHEMA = {
 }
 
 
-def _handle_terminal(args: Dict[str, Any]) -> str:
+def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Execute a shell command."""
     command = args.get("command", "")
     timeout = int(args.get("timeout", 180))
@@ -700,6 +700,13 @@ def _handle_terminal(args: Dict[str, Any]) -> str:
             cwd = str(_resolve_path(workdir))
         except (OSError, ValueError) as exc:
             return tool_error(f"Invalid workdir '{workdir}': {exc}")
+        # Track workspace state for session recovery
+        if parent_agent is not None and hasattr(parent_agent, "home_dir"):
+            state_file = parent_agent.home_dir / ".workspace_cwd"
+            try:
+                state_file.write_text(cwd)
+            except OSError:
+                pass  # best-effort; don't fail the tool call
 
     try:
         # Ensure isolated HOME is inherited by subprocess
@@ -877,6 +884,7 @@ registry.register(
     handler=_handle_terminal,
     description="Execute shell commands",
     emoji="💻",
+    wants_parent=True,
 )
 registry.register(
     name="execute_code",
