@@ -37,7 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "model": _DEFAULT_MODEL,
         "max_tool_turns": 200,
         "reasoning_effort": "high",
-        "system_prompt": "You are a helpful assistant.",
+        "system_prompt": "",
         "max_tokens": 4096,
         "temperature": 0.7,
         "http_timeout": 120.0,
@@ -183,7 +183,7 @@ class AgentConfig:
     model: str = _DEFAULT_MODEL
     base_url: Optional[str] = None
     max_tool_turns: Optional[int] = 200  # None = no limit
-    system_prompt: str = "You are a helpful assistant."
+    system_prompt: str = ""
     reasoning_effort: Optional[str] = "high"  # None/"" = don't send
     context_length: Optional[int] = None
     max_tokens: int = 4096
@@ -222,7 +222,7 @@ class AgentConfig:
             model=data.get("model", _DEFAULT_MODEL),
             base_url=data.get("base_url"),
             max_tool_turns=data.get("max_tool_turns", 200),
-            system_prompt=data.get("system_prompt", "You are a helpful assistant."),
+            system_prompt=data.get("system_prompt", ""),
             reasoning_effort=data.get("reasoning_effort", "high"),
             context_length=int(cl) if cl is not None else None,
             max_tokens=data.get("max_tokens", 4096),

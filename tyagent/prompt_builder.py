@@ -25,10 +25,10 @@ TYAGENT_IDENTITY = (
     "You communicate clearly and prioritise being genuinely useful."
 )
 
-# Default system_prompt value in AgentConfig.  We skip injecting the
-# user's custom prompt when it still matches this default so the system
-# prompt stays lean.
-_DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Sentinel for "user did not set a custom system prompt". Empty string
+# means the prompt_builder should skip injection — the user can set any
+# non-empty string including "You are a helpful assistant." if they choose.
+_DEFAULT_SYSTEM_PROMPT = ""
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +75,8 @@ def build_system_prompt(
         if user_text:
             parts.append(user_text)
 
-    # Layer 3: user's custom system_prompt only if non-default
-    if user_prompt and user_prompt != _DEFAULT_SYSTEM_PROMPT:
+    # Layer 3: user's custom system_prompt (skip if empty/unset)
+    if user_prompt and user_prompt.strip():
         parts.append(user_prompt)
 
     # Layer 4: session metadata

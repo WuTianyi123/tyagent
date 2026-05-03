@@ -124,7 +124,7 @@ class TestAgentConfigDefaults:
         assert cfg.api_key is None
         assert cfg.base_url is None
         assert cfg.max_tool_turns == 200
-        assert cfg.system_prompt == "You are a helpful assistant."
+        assert cfg.system_prompt == ""
         assert cfg.context_length is None
 
 
@@ -138,7 +138,7 @@ class TestAgentConfigToDict:
             "provider": "deepseek",
             "model": "anthropic/claude-sonnet-4",
             "base_url": None,
-            "system_prompt": "You are a helpful assistant.",
+            "system_prompt": "",
             "max_tokens": 4096,
             "temperature": 0.7,
             "http_timeout": 120.0,
@@ -176,7 +176,7 @@ class TestAgentConfigFromDict:
         assert cfg.api_key is None
         assert cfg.base_url is None
         assert cfg.max_tool_turns == 200
-        assert cfg.system_prompt == "You are a helpful assistant."
+        assert cfg.system_prompt == ""
         assert cfg.context_length is None
 
     def test_full_dict(self):
@@ -203,7 +203,7 @@ class TestAgentConfigFromDict:
         assert cfg.model == "custom-model"
         assert cfg.api_key is None
         assert cfg.max_tool_turns == 20
-        assert cfg.system_prompt == "You are a helpful assistant."
+        assert cfg.system_prompt == ""
 
     def test_roundtrip(self):
         original = AgentConfig(

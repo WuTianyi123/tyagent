@@ -155,7 +155,7 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=256)  # 256 slots for commonly queried model names; evicts LRU
 def get_model_context_length(model: str, *, context_length: int | None = None) -> int:
     """Return the context length for *model*.
 
@@ -169,7 +169,14 @@ def get_model_context_length(model: str, *, context_length: int | None = None) -
 
     bare = _strip_provider_prefix(model).lower()
     for key in _SORTED_KEYS:
-        if key in bare:
+        idx = bare.find(key)
+        if idx == -1:
+            continue
+        # Reject false-positives where key is embedded in a longer name
+        # (e.g. "non-deepseek-v4-pro" should not match "deepseek-v4-pro")
+        before_ok = idx == 0 or bare[idx - 1] in ("-", "/", ":")
+        after_ok = idx + len(key) == len(bare) or bare[idx + len(key)] in ("-", "/", ":")
+        if before_ok and after_ok:
             result = DEFAULT_CONTEXT_LENGTHS[key]
             logger.debug("Context length for %r resolved to %s (matched %r)", model, f"{result:,}", key)
             return result

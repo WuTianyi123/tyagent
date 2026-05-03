@@ -30,6 +30,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 
 DEFAULT_SUBAGENT_MAX_TOOL_TURNS = 30
+DEFAULT_CHILD_TIMEOUT = 600.0  # asyncio.wait_for timeout for each child chat() call
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ async def _run_child_async(
         summary = await asyncio.wait_for(
             child.chat(child_messages, tools=tool_defs,
                         tool_progress_callback=tool_progress_callback),
-            timeout=600.0,
+            timeout=DEFAULT_CHILD_TIMEOUT,
         )
         result = {
             "success": True,
@@ -155,7 +156,7 @@ async def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> 
             parent_cb(tn, ai, prefix="📤 ")
         child_cb = _child_progress
 
-    task_id = str(uuid.uuid4())[:8]
+    task_id = str(uuid.uuid4())[:12]  # 48-bit — negligible collision risk in practice
 
     # Lazy create collector
     if parent_agent._event_collector is None:
@@ -281,32 +282,15 @@ async def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) 
     Kept for backward compatibility. Equivalent to the original blocking
     delegate_task behavior but uses the new async sub-agent infrastructure.
     """
-    goal = args.get("goal", "").strip()
-    if not goal:
-        return tool_error("goal is required for delegate_task.")
-
-    context = args.get("context") or None
-    toolsets: Optional[List[str]] = args.get("toolsets") or None
-    max_tool_turns = args.get("max_tool_turns", DEFAULT_SUBAGENT_MAX_TOOL_TURNS)
-    try:
-        max_tool_turns = int(max_tool_turns)
-    except (TypeError, ValueError):
-        return tool_error("max_tool_turns must be an integer.")
-    if max_tool_turns < 1:
-        return tool_error("max_tool_turns must be at least 1.")
-    if max_tool_turns > 200:
-        return tool_error("max_tool_turns must be at most 200.")
-    if parent_agent is None:
-        return tool_error("No parent agent context — delegate_task requires a session agent.")
-
-    # Delegate to spawn_task
-    spawn_args = {"goal": goal}
-    if context:
-        spawn_args["context"] = context
-    if toolsets:
-        spawn_args["toolsets"] = toolsets
-    if max_tool_turns != DEFAULT_SUBAGENT_MAX_TOOL_TURNS:
-        spawn_args["max_tool_turns"] = max_tool_turns
+    # Validation is delegated to _handle_spawn_task to avoid duplication.
+    # Build spawn_args from delegate_task's argument set.
+    spawn_args: Dict[str, Any] = {"goal": args.get("goal", "")}
+    if "context" in args:
+        spawn_args["context"] = args["context"]
+    if "toolsets" in args:
+        spawn_args["toolsets"] = args["toolsets"]
+    if "max_tool_turns" in args:
+        spawn_args["max_tool_turns"] = args["max_tool_turns"]
 
     spawn_result = json.loads(
         await _handle_spawn_task(spawn_args, parent_agent=parent_agent)

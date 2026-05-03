@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 3
 
+_MAX_SEARCH_RESULT_LENGTH = 500  # Truncate content preview in search results
+_MAX_SEARCH_RESULTS = 50         # Cap on FTS5 search row count
+
 # ---------------------------------------------------------------------------
 # Chinese-capable FTS via jieba
 # ---------------------------------------------------------------------------
@@ -170,15 +173,13 @@ class Database:
 
             if version < 3:
                 logger.info("Upgrading database schema to v3 (session_id)")
-                try:
+                # Check if column already exists before ALTER (robust across locales)
+                col_info = self._conn.execute("PRAGMA table_info(messages)").fetchall()
+                col_names = {row["name"] for row in col_info}
+                if "session_id" not in col_names:
                     self._conn.execute(
                         "ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
                     )
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column" in str(exc).lower():
-                        logger.warning("session_id column already exists, skipping ALTER TABLE")
-                    else:
-                        raise
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_session "
                     "ON messages(session_key, session_id)"
@@ -559,7 +560,7 @@ class Database:
         if not fts_query:
             return []
 
-        limit = min(max(limit, 1), 50)
+        limit = min(max(limit, 1), _MAX_SEARCH_RESULTS)
 
         with self._lock:
             try:
@@ -582,7 +583,7 @@ class Database:
                 results.append({
                     "session_key": row["session_key"],
                     "role": row["role"],
-                    "content": (row["content"] or "")[:500],
+                    "content": (row["content"] or "")[:_MAX_SEARCH_RESULT_LENGTH],
                     "created_at": row["created_at"],
                     "rank": row["rank"],
                 })
@@ -641,7 +642,9 @@ class Database:
                     json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
                 )
 
-                # Increment timestamp slightly per message to preserve order
+                # Stagger timestamps by 1ms per message to preserve insertion order.
+                # float64 has ~15 sigfigs; at epoch ~1.7e9, 1ms steps are safe for
+                # batches up to ~10,000 messages.
                 msg_ts = base_ts + (i * 0.001)
 
                 self._conn.execute(

@@ -91,7 +91,7 @@ class TestDelegateTaskValidation:
     async def test_missing_parent_agent(self):
         result = await _call_handler({"goal": "do something"})
         assert "error" in result
-        assert "parent" in result["error"].lower()
+        assert "session" in result["error"].lower()
 
     @pytest.mark.asyncio
     async def test_max_tool_turns_not_integer(self):

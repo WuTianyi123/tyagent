@@ -192,11 +192,15 @@ class ProgressSender:
     async def run(self) -> None:
         """Async task: drain queue and edit a single progress message."""
         if not self.enabled:
+            drained = 0
             while not self._queue.empty():
                 try:
                     self._queue.get_nowait()
+                    drained += 1
                 except asyncio.QueueEmpty:
                     break
+            if drained:
+                logger.debug("Progress disabled — discarded %d queued items", drained)
             return
 
         progress_lines: list[str] = []

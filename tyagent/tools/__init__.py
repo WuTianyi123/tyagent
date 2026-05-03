@@ -9,7 +9,10 @@ browser_vision, browser_console).
 
 from tyagent.tools.registry import registry, tool_error, tool_result
 
-# Import core tools to trigger self-registration
+# Import core tools to trigger self-registration via side-effect imports.
+# DO NOT remove these — each import registers its tools in the global registry.
+# The # noqa: F401 suppresses "unused import" warnings because the side-effect
+# is the desired behavior, not the imported name.
 import tyagent.tools.core  # noqa: F401
 import tyagent.tools.browser_tools  # noqa: F401
 import tyagent.tools.memory_tool  # noqa: F401

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Sentinels for StreamConsumer
 _DONE = object()
 _NEW_SEGMENT = object()
+_MIN_FIRST_EDIT_LENGTH = 4  # Avoid sending tiny cursor-only fragments on first edit
 
 
 class StreamConsumer:
@@ -55,7 +56,7 @@ class StreamConsumer:
         self._last_sent_text: str = ""
         self._edit_supported: bool = True
         self._flood_strikes: int = 0
-        self._MAX_FLOOD_STRIKES: int = 3
+        self._max_flood_strikes: int = 3
         self._current_edit_interval: float = 1.0
         self.final_content: str = ""
         self._already_sent: bool = False
@@ -122,7 +123,7 @@ class StreamConsumer:
 
                 if should_edit and self._accumulated:
                     # Don't send tiny fragments on first edit (avoid "<cursor>")
-                    if not self._already_sent and len(self._accumulated) < 4 and not got_done and not got_segment_break:
+                    if not self._already_sent and len(self._accumulated) < _MIN_FIRST_EDIT_LENGTH and not got_done and not got_segment_break:
                         pass  # Wait for more content
                     elif self._message_id is None:
                         # First send: create the message
@@ -284,7 +285,7 @@ class StreamConsumer:
                 self._flood_strikes += 1
                 self._current_edit_interval = min(self._current_edit_interval * 2, 10.0)
                 self._last_edit_time = time.monotonic()
-                if self._flood_strikes >= self._MAX_FLOOD_STRIKES:
+                if self._flood_strikes >= self._max_flood_strikes:
                     self._edit_supported = False
                     logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)
                     return False  # Content remains accumulated, sent on got_done

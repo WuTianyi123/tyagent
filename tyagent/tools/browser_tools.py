@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -158,7 +159,7 @@ def _run_cmd(
     if browser_cmd is None:
         return {"success": False, "error": "agent-browser CLI not found"}
 
-    cmd_parts = browser_cmd.split() if browser_cmd.startswith("npx ") else [browser_cmd]
+    cmd_parts = shlex.split(browser_cmd) if browser_cmd.startswith("npx ") else [browser_cmd]
     cmd = [*cmd_parts, "--session", session_name, action]
     if args:
         cmd.extend(str(a) for a in args)
@@ -247,7 +248,7 @@ def _handle_browser_navigate(args: Dict[str, Any]) -> str:
 
     task_id = args.get("task_id")
     session = _get_session_name(task_id)
-    result = _run_cmd(session, "open", [url], timeout=max(30, _DEFAULT_TIMEOUT))
+    result = _run_cmd(session, "open", [url], timeout=_DEFAULT_TIMEOUT)
 
     if not result.get("success"):
         return tool_error(result.get("error", "Navigation failed"))
