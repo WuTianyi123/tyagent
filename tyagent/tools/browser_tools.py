@@ -32,7 +32,6 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import time
 from typing import Any, Dict, List, Optional
 
 from tyagent.tools.registry import registry, tool_error, tool_result
@@ -365,15 +364,12 @@ def _handle_browser_scroll(args: Dict[str, Any]) -> str:
 def _handle_browser_back(args: Dict[str, Any]) -> str:
     task_id = args.get("task_id")
     session = _get_session_name(task_id)
-    # agent-browser doesn't have a native "back" command; use eval
-    result = _run_cmd(session, "eval", ["history.back()"], timeout=_DEFAULT_TIMEOUT)
+    result = _run_cmd(session, "back", timeout=_DEFAULT_TIMEOUT)
 
     if not result.get("success"):
         return tool_error(result.get("error", "Back navigation failed"))
 
-    # Small delay for navigation
-    time.sleep(0.5)
-    # Return snapshot
+    # Return snapshot of the page we landed on
     snap = _run_cmd(session, "snapshot", ["-i"], timeout=_DEFAULT_TIMEOUT)
     snap_data = {}
     if snap.get("success"):
