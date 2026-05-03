@@ -633,6 +633,45 @@ class Gateway:
 # Entry point
 # ---------------------------------------------------------------------------
 
+import shutil
+
+
+def _maybe_migrate_legacy_home(home_dir: Path) -> None:
+    """One-time migration: old flat ~/.tyagent/ → new profile directory.
+
+    Only triggers when:
+      - Legacy ~/.tyagent/config.yaml exists
+      - Target home_dir/config.yaml does NOT exist
+      - home_dir is under ~/.tyagent/ (not a custom path)
+    """
+    legacy_home = home_dir.parent  # ~/.tyagent/
+    legacy_config = legacy_home / "config.yaml"
+    if not legacy_config.exists():
+        return
+
+    # Don't migrate if the target already has a config
+    if (home_dir / "config.yaml").exists():
+        return
+
+    # Only migrate if home_dir is a direct child of legacy_home
+    # (i.e., we're using the default profile, not a custom absolute path)
+    if home_dir.parent != legacy_home:
+        return
+
+    logger = logging.getLogger(__name__)
+    logger.info("Migrating legacy ~/.tyagent/ → %s/", home_dir)
+    home_dir.mkdir(parents=True, exist_ok=True)
+
+    for item in ["config.yaml", "memories", "sessions", "cache", "home", ".clean_shutdown"]:
+        src = legacy_home / item
+        dst = home_dir / item
+        if src.exists() and not dst.exists():
+            try:
+                shutil.move(str(src), str(dst))
+                logger.info("  Moved %s/ → %s/", item, dst)
+            except OSError as exc:
+                logger.warning("  Failed to move %s: %s", item, exc)
+
 
 async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgentConfig] = None) -> None:
     """Entry point to start the gateway.
@@ -649,6 +688,9 @@ async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgen
         config = load_config(Path(config_path))
     else:
         config = load_config()
+
+    # ── One-time migration: old flat ~/.tyagent/ → profiles/tyagent/ ──
+    _maybe_migrate_legacy_home(config.home_dir)
 
     # Setup logging
     logging.basicConfig(
