@@ -71,3 +71,16 @@ class TestGetModelContextLength:
         r1 = get_model_context_length("claude-sonnet-4-6")
         r2 = get_model_context_length("claude-sonnet-4-6")
         assert r1 == r2 == 1_000_000
+
+    def test_deepseek_r1_legacy(self):
+        """Explicit deepseek-r1 keeps legacy 128K (not an API alias)."""
+        assert get_model_context_length("deepseek-r1") == 128_000
+
+    def test_context_length_zero_falls_through(self):
+        assert get_model_context_length("deepseek-v4-pro", context_length=0) == 1_000_000
+
+    def test_context_length_negative_falls_through(self):
+        assert get_model_context_length("deepseek-v4-pro", context_length=-1) == 1_000_000
+
+    def test_context_length_non_int_falls_through(self):
+        assert get_model_context_length("deepseek-v4-pro", context_length="500k") == 1_000_000

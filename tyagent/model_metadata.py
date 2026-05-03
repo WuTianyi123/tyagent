@@ -67,13 +67,13 @@ DEFAULT_CONTEXT_LENGTHS: Dict[str, int] = {
     "o1":                      200_000,
     "o1-mini":                 128_000,
     "o1-pro":                  200_000,
-    # DeepSeek — V4 family (1M), legacy (128K)
+    # DeepSeek — V4 family (1M), legacy R1 (128K)
     "deepseek-v4-pro":       1_000_000,
     "deepseek-v4-flash":     1_000_000,
-    "deepseek-chat":         1_000_000,   # server-side → v4-flash
-    "deepseek-reasoner":     1_000_000,   # server-side → v4-flash
+    "deepseek-chat":         1_000_000,   # API alias → v4-flash
+    "deepseek-reasoner":     1_000_000,   # API alias → v4-flash (not the same as deepseek-r1)
+    "deepseek-r1":             128_000,   # explicit R1 model — 128K context
     "deepseek-v3":              64_000,
-    "deepseek-r1":             128_000,
     "deepseek":                128_000,
     # Google Gemini
     "gemini-3":                409_600,
