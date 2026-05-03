@@ -34,6 +34,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_tool_turns": 200,
         "reasoning_effort": "high",
         "system_prompt": "You are a helpful assistant.",
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "http_timeout": 120.0,
+        "shutdown_timeout": 5.0,
     },
     "compression": {
         "cut_ratio": 0.5,
@@ -178,6 +182,10 @@ class AgentConfig:
     system_prompt: str = "You are a helpful assistant."
     reasoning_effort: Optional[str] = "high"  # None/"" = don't send
     context_length: Optional[int] = None
+    max_tokens: int = 4096
+    temperature: float = 0.7
+    http_timeout: float = 120.0
+    shutdown_timeout: float = 5.0
 
     # ―― runtime only, set by CLI / gateway after .env loading ―――
     api_key: Optional[str] = None
@@ -188,6 +196,9 @@ class AgentConfig:
             "model": self.model,
             "base_url": self.base_url,
             "system_prompt": self.system_prompt,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "http_timeout": self.http_timeout,
         }
         if self.max_tool_turns is not None:
             d["max_tool_turns"] = self.max_tool_turns
@@ -195,6 +206,7 @@ class AgentConfig:
             d["reasoning_effort"] = self.reasoning_effort
         if self.context_length is not None:
             d["context_length"] = self.context_length
+        # shutdown_timeout is runtime only — not persisted
         # api_key deliberately excluded — lives in .env
         return d
 
@@ -209,7 +221,10 @@ class AgentConfig:
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
             reasoning_effort=data.get("reasoning_effort", "high"),
             context_length=int(cl) if cl is not None else None,
-            # api_key is loaded from .env, not config.yaml
+            max_tokens=data.get("max_tokens", 4096),
+            temperature=data.get("temperature", 0.7),
+            http_timeout=data.get("http_timeout", 120.0),
+            shutdown_timeout=data.get("shutdown_timeout", 5.0),
         )
 
 

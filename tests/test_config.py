@@ -138,8 +138,11 @@ class TestAgentConfigToDict:
             "provider": "deepseek",
             "model": "anthropic/claude-sonnet-4",
             "base_url": None,
-            "max_tool_turns": 200,
             "system_prompt": "You are a helpful assistant.",
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "http_timeout": 120.0,
+            "max_tool_turns": 200,
             "reasoning_effort": "high",
         }
 

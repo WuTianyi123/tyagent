@@ -53,6 +53,10 @@ async def _run_child_async(
     collector: Optional[EventCollector] = None,
     home_dir: Optional[Path] = None,
     context_length: Optional[int] = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+    http_timeout: float = 120.0,
+    shutdown_timeout: float = 5.0,
 ) -> Dict[str, Any]:
     """Run a child agent as an asyncio task in the shared event loop.
     On completion, notifies the collector. Never raises — errors captured in result dict.
@@ -67,6 +71,10 @@ async def _run_child_async(
         max_tool_turns=max_tool_turns, system_prompt=child_system,
         reasoning_effort=reasoning_effort, compression=compression,
         home_dir=home_dir, context_length=context_length,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        http_timeout=http_timeout,
+        shutdown_timeout=shutdown_timeout,
     )
     child_messages = [{"role": "user", "content": goal}]
     tool_defs = registry.get_definitions(names=tool_names)
@@ -166,6 +174,10 @@ async def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> 
         collector=parent_agent._event_collector,
         home_dir=parent_agent.home_dir,
         context_length=parent_agent.context_length,
+        max_tokens=getattr(parent_agent, '_max_tokens', 4096),
+        temperature=getattr(parent_agent, '_temperature', 0.7),
+        http_timeout=getattr(parent_agent, '_http_timeout', 120.0),
+        shutdown_timeout=getattr(parent_agent, '_shutdown_timeout', 5.0),
     )
 
     child_task = asyncio.get_running_loop().create_task(child_coro)
