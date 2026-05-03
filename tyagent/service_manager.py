@@ -11,6 +11,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
+
+from tyagent.config import DEFAULT_PROFILE
 
 SERVICE_NAME = "tyagent-gateway"
 SERVICE_DESCRIPTION = "tyagent messaging gateway"
@@ -63,8 +66,12 @@ def _supports_systemd() -> bool:
         return False
 
 
-def _generate_unit() -> str:
-    """Generate the systemd unit file content."""
+def _generate_unit(env_file_path: Optional[Path] = None) -> str:
+    """Generate the systemd unit file content.
+    
+    API keys are written to a separate EnvironmentFile (not embedded in the unit)
+    to prevent exposure via ``systemctl --user show``.
+    """
     python_path = _get_python_path()
     project_root = _get_project_root()
     venv = _get_venv_dir()
@@ -76,11 +83,17 @@ def _generate_unit() -> str:
     common_paths = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
     path_entries.extend(common_paths)
     
-    env_lines = []
+    # Separate secrets (API keys) from non-secrets
+    _API_KEY_VARS = {
+        "TYAGENT_API_KEY", "OPENAI_API_KEY", "KIMI_API_KEY",
+        "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
+    }
+    secret_lines: list[str] = []
+    env_lines: list[str] = []
     for key, value in os.environ.items():
-        # Exclude HOME — gateway will set it to profile_home at runtime
-        if key in ("PATH", "USER", "OPENAI_API_KEY", "KIMI_API_KEY", 
-                    "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"):
+        if key in _API_KEY_VARS and value:
+            secret_lines.append(f'{key}={value}')
+        elif key in ("PATH", "USER"):
             env_lines.append(f'Environment="{key}={value}"')
     
     # Also add VIRTUAL_ENV if we detected one
@@ -88,6 +101,15 @@ def _generate_unit() -> str:
         env_lines.append(f'Environment="VIRTUAL_ENV={venv_dir}"')
     
     env_block = '\n'.join(env_lines)
+    
+    # Write environment file with API keys (if path provided)
+    env_file_ref = ""
+    if env_file_path is not None and secret_lines:
+        env_file_path.write_text('\n'.join(secret_lines) + '\n')
+        env_file_path.chmod(0o600)
+        env_file_ref = f'EnvironmentFile={env_file_path}'
+    
+    env_file_line = f'\n{env_file_ref}' if env_file_ref else ""
     
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
@@ -100,7 +122,7 @@ Type=simple
 ExecStart={python_path} -m tyagent_cli gateway
 WorkingDirectory={project_root}
 Environment="PATH={':'.join(path_entries)}"
-{env_block}
+{env_block}{env_file_line}
 Restart=on-failure
 RestartSec=10
 RestartForceExitStatus=75
@@ -130,7 +152,9 @@ def install_service(force: bool = False) -> int:
         return 0
     
     unit_path.parent.mkdir(parents=True, exist_ok=True)
-    unit_path.write_text(_generate_unit(), encoding="utf-8")
+    env_file_path = Path.home() / ".tyagent" / DEFAULT_PROFILE / "env.service"
+    env_file_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(_generate_unit(env_file_path=env_file_path), encoding="utf-8")
     
     _run_systemctl(["daemon-reload"], check=True, timeout=30)
     _run_systemctl(["enable", SERVICE_NAME], check=True, timeout=30)
@@ -166,9 +190,13 @@ def uninstall_service() -> int:
     _run_systemctl(["disable", SERVICE_NAME], check=False, timeout=30)
     
     unit_path = _get_unit_path()
+    env_file_path = Path.home() / ".tyagent" / DEFAULT_PROFILE / "env.service"
     if unit_path.exists():
         unit_path.unlink()
         print(f"✓ Removed {unit_path}")
+    if env_file_path.exists():
+        env_file_path.unlink()
+        print(f"✓ Removed {env_file_path}")
     
     _run_systemctl(["daemon-reload"], check=True, timeout=30)
     print("✓ Service uninstalled")
