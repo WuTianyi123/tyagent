@@ -142,7 +142,7 @@ def _load_builtin_platforms() -> None:
     """Load built-in platform adapters by importing them so they self-register."""
     try:
         from tyagent.platforms.feishu import FeishuAdapter
-        _PLATFORM_REGISTRY["feishu"] = FeishuAdapter
+        register_platform("feishu", FeishuAdapter)
     except ImportError as exc:
         logger.debug("Feishu adapter not available: %s", exc)
     except Exception as exc:
