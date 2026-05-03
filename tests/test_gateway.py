@@ -693,3 +693,34 @@ class TestLegacyMigration:
             assert (legacy_home / "config.yaml").exists()
         finally:
             cfg_mod.default_home = orig_default
+
+
+class _MinimalAdapter(BasePlatformAdapter):
+    """Minimal concrete adapter for testing."""
+    async def connect(self) -> None:
+        pass
+    async def disconnect(self) -> None:
+        pass
+    async def start(self) -> None:
+        pass
+    async def stop(self) -> None:
+        pass
+    async def send_message(self, target, text, **kwargs):
+        pass
+
+
+class TestAdapterHomeDir:
+    """Integration: verify home_dir flows from Gateway to adapters."""
+
+    def test_base_adapter_stores_home_dir(self):
+        """BasePlatformAdapter stores home_dir from constructor."""
+        from pathlib import Path
+
+        home = Path("/tmp/test-profile")
+        adapter = _MinimalAdapter(config=None, platform_name="test", home_dir=home)
+        assert adapter.home_dir == home
+
+    def test_home_dir_none_default(self):
+        """BasePlatformAdapter accepts home_dir=None (backward compat)."""
+        adapter = _MinimalAdapter(config=None, platform_name="test")
+        assert adapter.home_dir is None

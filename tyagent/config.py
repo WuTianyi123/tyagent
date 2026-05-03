@@ -188,6 +188,9 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
     3. default — ~/.tyagent/tyagent/config.yaml
     """
     if config_path:
+        # Explicit path — trust the file as-is.  Unlike profile mode we do
+        # NOT override home_dir / sessions_dir here: the user specified an
+        # exact file and may have intentional custom paths in it.
         return _load_from_path(config_path)
 
     if profile:

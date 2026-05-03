@@ -649,10 +649,6 @@ async def run_gateway(config_path: Optional[str] = None, config: Optional[TyAgen
     else:
         config = load_config()
 
-    # ── One-time migration: old flat ~/.tyagent/ → profiles/tyagent/ ──
-    from tyagent.config import migrate_legacy_home
-    migrate_legacy_home(config.home_dir)
-
     # Setup logging
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
