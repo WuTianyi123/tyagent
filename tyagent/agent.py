@@ -7,7 +7,6 @@ Supports OpenAI-compatible APIs, model routing, and function calling (tools).
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import os
@@ -19,8 +18,8 @@ OnMessageCallback = Callable[..., Any]
 
 import httpx
 
+from tyagent.compaction import run_compact, total_token_estimate
 from tyagent.config import CompressionConfig
-from tyagent.context import compress_context
 from tyagent.events import EventCollector
 from tyagent.model_metadata import get_model_context_length
 from tyagent.prompt_builder import build_system_prompt
@@ -32,47 +31,9 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "tyagent/1.0"
 
 
-class ContextOverflow(Exception):
-    """LLM API returned 400 indicating the context is too long.
-    Caught by chat() to trigger single-pass compression and retry.
-    """
-    pass
-
-
-# Patterns used to detect context overflow errors in API responses.
-# Borrowed from Hermes error_classifier.py.
-_CONTEXT_OVERFLOW_PATTERNS = [
-    "context length",
-    "context size",
-    "maximum context",
-    "token limit",
-    "too many tokens",
-    "reduce the length",
-    "exceeds the limit",
-    "context window",
-    "prompt is too long",
-    "prompt exceeds max length",
-    "max_tokens",
-    "maximum number of tokens",
-    "exceeds the max_model_len",
-    "max_model_len",
-    "prompt length",
-    "input is too long",
-    "maximum model length",
-    "context length exceeded",
-    "超过最大长度",
-    "上下文长度",
-    "max input token",
-    "exceeds the maximum number of input tokens",
-]
-
-
-def _is_context_overflow(status_code: int, body: str) -> bool:
-    """Return True if the API error indicates a context overflow."""
-    if status_code not in (400, 413):
-        return False
-    body_lower = body.lower()
-    return any(p in body_lower for p in _CONTEXT_OVERFLOW_PATTERNS)
+# No ContextOverflow exception — compaction is PROACTIVE (pre-turn + mid-turn
+# threshold checks), not reactive (catch 400 then retry).  Architected to
+# match Codex CLI's compact.rs design philosophy.
 
 
 class TyAgent:
@@ -110,25 +71,29 @@ class TyAgent:
         self._http_timeout = http_timeout
         self._shutdown_timeout = shutdown_timeout
         c = compression or CompressionConfig()
-        self.compress_model = c.model
-        self.compress_api_key = c.api_key or self.api_key
-        self.compress_base_url = c.base_url or self.base_url
-        self.compress_cut_ratio = c.cut_ratio
         self._compression_config = compression  # stored for child agent cloning
         self._effective_context_length = get_model_context_length(
             model, context_length=context_length,
         )
+        # Proactive compaction threshold.  When total estimated tokens
+        # exceed this, compaction runs before the next API call.  Maps to
+        # Codex CLI's ``model_auto_compact_token_limit`` config.
+        auto_limit = c.auto_compact_limit
+        try:
+            if auto_limit is None or auto_limit <= 0:
+                auto_limit = int(self._effective_context_length * 0.80)
+        except TypeError:
+            # Non-integer value (e.g. MagicMock in tests)
+            auto_limit = int(self._effective_context_length * 0.80)
+        self.auto_compact_limit: int = auto_limit
+        # Which model/client to use for the compaction stand-alone turn.
+        # Falls back to the main model when not configured separately.
+        self.compact_model: str = c.model or self.model
+        self.compact_api_key: str = c.api_key or self.api_key
+        self.compact_base_url: str = c.base_url or self.base_url
         self._client = httpx.AsyncClient(timeout=self._http_timeout)
         # Real token usage from the last API response
         self.last_usage: Optional[Dict[str, int]] = None
-        # Cached full system prompt string (built once per session, invalidated
-        # after context compression).
-        self._cached_system_prompt: Optional[str] = None
-        # Boundary index for append-only api_messages mode
-        self._prev_msg_count: int = 0
-        # Token tracking: (message_count, cumulative_prompt_tokens) per API call.
-        # Used by compression to find precise cut points without a tokenizer.
-        self._token_history: List[tuple] = []
         # ── Actor model lifecycle ─────────────────────────────────
         self._inbox: asyncio.Queue["InboxMessage"] = asyncio.Queue()
         self._output_queue: asyncio.Queue[AgentOutput] = asyncio.Queue()
@@ -196,13 +161,6 @@ class TyAgent:
                 kwargs["reasoning"] = reasoning_content
             self._on_message("assistant", content or "", **kwargs)
 
-    def _record_token_history(self, api_messages: List[Dict[str, Any]]) -> None:
-        """Record a (message_count, prompt_tokens) data point from last_usage."""
-        if self.last_usage and self.last_usage.get("prompt_tokens"):
-            self._token_history.append(
-                (len(api_messages), self.last_usage["prompt_tokens"])
-            )
-
     async def _execute_tool_calls(
         self,
         tool_calls: List[Dict[str, Any]],
@@ -254,16 +212,16 @@ class TyAgent:
     async def _call_api_nonstreaming(
         self, payload: Dict[str, Any], headers: Dict[str, str],
     ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
-        """Make a non-streaming API call. Raises ContextOverflow on 400/413."""
-        resp = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers, json=payload,
-        )
+        """Make a non-streaming API call."""
+        try:
+            resp = await self._client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers, json=payload,
+            )
+        except Exception as exc:
+            raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
         if resp.status_code >= 400:
             body_str = resp.text[:2000]
-            logger.error("LLM API error: %s - %s", resp.status_code, body_str)
-            if _is_context_overflow(resp.status_code, body_str):
-                raise ContextOverflow(body_str)
             raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
         data = resp.json()
         usage = data.get("usage")
@@ -282,19 +240,18 @@ class TyAgent:
         stream_delta_callback: Optional[Callable[[str], None]] = None,
         reasoning_callback: Optional[Callable[[str], None]] = None,
     ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
-        """Make a streaming API call. Raises ContextOverflow on 400/413."""
-        async with self._client.stream(
-            "POST", f"{self.base_url}/chat/completions",
-            json=payload, headers=headers,
-        ) as resp:
-            if resp.status_code >= 400:
-                error_body = b""
-                async for chunk in resp.aiter_raw(chunk_size=4096):
-                    error_body += chunk
-                body_str = error_body.decode("utf-8", errors="replace")[:2000]
-                if _is_context_overflow(resp.status_code, body_str):
-                    raise ContextOverflow(body_str)
-                raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
+        """Make a streaming API call."""
+        try:
+            async with self._client.stream(
+                "POST", f"{self.base_url}/chat/completions",
+                json=payload, headers=headers,
+            ) as resp:
+                if resp.status_code >= 400:
+                    error_body = b""
+                    async for chunk in resp.aiter_raw(chunk_size=4096):
+                        error_body += chunk
+                    body_str = error_body.decode("utf-8", errors="replace")[:2000]
+                    raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
 
             content_parts: List[str] = []
             tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -358,69 +315,10 @@ class TyAgent:
                 }
 
             return content, reasoning, tc_list
-
-    async def _api_call_with_compression_retry(
-        self,
-        messages: List[Dict[str, Any]],
-        api_messages: List[Dict[str, Any]],
-        payload: Dict[str, Any],
-        headers: Dict[str, str],
-        *,
-        api_caller: Callable[..., Any],
-    ) -> tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
-        """Call the LLM API with single-pass compression retry.
-
-        *api_caller* is an async callable ``(payload, headers) -> (content,
-        reasoning, tool_calls)``.  On ContextOverflow, compresses once
-        and retries.  *api_messages* is mutated in place and *payload*
-        updated on compression.
-        """
-        _compressed = False
-        while True:
-            self.last_usage = None
-            try:
-                return await api_caller(payload, headers)
-            except ContextOverflow:
-                if not _compressed:
-                    _compressed = True
-                    logger.info("Context overflow — applying single-pass compression")
-                    compressed = await compress_context(
-                        api_messages, self._client,
-                        model=self.compress_model or self.model,
-                        api_key=self.compress_api_key,
-                        base_url=self.compress_base_url,
-                        token_history=self._token_history,
-                        context_window=self._effective_context_length,
-                        cut_ratio=self.compress_cut_ratio,
-                    )
-                    if compressed is not None:
-                        api_messages[:] = compressed
-                        self._prev_msg_count = len(messages)
-                        self._token_history = []
-                        self._cached_system_prompt = None
-                        payload["messages"] = api_messages
-                        continue
-                raise AgentError("Context too long even after compression.")
-            except AgentError:
-                raise
-            except Exception as exc:
-                raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
-
-    def _ensure_system_prompt(self) -> str:
-        """Return the system prompt, building and caching it on first call."""
-        if self._cached_system_prompt is None:
-            self._cached_system_prompt = build_system_prompt(
-                model=self.model,
-                user_prompt=self.system_prompt,
-                home_dir=self.home_dir,
-            )
-        return self._cached_system_prompt
-
-    def _insert_system_prompt(self, messages: List[Dict[str, Any]]) -> None:
-        """Insert the system message at messages[0] if not already present."""
-        prompt = self._ensure_system_prompt()
-        if not messages or messages[0].get("role") != "system":
-            messages.insert(0, {"role": "system", "content": prompt})
+        except AgentError:
+            raise
+        except Exception as exc:
+            raise AgentError(f"LLM request failed: {type(exc).__name__}") from exc
 
     # ── Chat (backward-compat) ─────────────────────────────────
 
@@ -444,7 +342,13 @@ class TyAgent:
         """
         self._tool_progress_callback = tool_progress_callback
         self._on_message = on_message
+        # Strip any system messages from incoming list — the new
+        # architecture builds the system prompt fresh per turn.
         self._messages = messages
+        # Remove any existing system messages in-place (mutation preserves
+        # caller's reference for backward-compatible message inspection).
+        while self._messages and self._messages[0].get("role") == "system":
+            self._messages.pop(0)
         return await self._run_turn(
             tools=tools,
             stream=stream,
@@ -464,6 +368,13 @@ class TyAgent:
     ) -> str:
         """Run one LLM+tool-call turn to completion. Mutates self._messages in place.
 
+        Architecture (Codex CLI style):
+          - ``self._messages`` NEVER contains a system message
+          - System prompt is built fresh each iteration
+          - Pre-turn compaction: before first API call, check total tokens
+          - Mid-turn compaction: after tool calls, if still over limit, compact
+          - No reactive overflow handling — proactive estimates are authoritative
+
         When *stream* is True, uses SSE streaming and invokes
         *stream_delta_callback*, *reasoning_callback*, and
         *on_segment_break* at the appropriate points.
@@ -472,15 +383,35 @@ class TyAgent:
 
         messages = self._messages
 
-        # System prompt injection
-        self._insert_system_prompt(messages)
+        # Build system prompt fresh (not cached — skills/memory may change).
+        # Stored separately from messages; injected at API call time.
+        system_prompt = build_system_prompt(
+            model=self.model,
+            user_prompt=self.system_prompt,
+            home_dir=self.home_dir,
+        )
+        # Record it so clone() can reconstruct accurately.
+        self._system_prompt = system_prompt
 
-        self._token_history = []
-        api_messages = list(messages)
-        self._prev_msg_count = len(messages)
+        # ── Pre-turn compaction ─────────────────────────────────
+        est = total_token_estimate(messages, system_prompt=system_prompt)
+        if est >= self.auto_compact_limit:
+            logger.info(
+                "Pre-turn compaction: ~%d tokens >= %d limit",
+                total_token_estimate(messages, system_prompt=system_prompt),
+                self.auto_compact_limit,
+            )
+            compacted = await run_compact(
+                messages,
+                model=self.compact_model,
+                api_key=self.compact_api_key,
+                base_url=self.compact_base_url,
+                http_client=self._client,
+            )
+            if compacted is not None:
+                messages[:] = compacted
 
         payload_base = self._build_payload_base(tools)
-
         headers = self._build_headers()
 
         tool_turn = 0
@@ -492,31 +423,25 @@ class TyAgent:
             if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
                 break
 
-            if tool_turn > 0:
-                api_messages.extend(messages[self._prev_msg_count:])
-            self._prev_msg_count = len(messages)
+            # Build api_messages: system prompt prepended at call time only.
+            # messages itself NEVER contains system — compaction never touches it.
+            api_messages = [{"role": "system", "content": system_prompt}] + messages
 
             if stream:
                 payload: Dict[str, Any] = {
                     **payload_base, "messages": api_messages,
                     "stream": True, "stream_options": {"include_usage": True},
                 }
-                _api_caller = functools.partial(
-                    self._call_api_streaming,
+                content, reasoning_content, tool_calls = await self._call_api_streaming(
+                    payload, headers,
                     stream_delta_callback=stream_delta_callback,
                     reasoning_callback=reasoning_callback,
                 )
             else:
                 payload = {**payload_base, "messages": api_messages}
-                _api_caller = self._call_api_nonstreaming
-
-            content, reasoning_content, tool_calls = \
-                await self._api_call_with_compression_retry(
-                    messages, api_messages, payload, headers,
-                    api_caller=_api_caller,
+                content, reasoning_content, tool_calls = await self._call_api_nonstreaming(
+                    payload, headers,
                 )
-
-            self._record_token_history(api_messages)
 
             assistant_msg = self._build_assistant_msg(content, reasoning_content, tool_calls)
             messages.append(assistant_msg)
@@ -533,6 +458,28 @@ class TyAgent:
 
             tool_turn += 1
             await self._execute_tool_calls(tool_calls, messages, registry)
+
+            # ── Mid-turn compaction ──────────────────────────────
+            # After tool outputs have been appended, check if we're
+            # still over the limit.  If yes, compact before the next
+            # API call so the model sees compressed context.
+            # Equivalent to Codex CLI's mid-turn path (turn.rs L484-501).
+            est = total_token_estimate(messages, system_prompt=system_prompt)
+            if est >= self.auto_compact_limit:
+                logger.info(
+                    "Mid-turn compaction: ~%d tokens >= %d limit",
+                    total_token_estimate(messages, system_prompt=system_prompt),
+                    self.auto_compact_limit,
+                )
+                compacted = await run_compact(
+                    messages,
+                    model=self.compact_model,
+                    api_key=self.compact_api_key,
+                    base_url=self.compact_base_url,
+                    http_client=self._client,
+                )
+                if compacted is not None:
+                    messages[:] = compacted
 
         return (content or reasoning_content or "")
 

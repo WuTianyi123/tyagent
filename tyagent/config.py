@@ -99,16 +99,24 @@ class PlatformConfig:
 
 @dataclass
 class CompressionConfig:
-    """Configuration for context compression (LLM summarization on overflow).
+    """Configuration for context compaction (Codex CLI style).
 
-    All fields optional — None falls back to the agent model (model/api_key/base_url).
-    cut_ratio controls the single-pass compression cut point: the cut lands at
-    roughly ``context_length * cut_ratio`` tokens into the conversation.
+    All fields optional — None falls back to the agent defaults.
+
+    ``auto_compact_limit`` controls proactive compaction threshold.
+    When the estimated total tokens (system + conversation) exceed this
+    value, compaction runs before the next API call.  Defaults to 80%
+    of the model's context window (``context_length * 0.80``), mapping
+    to Codex CLI's ``model_auto_compact_token_limit``.
+
+    ``model`` / ``api_key`` / ``base_url`` allow a separate (cheaper)
+    model to handle compaction calls; when unset, the main agent model
+    is used.
     """
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
-    cut_ratio: float = 0.5
+    auto_compact_limit: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {}
@@ -118,7 +126,8 @@ class CompressionConfig:
             d["api_key"] = self.api_key
         if self.base_url:
             d["base_url"] = self.base_url
-        d["cut_ratio"] = self.cut_ratio
+        if self.auto_compact_limit is not None:
+            d["auto_compact_limit"] = self.auto_compact_limit
         return d
 
     @classmethod
@@ -127,7 +136,7 @@ class CompressionConfig:
             model=data.get("model"),
             api_key=data.get("api_key"),
             base_url=data.get("base_url"),
-            cut_ratio=float(_v) if (_v := data.get("cut_ratio")) is not None else 0.5,
+            auto_compact_limit=data.get("auto_compact_limit"),
         )
 
 

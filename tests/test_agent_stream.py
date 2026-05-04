@@ -107,9 +107,9 @@ class TestChatStreamBasic:
             result = await agent.chat(messages, stream=True)
 
         assert result == "Hello world!"
-        assert len(messages) == 3  # system + user + assistant
-        assert messages[2]["role"] == "assistant"
-        assert messages[2]["content"] == "Hello world!"
+        assert len(messages) == 2  # user + assistant
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Hello world!"
         assert agent.last_usage == {
             "prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22,
         }
@@ -179,11 +179,11 @@ class TestChatStreamBasic:
         # Returns empty since no second API call for final text
         # Actually, the test agent only has the stream return, no follow-up
         # Let's check the assistant message was built correctly
-        assert messages[2]["role"] == "assistant"
-        assert messages[2]["content"] == "Let me check..."
-        assert len(messages[2]["tool_calls"]) == 1
-        assert messages[2]["tool_calls"][0]["function"]["name"] == "read_file"
-        assert messages[2]["tool_calls"][0]["function"]["arguments"] == '{"path": "/tmp/test.txt"}'
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Let me check..."
+        assert len(messages[1]["tool_calls"]) == 1
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"path": "/tmp/test.txt"}'
 
     @pytest.mark.asyncio
     async def test_on_segment_break_called(self, agent):
@@ -448,10 +448,10 @@ class TestStreamApiMessagesNoDuplicates:
             )
 
         # After chat, messages list should be: system, user, assistant, tool, assistant
-        assert len(messages) == 5, f"Expected 5 messages, got {len(messages)}"
-        assert messages[2]["role"] == "assistant"
-        assert messages[3]["role"] == "tool"
-        assert messages[4]["role"] == "assistant"
+        assert len(messages) == 4, f"Expected 4 messages, got {len(messages)}"
+        assert messages[1]["role"] == "assistant"
+        assert messages[2]["role"] == "tool"
+        assert messages[3]["role"] == "assistant"
 
         # The api_messages sent in call 2 should match messages except possibly
         # the final assistant (which doesn't exist yet at that point)
@@ -528,7 +528,7 @@ class TestBackwardCompatible:
                 )
 
         assert result == "File contents: hello"
-        assert len(messages) == 5
+        assert len(messages) == 4  # user, assistant(tool), tool, assistant
 
     @pytest.mark.asyncio
     async def test_non_stream_with_on_message(self, agent):

@@ -86,9 +86,10 @@ class TestChatBasic:
             result = await agent.chat(messages)
 
         assert result == "Hello world"
-        assert len(messages) == 3  # system + user + assistant
-        assert messages[0]["role"] == "system"
-        assert messages[2]["role"] == "assistant"
+        # self._messages is conversation only (no system prompt injected)
+        assert len(messages) == 2  # user + assistant
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
 
     @pytest.mark.asyncio
     async def test_system_prompt_injected(self):
@@ -107,14 +108,14 @@ class TestChatBasic:
             messages = [{"role": "user", "content": "hi"}]
             await agent.chat(messages)
 
-        assert messages[0]["role"] == "system"
-        # Identity is built by prompt_builder: tyagent identity + user override
-        content = messages[0]["content"]
+        # System prompt is stored separately, not in self._messages
+        assert hasattr(agent, "_system_prompt")
+        content = agent._system_prompt
         assert "tyagent" in content
         assert "Be helpful" in content
 
     @pytest.mark.asyncio
-    async def test_existing_system_prompt_not_duplicated(self):
+    async def test_existing_system_prompt_in_input_is_ignored(self):
         agent = TyAgent(api_key="key", base_url="https://api.test/v1")
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -131,8 +132,10 @@ class TestChatBasic:
             ]
             await agent.chat(messages)
 
-        assert len(messages) == 3
-        assert messages[0]["content"] == "Existing"
+        # New architecture: system prompt is not stored in messages
+        # messages[0] is the user message, not system
+        assert len(messages) == 2  # user + assistant
+        assert messages[0]["role"] == "user"
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +223,9 @@ class TestChatToolLoop:
                 )
 
         assert result == "File contents: hello"
-        assert len(messages) == 5  # system, user, assistant(tool), tool, assistant
-        assert messages[3]["role"] == "tool"
+        # self._messages is conversation only (no system prompt injected)
+        assert len(messages) == 4  # user, assistant(tool), tool, assistant
+        assert messages[2]["role"] == "tool"
 
     @pytest.mark.asyncio
     async def test_malformed_tool_call(self):
@@ -309,7 +313,7 @@ class TestChatToolLoop:
                 )
 
         assert result == "handled"
-        tool_msg = messages[3]
+        tool_msg = messages[2]
         assert tool_msg["role"] == "tool"
         assert "Invalid JSON" in tool_msg["content"]
 
