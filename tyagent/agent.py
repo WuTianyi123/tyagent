@@ -223,7 +223,10 @@ class TyAgent:
         if resp.status_code >= 400:
             body_str = resp.text[:2000]
             raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise AgentError(f"Invalid JSON response: {exc}") from exc
         usage = data.get("usage")
         if usage:
             self.last_usage = {

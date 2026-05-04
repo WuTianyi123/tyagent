@@ -158,9 +158,11 @@ def build_compacted_history(
           {"role": "assistant", "content": "{SUMMARY_PREFIX}\\n{summary}"},
         ]
 
-    The summary is injected as an ``assistant``-role message so that
-    ``user/assistant`` alternation is preserved — the next user message
-    from the loop naturally follows.
+    The summary is injected as a ``user``-role message (matching Codex CLI's
+    ``build_compacted_history()`` which uses ``role: "user"`` for the summary).
+    This is fine for OpenAI-compatible APIs which accept consecutive ``user``
+    messages; the next real assistant response from the tool loop follows
+    naturally.
     """
     history: List[Dict[str, Any]] = []
     for msg_text in selected_messages:
@@ -181,15 +183,15 @@ def total_token_estimate(messages: List[Dict[str, Any]], *, system_prompt: str =
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, list):
-            chars = sum(
+            text_len = sum(
                 len(b.get("text", "")) for b in content
                 if isinstance(b, dict)
             )
+            total += text_len // _CHARS_PER_TOKEN + 10
         elif isinstance(content, str):
-            chars = len(content)
+            total += len(content.encode("utf-8")) // _CHARS_PER_TOKEN + 10
         else:
-            chars = len(str(content))
-        total += len(content.encode("utf-8")) // _CHARS_PER_TOKEN + 10  # +10 per-message overhead
+            total += len(str(content)) // _CHARS_PER_TOKEN + 10
         # Account for tool_calls in assistant messages
         for tc in msg.get("tool_calls") or []:
             args = tc.get("function", {}).get("arguments", "")
