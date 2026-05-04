@@ -43,8 +43,8 @@ class TestIsSummaryMessage:
         assert not is_summary_message("")
 
     def test_prefix_without_newline(self):
-        # Starts with prefix but no newline—still matches
-        assert is_summary_message(SUMMARY_PREFIX + " (no newline)")
+        # Starts with prefix but no newline — should NOT match (Codex-aligned)
+        assert not is_summary_message(SUMMARY_PREFIX + " (no newline)")
 
 
 # ── collect_user_messages ────────────────────────────────────────────────────
@@ -105,12 +105,13 @@ class TestSelectTailMessages:
 
     def test_truncates_last(self):
         # A 60-byte message at 4 bytes/token -> ~15 tokens, exceeds budget=10.
-        # The message is dropped entirely since it doesn't fit — no truncation.
+        # The message is truncated to fit the remaining budget (matching Codex).
         long_msg = "a" * 60
         msgs = ["first", long_msg]
         result = select_tail_messages(msgs, max_tokens=10)
-        # Reverse iteration: long_msg doesn't fit → dropped, "first" not reached
-        assert result == []
+        # Reverse iteration: long_msg truncated to ~10 tokens, "first" not reached
+        assert len(result) == 1
+        assert "[truncated]" in result[0]
 
     def test_reverse_order(self):
         msgs = ["oldest", "middle", "newest"]
@@ -290,7 +291,10 @@ class TestRunCompact:
             api_key="key", base_url="https://api.test/v1",
             http_client=client, max_retries=0,
         )
-        assert result is None
+        assert result is not None
+        # Empty summary gets "(no summary available)" placeholder
+        assert len(result) > 1
+        assert "(no summary available)" in result[-1]["content"]
 
     @pytest.mark.asyncio
     async def test_timeout_retry(self):

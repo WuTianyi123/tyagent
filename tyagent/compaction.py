@@ -111,10 +111,10 @@ def _is_context_overflow(status_code: int, body: str) -> bool:
 def is_summary_message(message: str) -> bool:
     """Return True if *message* is a previously injected compaction summary.
 
-    Matches by ``SUMMARY_PREFIX`` prefix, same strategy as Codex CLI's
+    Matches by ``SUMMARY_PREFIX + "\\n"`` prefix, same strategy as Codex CLI's
     ``is_summary_message()`` (compact.rs L386-388).
     """
-    return message.startswith(SUMMARY_PREFIX)
+    return message.startswith(f"{SUMMARY_PREFIX}\n")
 
 
 def collect_user_messages(messages: List[Dict[str, Any]]) -> List[str]:
@@ -153,15 +153,15 @@ def select_tail_messages(
 ) -> List[str]:
     """Select recent user messages up to *max_tokens*, walking backward.
 
-    Algorithm:
+    Algorithm (mirrors Codex CLI compact.rs L460-478):
       1. Iterate user messages in reverse (most recent first)
-      2. If message fits in remaining budget → keep entirely
-      3. If doesn't fit → stop (message dropped, preserved via summary)
+      2. If message fits in remaining budget -> keep entirely
+      3. If doesn't fit -> truncate to remaining budget, stop
       4. Reverse back to original order
 
-    All kept messages are complete — no partial truncation.  The single
-    oversized message that doesn't fit is left to the LLM summary, so
-    its content is never lost, just compressed.
+    Messages that don't fit are truncated rather than dropped -- the prefix
+    and suffix are preserved verbatim while the middle is replaced with a
+    "[truncated]" marker, matching Codex CLI's truncate_middle behavior.
     """
     if max_tokens <= 0:
         return []
@@ -173,9 +173,47 @@ def select_tail_messages(
             selected.append(msg)
             remaining -= tokens
         else:
+            selected.append(_truncate_middle(msg, remaining))
             break
     selected.reverse()
     return selected
+
+
+def _truncate_middle(text: str, token_budget: int) -> str:
+    """Truncate *text* to fit within *token_budget* approximate tokens,
+    keeping as much of the beginning and end as possible.
+
+    Mirrors Codex CLI's truncate_middle_with_token_budget()
+    (codex-rs/utils/string/src/truncate.rs): splits the budget 60/40
+    between prefix and suffix, inserts a "[truncated]" marker.
+    """
+    budget_bytes = token_budget * _CHARS_PER_TOKEN
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes <= budget_bytes:
+        return text
+    head_budget = int(budget_bytes * 0.6)
+    tail_budget = budget_bytes - head_budget
+    head_text = _truncate_to_bytes(text, head_budget)
+    tail_text = _truncate_to_bytes(text, tail_budget, from_end=True)
+    return f"{head_text}\n[truncated]\n{tail_text}"
+
+
+def _truncate_to_bytes(text: str, max_bytes: int, *, from_end: bool = False) -> str:
+    """Return a prefix or suffix of *text* that fits within *max_bytes*.
+
+    Operates on UTF-8 byte boundaries so multi-byte characters are never
+    split.  When *from_end* is True, returns the last *max_bytes* bytes.
+    """
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    if from_end:
+        decoded = encoded[-max_bytes:].decode("utf-8", errors="ignore")
+    else:
+        decoded = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return decoded
 
 
 def build_compacted_history(
@@ -408,9 +446,9 @@ async def run_compact(
             )
             if not summary:
                 logger.warning(
-                    "Compaction: empty summary — permanent failure"
+                    "Compaction: empty summary — using placeholder"
                 )
-                return None
+                summary = "(no summary available)"
 
             # 5. Build compacted history
             compacted = build_compacted_history(tail, summary)
