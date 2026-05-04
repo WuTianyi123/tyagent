@@ -398,7 +398,7 @@ class TyAgent:
         if est >= self.auto_compact_limit:
             logger.info(
                 "Pre-turn compaction: ~%d tokens >= %d limit",
-                total_token_estimate(messages, system_prompt=system_prompt),
+                est,
                 self.auto_compact_limit,
             )
             compacted = await run_compact(
@@ -468,7 +468,7 @@ class TyAgent:
             if est >= self.auto_compact_limit:
                 logger.info(
                     "Mid-turn compaction: ~%d tokens >= %d limit",
-                    total_token_estimate(messages, system_prompt=system_prompt),
+                    est,
                     self.auto_compact_limit,
                 )
                 compacted = await run_compact(

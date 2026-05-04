@@ -166,7 +166,7 @@ def build_compacted_history(
     for msg_text in selected_messages:
         history.append({"role": "user", "content": msg_text})
     history.append({
-        "role": "assistant",
+        "role": "user",
         "content": f"{SUMMARY_PREFIX}\n{summary_text}",
     })
     return history
@@ -189,7 +189,7 @@ def total_token_estimate(messages: List[Dict[str, Any]], *, system_prompt: str =
             chars = len(content)
         else:
             chars = len(str(content))
-        total += chars // _CHARS_PER_TOKEN + 10  # +10 per-message overhead
+        total += len(content.encode("utf-8")) // _CHARS_PER_TOKEN + 10  # +10 per-message overhead
         # Account for tool_calls in assistant messages
         for tc in msg.get("tool_calls") or []:
             args = tc.get("function", {}).get("arguments", "")
@@ -203,8 +203,15 @@ def total_token_estimate(messages: List[Dict[str, Any]], *, system_prompt: str =
 
 
 def _approx_token_count(text: str) -> int:
-    """Rough token estimate for budget calculations.  4 chars ≈ 1 token."""
-    return len(text) // _CHARS_PER_TOKEN
+    """Rough token estimate for budget calculations.
+
+    Uses byte-length in UTF-8 rather than character count to get a
+    conservative bound for CJK text (where one character can be 3 bytes).
+    4 bytes ≈ 1 token works for both ASCII (1 byte/char) and CJK (3 bytes/char).
+    This replaces the simpler ``len(text) // 4`` which underestimates CJK by
+    up to 3x, risking context overflow before proactive compaction fires.
+    """
+    return len(text.encode("utf-8")) // _CHARS_PER_TOKEN
 
 
 def _serialize_messages(messages: List[Dict[str, Any]]) -> str:
