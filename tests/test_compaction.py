@@ -530,3 +530,22 @@ class TestContextOverflow:
         # Call 3: success
         # Total: 3 calls (overflow + retry after timeout + success)
         assert client.post.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_json_decode_error_returns_none(self):
+        '''HTTP 200 with invalid JSON should return None immediately.'''
+        client = AsyncMock(spec=httpx.AsyncClient)
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.side_effect = ValueError("not valid JSON")
+        client.post.return_value = mock_resp
+
+        messages = [{"role": "user", "content": "msg1"}]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=2,
+        )
+
+        assert result is None
+        # Should fail on first attempt — no retry on permanent JSON error
+        assert client.post.call_count == 1

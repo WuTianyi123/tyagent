@@ -25,7 +25,6 @@ is authoritative.
 from __future__ import annotations
 
 import asyncio
-import json as _json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -219,7 +218,7 @@ def total_token_estimate(messages: List[Dict[str, Any]], *, system_prompt: str =
         content = msg.get("content", "")
         if isinstance(content, list):
             text_len = sum(
-                len(b.get("text", "").encode("utf-8")) for b in content
+                len(b.get("text", "")) for b in content
                 if isinstance(b, dict)
             )
             total += text_len // _CHARS_PER_TOKEN + 10
@@ -269,10 +268,6 @@ def _serialize_messages(messages: List[Dict[str, Any]]) -> str:
         elif not isinstance(content, str):
             content = str(content)
         line = content
-        # Prepend reasoning content for reasoning models (o1, R1, etc.)
-        reasoning = msg.get("reasoning_content", "")
-        if reasoning:
-            line = f"[reasoning]: {reasoning}\n{line}"
         # Append tool call details inline for context
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function", {})
@@ -394,23 +389,28 @@ async def run_compact(
                 continue
 
             # ── Success — extract summary ──────────────────────────
-            try:
-                data = resp.json()
-            except (_json.JSONDecodeError, ValueError):
-                logger.error(
-                    "Compaction: failed to parse JSON response (permanent failure)"
-                )
-                return None
+            data = resp.json()
             summary = (
                 data.get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "")
             )
             if not summary:
+                last_error = "Empty summary in response"
                 logger.warning(
-                    "Compaction: empty summary — permanent failure"
+                    "Compaction empty summary (%d transient retries left)",
+                    remaining_transient,
                 )
-                return None
+                if remaining_transient <= 0:
+                    break
+                remaining_transient -= 1
+                await asyncio.sleep(
+                    _BACKOFF_DELAYS[min(
+                        max_retries - remaining_transient - 1,
+                        len(_BACKOFF_DELAYS) - 1,
+                    )]
+                )
+                continue
 
             # 5. Build compacted history
             compacted = build_compacted_history(tail, summary)
@@ -481,6 +481,7 @@ def _make_input_builder(
     working_msgs: List[Dict[str, Any]],
 ) -> Any:
     """Return a closure that serializes the current working messages."""
+    import httpx
     def _build() -> str:
         serialized = _serialize_messages(working_msgs)
         return f"{serialized}\n\n---\n\n{COMPACTION_PROMPT}"
