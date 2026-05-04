@@ -115,15 +115,15 @@ def select_tail_messages(
 ) -> List[str]:
     """Select recent user messages up to *max_tokens*, walking backward.
 
-    Algorithm mirrors Codex CLI ``build_compacted_history_with_limit()``
-    (compact.rs L460-478):
-
+    Algorithm:
       1. Iterate user messages in reverse (most recent first)
       2. If message fits in remaining budget → keep entirely
-      3. If doesn't fit → truncate to remaining budget, stop
+      3. If doesn't fit → stop (message dropped, preserved via summary)
       4. Reverse back to original order
 
-    This is a token budget, not a message-count budget.
+    All kept messages are complete — no partial truncation.  The single
+    oversized message that doesn't fit is left to the LLM summary, so
+    its content is never lost, just compressed.
     """
     if max_tokens <= 0:
         return []
@@ -135,8 +135,6 @@ def select_tail_messages(
             selected.append(msg)
             remaining -= tokens
         else:
-            char_budget = remaining * _CHARS_PER_TOKEN
-            selected.append(msg[:char_budget])
             break
     selected.reverse()
     return selected
@@ -154,7 +152,7 @@ def build_compacted_history(
           {"role": "user", "content": msg1},
           {"role": "user", "content": msg2},
           ...
-          {"role": "assistant", "content": "{SUMMARY_PREFIX}\\n{summary}"},
+          {"role": "user", "content": "{SUMMARY_PREFIX}\\n{summary}"},
         ]
 
     The summary is injected as a ``user``-role message (matching Codex CLI's
@@ -212,7 +210,7 @@ def _approx_token_count(text: str) -> int:
     This replaces the simpler ``len(text) // 4`` which underestimates CJK by
     up to 3x, risking context overflow before proactive compaction fires.
     """
-    return len(text.encode("utf-8")) // _CHARS_PER_TOKEN
+    return (len(text.encode("utf-8")) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
 
 
 def _serialize_messages(messages: List[Dict[str, Any]]) -> str:
@@ -290,7 +288,6 @@ async def run_compact(
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": compaction_input}],
-                "max_tokens": 2048,
                 "temperature": 0.0,
             }
             headers = {

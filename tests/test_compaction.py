@@ -104,15 +104,13 @@ class TestSelectTailMessages:
         assert result == ["short"]
 
     def test_truncates_last(self):
-        # A 60-byte message at 4 bytes/token -> ~15 tokens.
-        # With budget=10, it gets truncated to 40 bytes.
-        long_msg = "a" * 60  # 60 bytes UTF-8 = 15 tokens approx
+        # A 60-byte message at 4 bytes/token -> ~15 tokens, exceeds budget=10.
+        # The message is dropped entirely since it doesn't fit — no truncation.
+        long_msg = "a" * 60
         msgs = ["first", long_msg]
         result = select_tail_messages(msgs, max_tokens=10)
-        # Reverse iteration: long_msg processed first, truncates to 40 chars,
-        # budget exhausted before "first" is processed.
-        assert len(result) == 1
-        assert len(result[0]) == 40  # 10 tokens * 4 bytes/token
+        # Reverse iteration: long_msg doesn't fit → dropped, "first" not reached
+        assert result == []
 
     def test_reverse_order(self):
         msgs = ["oldest", "middle", "newest"]

@@ -116,6 +116,10 @@ class MemoryStore:
         # Backlink index: {keyword: [(target, entry_index), ...]}
         # Indicates which entries contain [[keyword]] links.
         self._backlinks: Dict[str, List[tuple[str, int]]] = {}
+        # Frozen snapshot for system prompt — set once at load_from_disk() time.
+        # Mid-session writes do not update this; system prompt stability
+        # (prefix cache) is prioritised over real-time freshness.
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         self.load_from_disk()
 
     # -- Path helpers -------------------------------------------------------
@@ -154,6 +158,7 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
         self._rebuild_backlinks()
+        self._rebuild_snapshot()
 
     def _reload_target(self, target: str) -> None:
         """Re-read entries from disk for a target (called under lock)."""
@@ -452,6 +457,45 @@ class MemoryStore:
 
     # -- System prompt formatting -------------------------------------------
 
+    def _render_block_for_prompt(self, target: str) -> str:
+        """Render entries as a system prompt block.
+
+        Format: ``## <Label>`` heading, entries joined by blank lines.
+        No decorative separators or usage percentages — those consume
+        tokens without semantic value in the system prompt.
+        """
+        entries = self._entries_for(target)
+        if not entries:
+            return ""
+        label = "User profile" if target == "user" else "Memory"
+        # Join entries with blank lines for clean readability
+        content = "\n\n".join(e.strip() for e in entries if e.strip())
+        return f"## {label}\n{content}"
+
+    def _rebuild_snapshot(self) -> None:
+        """Rebuild the frozen snapshot from current entries.
+
+        Called at load_from_disk() time.  The snapshot is *not* updated
+        on mid-session writes — system prompt stability (prefix cache)
+        takes priority.
+        """
+        self._system_prompt_snapshot = {
+            "memory": self._render_block_for_prompt("memory"),
+            "user": self._render_block_for_prompt("user"),
+        }
+
+    def format_for_system_prompt(self, target: str) -> Optional[str]:
+        """Return frozen snapshot for system prompt injection.
+
+        Returns the state captured at load_from_disk() time, NOT the
+        live entries.  This keeps the system prompt stable across all
+        turns in a session, preserving the prefix cache.
+
+        Returns None if the snapshot is empty (no entries at load time).
+        """
+        block = self._system_prompt_snapshot.get(target, "")
+        return block if block else None
+
     def get_all_formatted(self) -> str:
         """Render both stores as a compact summary index for system prompt injection.
 
@@ -570,6 +614,11 @@ _global_store: Optional[MemoryStore] = None
 def set_store(store: MemoryStore) -> None:
     global _global_store
     _global_store = store
+
+
+def get_store() -> Optional[MemoryStore]:
+    """Return the global MemoryStore, or None if not yet initialised."""
+    return _global_store
 
 
 # ---------------------------------------------------------------------------

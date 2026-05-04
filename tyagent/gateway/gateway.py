@@ -404,11 +404,7 @@ class Gateway:
             if ctx:
                 ctx.progress_tasks.append(progress_task)
 
-            # Inject memory into user message
-            memory_block = self.memory_store.get_all_formatted()
             final_text = user_message
-            if memory_block:
-                final_text = f"{user_message}\n\n[记忆上下文]\n{memory_block}"
 
             # Skip agent interaction for empty messages (image-only, sticker, etc.)
             if not final_text.strip():

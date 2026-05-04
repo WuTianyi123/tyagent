@@ -81,10 +81,10 @@ class TyAgent:
         auto_limit = c.auto_compact_limit
         try:
             if auto_limit is None or auto_limit <= 0:
-                auto_limit = int(self._effective_context_length * 0.80)
+                auto_limit = int(self._effective_context_length * 0.90)
         except TypeError:
             # Non-integer value (e.g. MagicMock in tests)
-            auto_limit = int(self._effective_context_length * 0.80)
+            auto_limit = int(self._effective_context_length * 0.90)
         self.auto_compact_limit: int = auto_limit
         # Which model/client to use for the compaction stand-alone turn.
         # Falls back to the main model when not configured separately.
@@ -106,8 +106,41 @@ class TyAgent:
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
         self._event_collector: Optional[EventCollector] = None
+        # System prompt built once at init, then cached for prefix-cache
+        # stability across turns.  Rebuilt after compaction so mid-session
+        # memory writes are picked up — the cache-miss cost is negligible
+        # since compaction already changes the messages prefix.
+        self._system_prompt: str = build_system_prompt(
+            model=self.model,
+            user_prompt=self.system_prompt,
+            home_dir=self.home_dir,
+        )
 
-    # ── System prompt ──────────────────────────────────────────
+    # ── System prompt refresh ──────────────────────────────────
+
+    def _refresh_memory_and_prompt(self) -> None:
+        """Rebuild MemoryStore snapshot and regenerate system prompt.
+
+        Called after compaction so mid-session memory writes are picked
+        up.  Safe to call multiple times — regenerates system prompt only
+        when the MemoryStore is available (gateway profile), no-op in
+        isolated contexts (tests, child agents).
+        """
+        try:
+            from tyagent.tools.memory_tool import get_store
+            store = get_store()
+            if store is None:
+                return
+            store._rebuild_snapshot()
+            self._system_prompt = build_system_prompt(
+                model=self.model,
+                user_prompt=self.system_prompt,
+                home_dir=self.home_dir,
+            )
+        except Exception:
+            pass
+
+    # ── API helpers ─────────────────────────────────────────────
 
     def _build_headers(self) -> Dict[str, str]:
         """Return standard HTTP headers for LLM API requests."""
@@ -386,21 +419,20 @@ class TyAgent:
 
         messages = self._messages
 
-        # Build system prompt fresh (not cached — skills/memory may change).
+        # System prompt is cached from init for prefix-cache stability.
         # Stored separately from messages; injected at API call time.
-        system_prompt = build_system_prompt(
-            model=self.model,
-            user_prompt=self.system_prompt,
-            home_dir=self.home_dir,
-        )
-        # Record it so clone() can reconstruct accurately.
-        self._system_prompt = system_prompt
+        system_prompt = self._system_prompt
 
         # ── Pre-turn compaction ─────────────────────────────────
-        est = total_token_estimate(messages, system_prompt=system_prompt)
+        # Use exact prompt_tokens from the last API response when available,
+        # falling back to byte-based estimate only for the first-ever call.
+        if self.last_usage is not None:
+            est = self.last_usage["prompt_tokens"]
+        else:
+            est = total_token_estimate(messages, system_prompt=system_prompt)
         if est >= self.auto_compact_limit:
             logger.info(
-                "Pre-turn compaction: ~%d tokens >= %d limit",
+                "Pre-turn compaction: %d prompt_tokens >= %d limit",
                 est,
                 self.auto_compact_limit,
             )
@@ -413,6 +445,7 @@ class TyAgent:
             )
             if compacted is not None:
                 messages[:] = compacted
+                self._refresh_memory_and_prompt()
 
         payload_base = self._build_payload_base(tools)
         headers = self._build_headers()
@@ -459,18 +492,17 @@ class TyAgent:
                 except Exception:
                     pass
 
-            tool_turn += 1
-            await self._execute_tool_calls(tool_calls, messages, registry)
-
-            # ── Mid-turn compaction ──────────────────────────────
-            # After tool outputs have been appended, check if we're
-            # still over the limit.  If yes, compact before the next
-            # API call so the model sees compressed context.
-            # Equivalent to Codex CLI's mid-turn path (turn.rs L484-501).
-            est = total_token_estimate(messages, system_prompt=system_prompt)
+            # ── Mid-turn compaction (Codex style, pre-exec) ──────
+            # Before executing tool calls, check if we're over the limit.
+            # If yes, compact and continue so the model re-decides in a
+            # freed-up context.  Equivalent to turn.rs L485-501.
+            if self.last_usage is not None:
+                est = self.last_usage["prompt_tokens"]
+            else:
+                est = total_token_estimate(messages, system_prompt=system_prompt)
             if est >= self.auto_compact_limit:
                 logger.info(
-                    "Mid-turn compaction: ~%d tokens >= %d limit",
+                    "Mid-turn compaction (pre-exec): %d prompt_tokens >= %d limit",
                     est,
                     self.auto_compact_limit,
                 )
@@ -483,6 +515,12 @@ class TyAgent:
                 )
                 if compacted is not None:
                     messages[:] = compacted
+                    self._refresh_memory_and_prompt()
+                # Continue — model sees compacted context and re-decides
+                continue
+
+            tool_turn += 1
+            await self._execute_tool_calls(tool_calls, messages, registry)
 
         return (content or reasoning_content or "")
 

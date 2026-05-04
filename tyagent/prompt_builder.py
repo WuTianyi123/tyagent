@@ -2,18 +2,19 @@
 
 Layers (in order):
   1. identity.md  — profile-specific agent identity (fallback: TYAGENT_IDENTITY)
-  2. user.md      — profile-specific user context (optional)
-  3. User system_prompt override (from config, if non-default)
-  4. Session metadata (model, provider)
+  2. User custom system_prompt override (from config, if non-default)
+  3. Session metadata (model, provider)
+  4. Memory blocks — from MemoryStore snapshot (MEMORY.md + USER.md only)
 
-Design follows Hermes: build once per session, cache, rebuild only on
-context compression to maximise prefix-cache hits.
+User context comes exclusively from the memory tool's USER.md store,
+NOT from a separate user.md file at the profile root.  The two would
+be redundant — the memory tool is the canonical source.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -24,11 +25,6 @@ TYAGENT_IDENTITY = (
     "You are helpful, knowledgeable, and direct. "
     "You communicate clearly and prioritise being genuinely useful."
 )
-
-# Sentinel for "user did not set a custom system prompt". Empty string
-# means the prompt_builder should skip injection — the user can set any
-# non-empty string including "You are a helpful assistant." if they choose.
-_DEFAULT_SYSTEM_PROMPT = ""
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +39,31 @@ def _read_if_exists(path: Path) -> Optional[str]:
         return None
 
 
+def _get_memory_blocks() -> List[str]:
+    """Return memory blocks for system prompt injection.
+
+    Each target (memory / user) is rendered as an independent block
+    with full entry content, using the frozen snapshot captured at
+    ``MemoryStore.load_from_disk()`` time.
+
+    Returns an empty list if no MemoryStore is available (e.g. tests,
+    isolated child agents, or store not yet initialised).
+    """
+    try:
+        from tyagent.tools.memory_tool import get_store
+        store = get_store()
+        if store is None:
+            return []
+        blocks: List[str] = []
+        for target in ("memory", "user"):
+            block = store.format_for_system_prompt(target)
+            if block:
+                blocks.append(block)
+        return blocks
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
@@ -55,8 +76,9 @@ def build_system_prompt(
 ) -> str:
     """Assemble the system prompt for a session.
 
-    Called once at session start; cached on the agent.  Rebuilt after
-    context compression so the identity stays fresh.
+    Called once at agent init; cached on the agent for prefix-cache
+    stability across turns.  Compact-on-start is handled by Codex's
+    ``SUMMARY_PREFIX`` — no special rebuild logic needed on compression.
     """
     parts: list[str] = []
 
@@ -69,17 +91,15 @@ def build_system_prompt(
     if not parts:
         parts.append(TYAGENT_IDENTITY)
 
-    # Layer 2: user context — from user.md
-    if home_dir is not None:
-        user_text = _read_if_exists(home_dir / "user.md")
-        if user_text:
-            parts.append(user_text)
-
-    # Layer 3: user's custom system_prompt (skip if empty/unset)
+    # Layer 2: user's custom system_prompt (skip if empty/unset)
     if user_prompt and user_prompt.strip():
         parts.append(user_prompt)
 
-    # Layer 4: session metadata
+    # Layer 3: session metadata
     parts.append(f"Current model: {model}")
+
+    # Layer 4: memory blocks — from MemoryStore snapshot
+    for block in _get_memory_blocks():
+        parts.append(block)
 
     return "\n\n".join(parts)
