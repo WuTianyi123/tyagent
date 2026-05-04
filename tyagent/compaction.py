@@ -24,6 +24,7 @@ is authoritative.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,42 @@ COMPACTION_PROMPT: str = (
 
 # Approximate chars-per-token for budget calculations.
 _CHARS_PER_TOKEN: int = 4
+
+# Exponential backoff delay sequence (seconds) for transient compaction errors.
+# Mirrors Codex CLI backoff() (compact.rs: backoff pattern).
+_BACKOFF_DELAYS: List[float] = [0.25, 0.5, 1.0, 2.0, 5.0]
+
+# Error body substrings that indicate a context-window-exceeded / payload-too-large
+# condition.  When detected, ``run_compact`` removes the oldest message and
+# retries with a smaller input — the problem is recoverable by shrinking.
+_CONTEXT_OVERFLOW_PATTERNS: List[str] = [
+    "context_length",
+    "context window",
+    "context length",
+    "max context length",
+    "context limit",
+    "maximum context",
+    "token limit",
+    "too many tokens",
+    "request too large",
+    "payload too large",
+]
+
+
+def _is_context_overflow(status_code: int, body: str) -> bool:
+    """Return True if an API error indicates the compaction input exceeds the model's context window.
+
+    Matches Codex CLI's ``ContextWindowExceeded`` branch (compact.rs L204):
+    - HTTP 413 (Payload Too Large) always counts as overflow
+    - HTTP 400 counts only when the response body contains known overflow
+      keywords (checked case-insensitively)
+    """
+    if status_code == 413:
+        return True
+    if status_code == 400:
+        body_lower = body.lower()
+        return any(p in body_lower for p in _CONTEXT_OVERFLOW_PATTERNS)
+    return False
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -261,6 +298,16 @@ async def run_compact(
       4. Extract the summary from the LLM's response
       5. Assemble compacted history: [tail_user_msgs, summary_assistant_msg]
 
+    Error recovery (mirroring Codex CLI compact.rs L204-210):
+      - ``ContextWindowExceeded`` (HTTP 400/413 with overflow body): the
+        compaction input itself exceeds the model's context window.  The
+        oldest message is removed from the input and compaction retries
+        immediately with ``retries`` reset — the root cause was eliminated.
+      - Transient errors (timeout, HTTP 5xx, connection) use exponential
+        backoff and consume one retry slot.
+      - If only one message remains and compaction still overflows, the
+        function gives up and returns ``None``.
+
     Returns ``None`` if compaction fails (all retries exhausted) — the caller
     should fall back to the original messages.
 
@@ -272,18 +319,21 @@ async def run_compact(
         logger.warning("No user messages to compact")
         return None
 
-    # 2. Select tail
+    # 2. Select tail (won't change as we shrink the compaction input)
     tail = select_tail_messages(user_msgs)
     if not tail:
         logger.warning("No tail messages fit within budget")
         return None
 
-    # 3-4. Call LLM for summary
-    serialized = _serialize_messages(messages)
-    compaction_input = f"{serialized}\n\n---\n\n{COMPACTION_PROMPT}"
+    # 3. Prepare a working copy that can be shrunk on overflow
+    working_msgs: List[Dict[str, Any]] = list(messages)
+    _build_input = _make_input_builder(working_msgs)
+    compaction_input = _build_input()
 
     last_error: Optional[str] = None
-    for attempt in range(max_retries + 1):
+    remaining_transient = max_retries  # transient retry budget
+
+    while True:
         try:
             payload = {
                 "model": model,
@@ -300,13 +350,45 @@ async def run_compact(
                 json=payload,
                 timeout=120.0,
             )
+
+            # ── HTTP-level errors ──────────────────────────────────
             if resp.status_code >= 400:
-                body = resp.text[:500]
+                body = resp.text[:1000]
+                if _is_context_overflow(resp.status_code, body):
+                    # ContextWindowExceeded — shrink input, retry immediately
+                    if len(working_msgs) <= 1:
+                        logger.error(
+                            "Compaction: context overflow with only 1 message — giving up"
+                        )
+                        return None
+                    working_msgs.pop(0)  # Remove oldest message
+                    compaction_input = _build_input()
+                    remaining_transient = max_retries  # Reset transient budget
+                    last_error = (
+                        f"HTTP {resp.status_code}: context overflow — "
+                        f"retrying with {len(working_msgs)} messages"
+                    )
+                    logger.warning("Compaction: %s", last_error)
+                    continue  # immediate retry
+
+                # Non-overflow HTTP error — consume transient budget
                 last_error = f"HTTP {resp.status_code}: {body}"
-                logger.warning("Compaction API error (attempt %d/%d): %s",
-                               attempt + 1, max_retries + 1, last_error)
+                logger.warning(
+                    "Compaction API error (%d transient retries left): %s",
+                    remaining_transient, last_error,
+                )
+                if remaining_transient <= 0:
+                    break
+                remaining_transient -= 1
+                await asyncio.sleep(
+                    _BACKOFF_DELAYS[min(
+                        max_retries - remaining_transient - 1,
+                        len(_BACKOFF_DELAYS) - 1,
+                    )]
+                )
                 continue
 
+            # ── Success — extract summary ──────────────────────────
             data = resp.json()
             summary = (
                 data.get("choices", [{}])[0]
@@ -315,37 +397,92 @@ async def run_compact(
             )
             if not summary:
                 last_error = "Empty summary in response"
-                logger.warning("Compaction empty summary (attempt %d/%d)",
-                               attempt + 1, max_retries + 1)
+                logger.warning(
+                    "Compaction empty summary (%d transient retries left)",
+                    remaining_transient,
+                )
+                if remaining_transient <= 0:
+                    break
+                remaining_transient -= 1
+                await asyncio.sleep(
+                    _BACKOFF_DELAYS[min(
+                        max_retries - remaining_transient - 1,
+                        len(_BACKOFF_DELAYS) - 1,
+                    )]
+                )
                 continue
 
-            break
+            # 5. Build compacted history
+            compacted = build_compacted_history(tail, summary)
+            logger.info(
+                "Compaction: %d messages -> %d messages (preserved %d of %d user msgs)",
+                len(messages), len(compacted),
+                len(tail), len(user_msgs),
+            )
+            return compacted
 
         except httpx.TimeoutException as e:
             last_error = f"Timeout: {e}"
-            logger.warning("Compaction timeout (attempt %d/%d)",
-                           attempt + 1, max_retries + 1)
+            logger.warning(
+                "Compaction timeout (%d transient retries left)",
+                remaining_transient,
+            )
+            if remaining_transient <= 0:
+                break
+            remaining_transient -= 1
+            await asyncio.sleep(
+                _BACKOFF_DELAYS[min(
+                    max_retries - remaining_transient - 1,
+                    len(_BACKOFF_DELAYS) - 1,
+                )]
+            )
             continue
+
         except httpx.HTTPError as e:
             last_error = f"HTTP error: {e}"
-            logger.warning("Compaction HTTP error (attempt %d/%d)",
-                           attempt + 1, max_retries + 1)
+            logger.warning(
+                "Compaction HTTP error (%d transient retries left)",
+                remaining_transient,
+            )
+            if remaining_transient <= 0:
+                break
+            remaining_transient -= 1
+            await asyncio.sleep(
+                _BACKOFF_DELAYS[min(
+                    max_retries - remaining_transient - 1,
+                    len(_BACKOFF_DELAYS) - 1,
+                )]
+            )
             continue
+
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            logger.warning("Compaction unexpected error (attempt %d/%d): %s",
-                           attempt + 1, max_retries + 1, last_error)
+            logger.warning(
+                "Compaction unexpected error (%d transient retries left): %s",
+                remaining_transient, last_error,
+            )
+            if remaining_transient <= 0:
+                break
+            remaining_transient -= 1
+            await asyncio.sleep(
+                _BACKOFF_DELAYS[min(
+                    max_retries - remaining_transient - 1,
+                    len(_BACKOFF_DELAYS) - 1,
+                )]
+            )
             continue
-    else:
-        logger.error("Compaction failed after %d attempts: %s",
-                     max_retries + 1, last_error)
-        return None
 
-    # 5. Build compacted history
-    compacted = build_compacted_history(tail, summary)
-    logger.info(
-        "Compaction: %d messages -> %d messages (preserved %d of %d user msgs)",
-        len(messages), len(compacted),
-        len(tail), len(user_msgs),
-    )
-    return compacted
+    logger.error("Compaction failed after %d transient retries: %s",
+                 max_retries, last_error)
+    return None
+
+
+def _make_input_builder(
+    working_msgs: List[Dict[str, Any]],
+) -> Any:
+    """Return a closure that serializes the current working messages."""
+    import httpx
+    def _build() -> str:
+        serialized = _serialize_messages(working_msgs)
+        return f"{serialized}\n\n---\n\n{COMPACTION_PROMPT}"
+    return _build

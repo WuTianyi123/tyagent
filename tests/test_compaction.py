@@ -338,3 +338,195 @@ class TestRunCompact:
         call_url = client.post.call_args[0][0]
         assert "//chat" not in call_url
         assert call_url.endswith("/chat/completions")
+# ── Context overflow recovery ───────────────────────────────────────────
+
+
+class TestContextOverflow:
+    """Tests for Codex-style context overflow recovery in run_compact."""
+
+    @pytest.mark.asyncio
+    async def test_context_overflow_removes_oldest_message(self):
+        """HTTP 400 with 'context_length' removes oldest message and retries."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+
+        # Track calls to verify shrinking
+        posted_bodies = []
+
+        async def side_effect(*args, **kwargs):
+            body = kwargs["json"]["messages"][0]["content"]
+            posted_bodies.append(len(body))
+            if len(posted_bodies) == 1:
+                # First call: context overflow
+                return MagicMock(
+                    status_code=400,
+                    text="context_length exceeded, model cannot process",
+                )
+            # Second call: success
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": "Final summary"}}]},
+            )
+
+        client.post.side_effect = side_effect
+
+        messages = [
+            {"role": "user", "content": "oldest message"},
+            {"role": "assistant", "content": "response to oldest"},
+            {"role": "user", "content": "newest message"},
+        ]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=2,
+        )
+
+        assert result is not None
+        assert "Final summary" in result[-1]["content"] or SUMMARY_PREFIX in result[-1]["content"]
+        # Second call should have shorter body (one message removed)
+        assert posted_bodies[1] < posted_bodies[0]
+
+    @pytest.mark.asyncio
+    async def test_413_triggers_overflow_recovery(self):
+        """HTTP 413 always triggers overflow recovery regardless of body content."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+
+        async def side_effect(*args, **kwargs):
+            if not hasattr(side_effect, "called"):
+                side_effect.called = True
+                return MagicMock(status_code=413, text="Request Entity Too Large")
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": "Summary"}}]},
+            )
+
+        client.post.side_effect = side_effect
+
+        messages = [{"role": "user", "content": "msg1"}, {"role": "user", "content": "msg2"}]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client,
+        )
+
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_single_message_overflow_gives_up(self):
+        """Context overflow with only 1 message left returns None."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+        mock_resp = MagicMock(
+            status_code=400,
+            text="context_length exceeded",
+        )
+        client.post.return_value = mock_resp
+
+        messages = [{"role": "user", "content": "only message"}]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=2,
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_multiple_overflows_progressive_shrink(self):
+        """Multiple context overflows progressively remove messages."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+
+        posted_bodies = []
+
+        async def side_effect(*args, **kwargs):
+            body = kwargs["json"]["messages"][0]["content"]
+            posted_bodies.append(body)
+            call = len(posted_bodies)
+            if call <= 2:
+                # First two calls overflow
+                return MagicMock(status_code=400, text="context_length exceeded")
+            # Third call succeeds
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": "Final summary"}}]},
+            )
+
+        client.post.side_effect = side_effect
+
+        messages = [
+            {"role": "user", "content": "msg1"},
+            {"role": "assistant", "content": "resp1"},
+            {"role": "user", "content": "msg2"},
+            {"role": "assistant", "content": "resp2"},
+            {"role": "user", "content": "msg3"},
+        ]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=2,
+        )
+
+        assert result is not None
+        # Each overflow call should have shorter input
+        assert len(posted_bodies) == 3
+        assert len(posted_bodies[1]) < len(posted_bodies[0])
+        assert len(posted_bodies[2]) < len(posted_bodies[1])
+
+    @pytest.mark.asyncio
+    async def test_non_overflow_400_uses_transient_retry_budget(self):
+        """Non-overflow 400 errors consume transient retry budget, not shrink input."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+        mock_resp = MagicMock(status_code=400, text="Bad Request: invalid model")
+        client.post.return_value = mock_resp
+
+        messages = [{"role": "user", "content": "msg1"}, {"role": "user", "content": "msg2"}]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=1,
+        )
+
+        assert result is None
+        # Should have called 2 times (initial + 1 retry), not shrunk
+        assert client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_overflow_resets_transient_budget(self):
+        """Context overflow should reset remaining_transient to max_retries."""
+        client = AsyncMock(spec=httpx.AsyncClient)
+
+        posted_bodies = []
+
+        async def side_effect(*args, **kwargs):
+            body = kwargs["json"]["messages"][0]["content"]
+            posted_bodies.append(len(body))
+            call = len(posted_bodies)
+            if call == 1:
+                # First call: overflow
+                return MagicMock(status_code=400, text="context_length exceeded")
+            if call == 2:
+                # Second call: timeout (should still have full transient budget)
+                raise httpx.TimeoutException("timeout")
+            # Third call: success
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": "Summary after reset"}}]},
+            )
+
+        client.post.side_effect = side_effect
+
+        messages = [
+            {"role": "user", "content": "a" * 100},
+            {"role": "user", "content": "b" * 100},
+            {"role": "user", "content": "c" * 100},
+        ]
+        result = await run_compact(
+            messages, model="test-model",
+            api_key="key", base_url="https://api.test/v1",
+            http_client=client, max_retries=1,
+        )
+
+        assert result is not None
+        # Overflow (call 1) reset budget from 1 to 1
+        # Timeout (call 2) consumed the 1 transient retry → remaining_transient=0 → but slept → continue
+        # Call 3: success
+        # Total: 3 calls (overflow + retry after timeout + success)
+        assert client.post.call_count == 3
