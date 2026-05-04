@@ -1,6 +1,6 @@
 # tyagent
 
-全功能 AI Agent 框架，native 飞书/Lark 消息网关。支持子代理委派、流式输出、工具进度显示、优雅重启。
+全功能 AI Agent 框架，native 飞书/Lark 消息网关。支持子代理委派、流式输出、工具进度显示、优雅重启、Codex 风格上下文压缩。
 
 ## 快速开始
 
@@ -20,7 +20,7 @@ uv run python tyagent_cli.py gateway run
 # 安装为 systemd 用户服务（推荐）
 uv run python tyagent_cli.py gateway install
 
-# 之后用 systemctl 管理服务
+# 管理服务
 systemctl --user start tyagent-gateway
 systemctl --user restart tyagent-gateway
 systemctl --user stop tyagent-gateway
@@ -28,46 +28,49 @@ systemctl --user status tyagent-gateway
 journalctl --user -u tyagent-gateway -f
 ```
 
-## CLI 命令总览
+## CLI 命令
 
 | 命令 | 说明 |
 |------|------|
-| `gateway run` | 前台运行网关（阻塞，Ctrl+C 停止） |
-| `gateway install` | 安装为 systemd 用户服务 |
-| `gateway uninstall` | 卸载 systemd 服务 |
-| `gateway start` | 启动 systemd 服务 |
-| `gateway stop` | 停止 systemd 服务 |
-| `gateway restart` | 重启 systemd 服务 |
-| `gateway status` | 查看服务状态 |
-| `setup-feishu` | 扫码配置飞书/Lark 机器人 |
-| `configure` | 交互式配置向导（选择模型、填 API Key） |
+| `gateway run` \| `install` \| `start` \| `stop` \| `restart` \| `status` \| `uninstall` | 网关管理 |
+| `setup-feishu` | 扫码配置飞书机器人 |
+| `configure` | 交互式配置向导 |
 | `set-model` | 直接设置模型参数 |
-| `config` | 查看当前配置（敏感值脱敏） |
-| `test-llm` | 直接测试 LLM API 连接 |
+| `config` | 查看当前配置（脱敏） |
+| `test-llm` | 测试 LLM API 连接 |
 
-## 全局参数
-
-- `-c, --config <path>` — 指定配置文件路径
-- `-l, --log-level <level>` — 日志级别（DEBUG/INFO/WARNING/ERROR）
+全局参数：`-c, --config <path>` 指定配置文件路径
 
 ## 配置
 
-配置默认保存在 `~/.tyagent/config.yaml`，包括：
+Profile 目录：`~/.tyagent/<profile>/config.yaml`
 
-- **LLM 设置**：model、base_url、api_key、system_prompt
-- **平台设置**：飞书 app_id、app_secret、domain
+- 默认 profile：`tyagent`（即 `~/.tyagent/tyagent/config.yaml`）
+- 使用 `--profile <name>` 指定其他 profile
 
-可用环境变量覆盖：
+环境变量覆盖：
 
-- `OPENAI_API_KEY`、`KIMI_API_KEY`、`ANTHROPIC_API_KEY`
-- `DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY`
+| 变量 | 说明 |
+|------|------|
+| `DEEPSEEK_API_KEY` | DeepSeek API key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `KIMI_API_KEY` | Kimi API key |
+| `OPENROUTER_API_KEY` | OpenRouter API key |
+| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `FEISHU_APP_ID` | 飞书 App ID |
+| `FEISHU_APP_SECRET` | 飞书 App Secret |
+
+## 飞书命令
+
+| 命令 | 功能 |
+|------|------|
+| `/help` | 显示所有命令 |
+| `/status` | 会话状态（模型、消息数） |
+| `/new` | 归档当前会话，开始新对话 |
+| `/restart` | 优雅重启 gateway |
 
 ## 查看日志
 
 ```bash
-# systemd 服务日志
 journalctl --user -u tyagent-gateway -f
-
-# 前台运行时直接看终端输出
-uv run python tyagent_cli.py gateway run
 ```
