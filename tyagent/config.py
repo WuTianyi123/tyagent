@@ -54,27 +54,74 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
-def _deep_merge_defaults(user: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
-    """Recursively add missing keys from *defaults* into *user* dict in-place.
+_EXTRA_KNOWN_TOP_KEYS = frozenset({"home_dir", "sessions_dir"})
+"""Top-level config keys that are valid even though not in ``DEFAULT_CONFIG``.
 
-    Returns True if any key was added (caller should re-save config.yaml).
-    Never overwrites an existing user value — only fills absent keys.
+These are runtime-derived paths set by ``load_config()`` and persisted
+via ``TyAgentConfig.to_dict()``.  The pruning function recognises them
+so they are not removed as stale keys.
+"""
 
-    Special handling for ``platforms``: each known platform adapter provides
-    a schema skeleton via ``_discover_platform_schemas()``.  When *defaults*
-    includes ``platforms``, the merge fills in skeleton entries for any
-    platform NOT already in the user config — meaning ``config.yaml``
-    auto-populates with all supported platforms and their defaults.
+
+def _prune_and_merge(
+    raw: Dict[str, Any],
+    canonical: Dict[str, Any],
+    path: str = "",
+) -> bool:
+    """Restructure *raw* to match *canonical* in-place.
+
+    Does two things in a single pass:
+
+    1. **Prune**: remove keys from *raw* that don't appear in *canonical*
+       at the same level.  Dicts whose dotted path ends in ``.extra`` (the
+       platform catch-all) are exempt — their contents are never pruned.
+    2. **Merge**: add any keys from *canonical* that are missing in *raw*
+       (recursing into nested dicts).
+
+    Returns ``True`` if *raw* was modified.
+
+    Unlike the old ``_deep_merge_defaults`` which only added missing keys,
+    this function actively cleans up obsolete config entries — ensuring
+    ``config.yaml`` only contains recognised fields from the framework
+    defaults or platform adapter schemas.
     """
     changed = False
-    for key, default_val in defaults.items():
-        if key not in user:
-            user[key] = default_val
-            changed = True
-        elif isinstance(default_val, dict) and isinstance(user[key], dict):
-            if _deep_merge_defaults(user[key], default_val):
+
+    # ── Prune: remove unknown keys ──────────────────────────────
+    # Never prune inside the catch-all ``extra`` dict.
+    if not _is_extra_path(path):
+        for key in list(raw.keys()):
+            # Allow extra known top-level keys
+            if not path and key in _EXTRA_KNOWN_TOP_KEYS:
+                continue
+            if key not in canonical:
+                del raw[key]
                 changed = True
+
+    # ── Merge: add missing keys, recurse into known dicts ──────
+    for key, canonical_val in canonical.items():
+        child_path = f"{path}.{key}" if path else key
+
+        if key not in raw:
+            raw[key] = canonical_val
+            changed = True
+        elif isinstance(canonical_val, dict) and isinstance(raw[key], dict):
+            if _prune_and_merge(raw[key], canonical_val, child_path):
+                changed = True
+
     return changed
+
+
+def _is_extra_path(path: str) -> bool:
+    """Return ``True`` if *path* ends in ``.extra`` (the catch-all dict).
+
+    Dicts at or below an ``.extra`` path are never pruned — they accept
+    arbitrary keys that platform adapters may need.
+    """
+    if not path:
+        return False
+    parts = path.split(".")
+    return "extra" in parts
 
 
 @dataclass
@@ -557,9 +604,9 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
                 **full_defaults.get("platforms", {}),
                 **platform_defaults,
             }
-        if _deep_merge_defaults(raw, full_defaults):
+        if _prune_and_merge(raw, full_defaults):
             _yaml_dump(raw, yaml_path)
-            logger.info("Config schema updated with new platform defaults.")
+            logger.info("Config pruned and merged against canonical schema.")
         # ── Validate platform configs ──────────────────────────
         _validate_platform_configs(raw)
         cfg = TyAgentConfig.from_dict(raw)

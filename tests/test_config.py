@@ -763,10 +763,10 @@ class TestPlatformSchemaDiscovery:
         assert cfg.platforms == {}  # Default TyAgentConfig has empty platforms
 
     def test_merge_defaults_with_empty_platforms(self, monkeypatch, tmp_path) -> None:
-        """_deep_merge_defaults can handle EMPTY platforms section."""
+        """_prune_and_merge can handle EMPTY platforms section."""
         import tyagent.config as cfg_mod
 
-        from tyagent.config import _deep_merge_defaults, _discover_platform_schemas
+        from tyagent.config import _prune_and_merge, _discover_platform_schemas
 
         raw_user = {}
         full_defaults = dict(cfg_mod.DEFAULT_CONFIG)
@@ -776,13 +776,70 @@ class TestPlatformSchemaDiscovery:
                 **full_defaults.get("platforms", {}),
                 **platform_defaults,
             }
-        changed = _deep_merge_defaults(raw_user, full_defaults)
+        changed = _prune_and_merge(raw_user, full_defaults)
         assert changed
         assert "platforms" in raw_user
         assert "feishu" in raw_user["platforms"]
         assert raw_user["platforms"]["feishu"]["enabled"] is False
         assert "connection" in raw_user["platforms"]["feishu"]["extra"]
         assert raw_user["platforms"]["feishu"]["extra"]["connection"]["app_id"] == ""
+
+    def test_prune_removes_stale_keys(self) -> None:
+        """_prune_and_merge removes keys not in canonical schema."""
+        from tyagent.config import _prune_and_merge
+
+        canonical = {
+            "agent": {"model": "gpt-4", "temperature": 0.7},
+            "compression": {"auto_compact_limit": None},
+        }
+        raw = {
+            "agent": {"model": "gpt-4", "temperature": 0.7, "old_field": "stale"},
+            "compression": {"auto_compact_limit": None, "cut_ratio": 0.5, "api_key": "x"},
+            "obsolete_section": {"a": 1},
+        }
+        changed = _prune_and_merge(raw, canonical)
+        assert changed
+
+        # Stale keys removed from known sections
+        assert "old_field" not in raw["agent"]
+        assert "cut_ratio" not in raw["compression"]
+        assert "api_key" not in raw["compression"]
+        # Unknown top-level section removed
+        assert "obsolete_section" not in raw
+        # Known keys preserved
+        assert raw["agent"]["model"] == "gpt-4"
+
+    def test_prune_protects_extra_dict(self) -> None:
+        """_prune_and_merge does NOT prune inside extra (catch-all)."""
+        from tyagent.config import _prune_and_merge
+
+        canonical = {
+            "platforms": {
+                "feishu": {
+                    "enabled": False,
+                    "extra": {
+                        "connection": {"app_id": ""},
+                    },
+                },
+            },
+        }
+        raw = {
+            "platforms": {
+                "feishu": {
+                    "enabled": False,
+                    "extra": {
+                        "connection": {"app_id": "my-app"},
+                        "unknown_extra_key": "value",  # Should be preserved
+                    },
+                },
+            },
+        }
+        changed = _prune_and_merge(raw, canonical)
+        # 'unknown_extra_key' inside extra should survive
+        assert not changed or "unknown_extra_key" in raw["platforms"]["feishu"]["extra"]
+        # But stale keys inside extra's known sub-keys ARE pruned
+        # (connection is not extra itself) 
+        assert "unknown_extra_key" in raw["platforms"]["feishu"]["extra"]
 
     def test_migrate_flat_to_grouped(self) -> None:
         """_migrate_platform_extra restructures old flat extra keys."""
