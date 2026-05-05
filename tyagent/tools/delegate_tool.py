@@ -23,10 +23,10 @@ from tyagent.tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 # Tools that children must never have access to:
-# - All spawn/wait/close/list tools: no recursive sub-agent management
+# - All spawn/wait/close/list/send_input tools: no recursive sub-agent management
 # - memory: no cross-session writes to shared memory
 DELEGATE_BLOCKED_TOOLS = frozenset(
-    ["spawn_task", "wait_task", "close_task", "list_tasks", "memory"]
+    ["spawn_task", "wait_task", "close_task", "list_tasks", "send_input", "memory"]
 )
 
 DEFAULT_SUBAGENT_MAX_TOOL_TURNS = 30
@@ -52,6 +52,7 @@ async def _run_child_async(
     compression: Any = None,
     tool_progress_callback: Any = None,
     collector: Optional[EventCollector] = None,
+    parent_agent: Any = None,
     home_dir: Optional[Path] = None,
     context_length: Optional[int] = None,
     max_tokens: int = 4096,
@@ -77,8 +78,13 @@ async def _run_child_async(
         http_timeout=http_timeout,
         shutdown_timeout=shutdown_timeout,
     )
+    child._check_inbox_between_turns = True
     child_messages = [{"role": "user", "content": goal}]
     tool_defs = registry.get_definitions(names=tool_names)
+
+    # Register child agent for send_input lookup
+    if collector is not None and parent_agent is not None:
+        parent_agent._child_agents[task_id] = child
 
     try:
         summary = await asyncio.wait_for(
@@ -107,6 +113,9 @@ async def _run_child_async(
     finally:
         try: await child.close()
         except Exception: pass
+        # Clean up child_agents registry
+        if parent_agent is not None:
+            parent_agent._child_agents.pop(task_id, None)
 
     if collector is not None:
         collector.notify_child_done(task_id, result)
@@ -173,6 +182,7 @@ async def _handle_spawn_task(args: Dict[str, Any], parent_agent: Any = None) -> 
         compression=_build_parent_compression(parent_agent),
         tool_progress_callback=child_cb,
         collector=parent_agent._event_collector,
+        parent_agent=parent_agent,
         home_dir=parent_agent.home_dir,
         context_length=parent_agent.context_length,
         max_tokens=getattr(parent_agent, '_max_tokens', 4096),
@@ -276,6 +286,42 @@ async def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> 
     return json.dumps(tasks, ensure_ascii=False)
 
 
+async def _handle_send_input(args: Dict[str, Any], parent_agent: Any = None) -> str:
+    """Send a message to a running child agent."""
+    target = args.get("target", "").strip()
+    message = args.get("message", "").strip()
+    interrupt = args.get("interrupt", False)
+    if not isinstance(interrupt, bool):
+        return tool_error("interrupt must be a boolean.")
+
+    if not target:
+        return tool_error("target is required for send_input.")
+    if not message:
+        return tool_error("message is required for send_input.")
+    if parent_agent is None:
+        return tool_error("send_input requires a session agent.")
+
+    child = parent_agent._child_agents.get(target)
+    if child is None:
+        return json.dumps({
+            "success": False,
+            "error": f"Agent not found: {target}. "
+                     f"Use list_tasks to see running agents.",
+        })
+
+    await child.send_message(message)
+    status = "interrupted" if interrupt else "queued"
+    logger.info(
+        "send_input: %s → %s (%s, %d chars)",
+        status, target, len(message),
+    )
+    return json.dumps({
+        "success": True,
+        "target": target,
+        "status": status,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Schemas for async sub-agent tools
 # ---------------------------------------------------------------------------
@@ -342,6 +388,42 @@ LIST_TASKS_SCHEMA: Dict[str, Any] = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+SEND_INPUT_SCHEMA: Dict[str, Any] = {
+    "name": "send_input",
+    "description": (
+        "Send a message to a running child agent spawned via spawn_task. "
+        "The message is queued on the child's inbox and will be picked up "
+        "between tool calls. When interrupt=true, the child sees the message "
+        "on its next LLM call; when interrupt=false, the child finishes its "
+        "current work first.\\n\\n"
+        "Use this when:\\n"
+        "- You discover new information the child needs mid-task\\n"
+        "- The user refines requirements while a child is working\\n"
+        "- A child's current direction needs correction"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Agent task_id (from spawn_task return value or list_tasks).",
+            },
+            "message": {
+                "type": "string",
+                "description": "Message text to send to the agent.",
+            },
+            "interrupt": {
+                "type": "boolean",
+                "description": (
+                    "When true, the child handles this message before "
+                    "continuing its current work. Default: false."
+                ),
+            },
+        },
+        "required": ["target", "message"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -354,3 +436,5 @@ registry.register(name="close_task", schema=CLOSE_TASK_SCHEMA, handler=_handle_c
                   description="Cancel a running child agent", emoji="🛑", wants_parent=True)
 registry.register(name="list_tasks", schema=LIST_TASKS_SCHEMA, handler=_handle_list_tasks,
                   description="List running/completed child agents", emoji="📋", wants_parent=True)
+registry.register(name="send_input", schema=SEND_INPUT_SCHEMA, handler=_handle_send_input,
+                  description="Send a message to a running child agent", emoji="📨", wants_parent=True)

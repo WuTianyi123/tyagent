@@ -105,7 +105,11 @@ class TyAgent:
         self._tool_progress_callback: Optional[Callable] = None
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
+        self._child_agents: Dict[str, "TyAgent"] = {}
+        """Running child agents keyed by task_id (for send_input lookup)."""
         self._event_collector: Optional[EventCollector] = None
+        # When True, _run_turn checks inbox between tool calls (child agents)
+        self._check_inbox_between_turns: bool = False
         # System prompt built once at init, then cached for prefix-cache
         # stability across turns.  Rebuilt after compaction so mid-session
         # memory writes are picked up — the cache-miss cost is negligible
@@ -458,6 +462,19 @@ class TyAgent:
         while True:
             if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
                 break
+
+            # ── Inbox check (child agents receiving send_input) ───
+            if self._check_inbox_between_turns:
+                try:
+                    inbox_msg = self._inbox.get_nowait()
+                    logger.info(
+                        "Child agent received mid-turn message (%.0f chars): %s",
+                        len(inbox_msg.text), inbox_msg.text[:60],
+                    )
+                    messages.append({"role": "user", "content": inbox_msg.text})
+                    continue  # re-enter LLM loop with new context
+                except asyncio.QueueEmpty:
+                    pass
 
             # Build api_messages: system prompt prepended at call time only.
             # messages itself NEVER contains system — compaction never touches it.

@@ -104,9 +104,106 @@ class TestBlockedTools:
     def test_list_tasks_is_blocked(self):
         assert "list_tasks" in DELEGATE_BLOCKED_TOOLS
 
+    def test_send_input_is_blocked(self):
+        assert "send_input" in DELEGATE_BLOCKED_TOOLS
+
     def test_blocked_tools_is_immutable(self):
         with pytest.raises(Exception):
             DELEGATE_BLOCKED_TOOLS.remove("memory")
+
+
+# ---------------------------------------------------------------------------
+# send_input — mid-turn messaging to child agents
+# ---------------------------------------------------------------------------
+
+
+class TestSendInput:
+    """Tests for _handle_send_input — sending messages to running children."""
+
+    @pytest.mark.asyncio
+    async def test_valid_send(self):
+        """send_input puts a message in the child's inbox."""
+        child = MagicMock(spec=TyAgent)
+        child.send_message = AsyncMock()
+        parent = _make_agent()
+        parent._child_agents = {"abc": child}
+
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"target": "abc", "message": "Hello"}, parent_agent=parent,
+        ))
+        assert result["success"] is True
+        assert result["target"] == "abc"
+        child.send_message.assert_called_once_with("Hello")
+
+    @pytest.mark.asyncio
+    async def test_interrupt_flag(self):
+        """interrupt=true is accepted and reflected in status."""
+        child = MagicMock(spec=TyAgent)
+        child.send_message = AsyncMock()
+        parent = _make_agent()
+        parent._child_agents = {"abc": child}
+
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"target": "abc", "message": "H", "interrupt": True},
+            parent_agent=parent,
+        ))
+        assert result["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_missing_target(self):
+        """Missing target yields an error."""
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"message": "Hi"}, parent_agent=_make_agent(),
+        ))
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_message(self):
+        """Missing message yields an error."""
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"target": "abc"}, parent_agent=_make_agent(),
+        ))
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_unknown_target(self):
+        """Non-existent task_id yields an error."""
+        parent = _make_agent()
+        parent._child_agents = {}
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"target": "nonexistent", "message": "Hi"},
+            parent_agent=parent,
+        ))
+        assert "error" in result
+        assert "not found" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_parent_agent(self):
+        """Missing parent_agent yields an error."""
+        from tyagent.tools.delegate_tool import _handle_send_input
+        result = json.loads(await _handle_send_input(
+            {"target": "abc", "message": "Hi"},
+        ))
+        assert "error" in result
+
+    def test_send_input_registered(self):
+        """send_input is registered as a tool."""
+        from tyagent.tools.registry import registry
+        assert "send_input" in registry.get_all_names()
+
+    def test_send_input_has_required_params(self):
+        """send_input schema has target and message as required."""
+        from tyagent.tools.registry import registry
+        schemas = registry.get_definitions(names=["send_input"])
+        assert len(schemas) == 1
+        fn = schemas[0]["function"]
+        assert "target" in fn["parameters"]["required"]
+        assert "message" in fn["parameters"]["required"]
 
 
 # ---------------------------------------------------------------------------
