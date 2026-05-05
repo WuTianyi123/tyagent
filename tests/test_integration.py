@@ -294,20 +294,3 @@ class TestChildAutoInjection:
             assert r2_output.reply_target is None  # auto-reply
 
         await agent.stop()
-
-
-class TestDelegateTaskBackwardCompat:
-    """delegate_task still works as before (spawn+wait wrapper)."""
-
-    async def test_delegate_task_produces_same_result(self):
-        """delegate_task returns flattened result like the old implementation."""
-        agent = TyAgent(model="test", api_key="k", base_url="http://x")
-
-        with patch.object(agent._client, "post") as mock_post:
-            # Mock the API responses for delegate_task being called as a tool
-            ...
-
-        # For now, just verify delegate_task is registered
-        from tyagent.tools.registry import registry
-        names = registry.get_all_names()
-        assert "delegate_task" in names

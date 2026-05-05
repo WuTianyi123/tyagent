@@ -102,7 +102,7 @@ class ToolRegistry:
         """Execute a tool handler by name.
 
         All exceptions are caught and returned as ``{"error": "..."}``.
-        Optional *parent_agent* is passed to the handler (used by delegate_task).
+        Optional *parent_agent* is passed to the handler (used by spawn_task).
         """
         with self._lock:
             entry = self._tools.get(name)

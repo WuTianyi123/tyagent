@@ -2,7 +2,7 @@
 
 Each child agent gets:
   - A fresh conversation (no parent history)
-  - A restricted toolset (blocked: delegate_task, memory)
+  - A restricted toolset (blocked: spawn_task, wait_task, close_task, list_tasks, memory)
   - Summary-only result (no intermediate tool calls in parent context)
 """
 
@@ -23,10 +23,10 @@ from tyagent.tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 # Tools that children must never have access to:
-# - delegate_task: no recursive delegation
+# - All spawn/wait/close/list tools: no recursive sub-agent management
 # - memory: no cross-session writes to shared memory
 DELEGATE_BLOCKED_TOOLS = frozenset(
-    ["delegate_task", "spawn_task", "wait_task", "close_task", "list_tasks", "memory"]
+    ["spawn_task", "wait_task", "close_task", "list_tasks", "memory"]
 )
 
 DEFAULT_SUBAGENT_MAX_TOOL_TURNS = 30
@@ -276,84 +276,6 @@ async def _handle_list_tasks(args: Dict[str, Any], parent_agent: Any = None) -> 
     return json.dumps(tasks, ensure_ascii=False)
 
 
-async def _handle_delegate_task(args: Dict[str, Any], parent_agent: Any = None) -> str:
-    """Convenience wrapper: spawn_task + immediate wait_task, flattened result.
-
-    Kept for backward compatibility. Equivalent to the original blocking
-    delegate_task behavior but uses the new async sub-agent infrastructure.
-    """
-    # Validation is delegated to _handle_spawn_task to avoid duplication.
-    # Build spawn_args from delegate_task's argument set.
-    spawn_args: Dict[str, Any] = {"goal": args.get("goal", "")}
-    if "context" in args:
-        spawn_args["context"] = args["context"]
-    if "toolsets" in args:
-        spawn_args["toolsets"] = args["toolsets"]
-    if "max_tool_turns" in args:
-        spawn_args["max_tool_turns"] = args["max_tool_turns"]
-
-    spawn_result = json.loads(
-        await _handle_spawn_task(spawn_args, parent_agent=parent_agent)
-    )
-    if "error" in spawn_result:
-        return json.dumps(spawn_result, ensure_ascii=False)
-
-    task_id = spawn_result["task_id"]
-
-    # Immediately wait
-    wait_result = json.loads(
-        await _handle_wait_task({"task_ids": [task_id]}, parent_agent=parent_agent)
-    )
-
-    # Flatten: delegate_task returns one result dict, not {task_id: result}
-    single = wait_result.get(task_id, {"error": "Unknown error"})
-    return json.dumps(single, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-
-DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
-    "name": "delegate_task",
-    "description": (
-        "Spawn a child agent to work on a task in isolated context. "
-        "The child gets a fresh conversation, a restricted toolset (no "
-        "delegate_task / memory), and returns a summary only — "
-        "intermediate tool calls never enter your context window.\n\n"
-        "Use this when:\n"
-        "- A subtask would flood your context with intermediate data\n"
-        "- You need researched synthesis, code review, or debugging\n"
-        "- A reasoning-heavy task would benefit from focused attention\n\n"
-        "Do NOT use for single tool calls — just call the tool directly."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "goal": {
-                "type": "string",
-                "description": "What the child should accomplish. Be specific and self-contained.",
-            },
-            "context": {
-                "type": "string",
-                "description": "Optional background info the child needs (file paths, constraints).",
-            },
-            "toolsets": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional list of tool names the child can use. Default: all non-blocked parent tools.",
-            },
-            "max_tool_turns": {
-                "type": "integer",
-                "description": f"Max tool-calling turns for the child (default: {DEFAULT_SUBAGENT_MAX_TOOL_TURNS}).",
-                "minimum": 1,
-                "maximum": 200,
-            },
-        },
-        "required": ["goal"],
-    },
-}
-
 # ---------------------------------------------------------------------------
 # Schemas for async sub-agent tools
 # ---------------------------------------------------------------------------
@@ -424,7 +346,6 @@ LIST_TASKS_SCHEMA: Dict[str, Any] = {
 # Registration
 # ---------------------------------------------------------------------------
 
-# Register four new async sub-agent tools
 registry.register(name="spawn_task", schema=SPAWN_TASK_SCHEMA, handler=_handle_spawn_task,
                   description="Launch a child agent in background (non-blocking)", emoji="🚀", wants_parent=True)
 registry.register(name="wait_task", schema=WAIT_TASK_SCHEMA, handler=_handle_wait_task,
@@ -433,12 +354,3 @@ registry.register(name="close_task", schema=CLOSE_TASK_SCHEMA, handler=_handle_c
                   description="Cancel a running child agent", emoji="🛑", wants_parent=True)
 registry.register(name="list_tasks", schema=LIST_TASKS_SCHEMA, handler=_handle_list_tasks,
                   description="List running/completed child agents", emoji="📋", wants_parent=True)
-
-registry.register(
-    name="delegate_task",
-    schema=DELEGATE_TASK_SCHEMA,
-    handler=_handle_delegate_task,
-    description="Spawn a child agent with restricted tools and isolated context",
-    emoji="📤",
-    wants_parent=True,
-)
