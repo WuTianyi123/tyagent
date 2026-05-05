@@ -52,15 +52,19 @@ class TestSchemaToDefaults:
     """Converting schemas to default-values dicts."""
 
     def test_flat_schema(self) -> None:
-        """Flat schema with simple fields."""
+        """Flat schema with simple fields — str None defaults become ''."""
         schema: SchemaDict = {
             "enabled": ConfigField(bool, default=False),
             "name": ConfigField(str, default="bot"),
             "count": ConfigField(int, default=42),
-            "nullable": ConfigField(),
+            "nullable": ConfigField(),  # type=None → stays None
+            "unset_str": ConfigField(str),  # type=str, default=None → ''
         }
         result = schema_to_defaults(schema)
-        assert result == {"enabled": False, "name": "bot", "count": 42, "nullable": None}
+        assert result == {
+            "enabled": False, "name": "bot", "count": 42,
+            "nullable": None, "unset_str": "",
+        }
 
     def test_nested_schema(self) -> None:
         """Nested schema mirrors config structure."""
@@ -74,10 +78,10 @@ class TestSchemaToDefaults:
         result = schema_to_defaults(schema)
         assert result == {"enabled": False, "extra": {"key1": "v1", "key2": 0}}
 
-    def test_none_default_becomes_none(self) -> None:
-        """Explicit None default stays None (not empty string)."""
+    def test_str_none_default_becomes_empty(self) -> None:
+        """Explicit None default for str-typed field becomes '' for YAML readability."""
         schema: SchemaDict = {"field": ConfigField(str, default=None)}
-        assert schema_to_defaults(schema) == {"field": None}
+        assert schema_to_defaults(schema) == {"field": ""}
 
     def test_empty_schema(self) -> None:
         assert schema_to_defaults({}) == {}

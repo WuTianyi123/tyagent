@@ -73,15 +73,24 @@ SchemaDict = Dict[str, Union[ConfigField, "SchemaDict"]]
 def schema_to_defaults(schema: SchemaDict) -> Dict[str, Any]:
     """Convert a schema definition into a plain defaults dict.
 
-    ``ConfigField`` leaves become their ``.default`` value (``None`` when
-    default is ``None``).  Nested dicts are recursed.  The result mirrors
-    the config structure exactly so it can be passed to
+    ``ConfigField`` leaves become their ``.default`` value.  For str-typed
+    fields with ``None`` default, ``""`` is used instead — this ensures they
+    render as ``''`` in YAML rather than ``~``, which is more intuitive
+    (\"this field is intentionally empty\").  Nested dicts are recursed.
+
+    The result mirrors the config structure exactly so it can be passed to
     ``_deep_merge_defaults()``.
     """
     result: Dict[str, Any] = {}
     for key, field in schema.items():
         if isinstance(field, ConfigField):
-            result[key] = field.default if field.default is not None else None
+            val = field.default if field.default is not None else None
+            # Display str fields with None default as "" (→ '' in YAML)
+            # rather than None (→ ~ in YAML).  Non-string fields where None
+            # carries semantic meaning (auto-detect, unset) keep ~.
+            if val is None and field.type is str:
+                val = ""
+            result[key] = val
         elif isinstance(field, dict):
             result[key] = schema_to_defaults(field)
         else:

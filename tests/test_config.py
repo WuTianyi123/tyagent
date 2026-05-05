@@ -688,7 +688,7 @@ class TestPlatformSchemaDiscovery:
         extra = feishu["extra"]
         # Connection group
         assert "connection" in extra
-        assert extra["connection"]["app_id"] is None
+        assert extra["connection"]["app_id"] == ""  # str-typed None → ''
         assert extra["connection"]["domain"] == "feishu"
         # Event subscription group
         assert "event_subscription" in extra
@@ -782,7 +782,7 @@ class TestPlatformSchemaDiscovery:
         assert "feishu" in raw_user["platforms"]
         assert raw_user["platforms"]["feishu"]["enabled"] is False
         assert "connection" in raw_user["platforms"]["feishu"]["extra"]
-        assert raw_user["platforms"]["feishu"]["extra"]["connection"]["app_id"] is None
+        assert raw_user["platforms"]["feishu"]["extra"]["connection"]["app_id"] == ""
 
     def test_migrate_flat_to_grouped(self) -> None:
         """_migrate_platform_extra restructures old flat extra keys."""
