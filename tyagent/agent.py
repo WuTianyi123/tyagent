@@ -641,31 +641,43 @@ class TyAgent:
                         break
                 break
 
-            # Inject child completions (auto-replies have no reply_target)
+            # ── Child completion notifications ─────────────────
+            # Injected into _messages but do NOT trigger a turn.
+            # They queue naturally; the next user-initiated turn
+            # will include them in context.
+            child_events = []
             if self._event_collector is not None:
                 child_events = self._event_collector.drain_completed()
-                for event in child_events:
-                    summary = event["result"].get("summary", "")
-                    if summary:
-                        inject = f"## Subagent `{event['task_id']}` completed\n\n{summary}"
-                    elif event["result"].get("success"):
-                        inject = f"## Subagent `{event['task_id']}` completed successfully"
-                    else:
-                        inject = f"## Subagent `{event['task_id']}` failed\n\n{event['result'].get('error', 'Unknown')}"
-                    self._messages.append({"role": "user", "content": inject})
+            for event in child_events:
+                task_id = event["task_id"]
+                result = event["result"]
+                summary = result.get("summary", "")
+                if summary:
+                    text = f"（子代理完成）任务 {task_id}:\n\n{summary}"
+                elif result.get("success"):
+                    text = f"（子代理完成）任务 {task_id} 已成功结束"
+                else:
+                    text = f"（子代理完成）任务 {task_id} 失败:\n\n{result.get('error', '未知错误')}"
+                self._messages.append({"role": "user", "content": text})
 
-            # Process user message
+            # ── Process user message ───────────────────────────
+            has_user_message = inbox_task in done
             current_reply = None
             current_tool_cb = None
             current_turn_done = None
-            if inbox_task in done:
+            if has_user_message:
                 msg = inbox_task.result()
                 self._messages.append({"role": "user", "content": msg.text})
                 current_reply = msg.reply_target
                 current_tool_cb = msg.tool_progress_cb
                 current_turn_done = msg.turn_done_cb
 
-            # Run turn with error handling
+            if not has_user_message:
+                # No user message — only child notifications arrived.
+                # Skip LLM call and loop back to select!.
+                continue
+
+            # ── Run turn with error handling ───────────────────
             tools = registry.get_definitions()
             prev_tool_cb = self._tool_progress_callback
             self._tool_progress_callback = current_tool_cb

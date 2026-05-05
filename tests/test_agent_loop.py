@@ -100,8 +100,8 @@ class TestAgentLoop:
 
         await agent.stop()
 
-    async def test_agent_loop_child_completion_triggers_turn(self):
-        """Child completion injected via collector triggers a turn."""
+    async def test_agent_loop_child_completion_queues_silently(self):
+        """Child completion queues in _messages but does NOT trigger a turn."""
         agent = TyAgent(model="test", api_key="k", base_url="http://x")
         agent._event_collector = EventCollector()
 
@@ -120,9 +120,17 @@ class TestAgentLoop:
 
         with patch.object(agent._client, "post", AsyncMock(return_value=mock_response)):
             await agent.start()
+            # Wait briefly — no output should appear because child completion
+            # does NOT trigger a turn
+            await asyncio.sleep(0.2)
+            assert agent._output_queue.empty(), "Child completion should not trigger output"
+            # Verify the notification was queued in _messages
+            assert any("子代理完成" in m["content"] for m in agent._messages)
+
+            # Now send a real user message — this should trigger output
+            await agent.send_message("continue")
             output = await agent._output_queue.get()
             assert output.text == "Based on research: ..."
-            assert output.reply_target is None  # auto-reply
 
         await agent.stop()
 

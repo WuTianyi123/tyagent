@@ -134,7 +134,7 @@ class TestSendInput:
         ))
         assert result["success"] is True
         assert result["target"] == "abc"
-        child.send_message.assert_called_once_with("Hello")
+        child.send_message.assert_called_once_with("（来自主代理的指导）Hello")
 
     @pytest.mark.asyncio
     async def test_interrupt_flag(self):

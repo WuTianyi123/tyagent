@@ -281,16 +281,20 @@ class TestChildAutoInjection:
 
             asyncio.ensure_future(child_completes())
 
-            # First send_message should get the initial response,
-            # then child completion triggers another turn whose output
-            # goes to _output_queue as a second message
+            # First send_message should get the initial response.
+            # Child completion queues silently — no second output.
             await agent.send_message("research climate change")
             r1_output = await agent._output_queue.get()
             assert r1_output.text == "Waiting for research..."
 
-            # Second output from child completion
-            r2_output = await agent._output_queue.get()
-            assert r2_output.text == "Research complete! Found 3 papers."
-            assert r2_output.reply_target is None  # auto-reply
+            # Yield to let _agent_loop process the collector event
+            # (child_completes fires after 0.05s)
+            await asyncio.sleep(0.15)
+
+            # Verify child completion was queued in _messages
+            assert any("子代理完成" in m["content"] for m in agent._messages)
+            assert any("climate" in m["content"] for m in agent._messages)
+            # _output_queue has no second message
+            assert agent._output_queue.empty()
 
         await agent.stop()

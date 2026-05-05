@@ -309,7 +309,7 @@ async def _handle_send_input(args: Dict[str, Any], parent_agent: Any = None) -> 
                      f"Use list_tasks to see running agents.",
         })
 
-    await child.send_message(message)
+    await child.send_message(f"（来自主代理的指导）{message}")
     status = "interrupted" if interrupt else "queued"
     logger.info(
         "send_input: %s → %s (%s, %d chars)",
