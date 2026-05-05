@@ -672,11 +672,6 @@ class TyAgent:
                 current_tool_cb = msg.tool_progress_cb
                 current_turn_done = msg.turn_done_cb
 
-            if not has_user_message:
-                # No user message — only child notifications arrived.
-                # Skip LLM call and loop back to select!.
-                continue
-
             # ── Run turn with error handling ───────────────────
             tools = registry.get_definitions()
             prev_tool_cb = self._tool_progress_callback
