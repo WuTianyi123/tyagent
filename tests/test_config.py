@@ -668,3 +668,102 @@ class TestLoadConfigProfile:
         # With explicit path, load_config ignores profile
         cfg = load_config(config_path=explicit, profile="mytest")
         assert cfg.agent.model == "explicit-model"
+
+
+# ── Platform schema discovery ──────────────────────────────────────────────────
+
+
+class TestPlatformSchemaDiscovery:
+    """Platform schema auto-discovery and config merging."""
+
+    def test_discover_returns_feishu_skeleton(self) -> None:
+        """_discover_platform_schemas returns feishu with defaults."""
+        from tyagent.config import _discover_platform_schemas
+
+        schemas = _discover_platform_schemas()
+        assert "feishu" in schemas
+        feishu = schemas["feishu"]
+        assert feishu["enabled"] is False
+        assert "extra" in feishu
+        assert feishu["extra"]["app_id"] is None
+        assert feishu["extra"]["domain"] == "feishu"
+        assert feishu["extra"]["group_policy"] == "mention"
+
+    def test_platform_defaults_merged_into_config(self, monkeypatch, tmp_path) -> None:
+        """load_config adds platform skeletons to config.yaml."""
+        import tyagent.config as cfg_mod
+
+        tyagent_root = tmp_path / ".tyagent"
+        monkeypatch.setattr(cfg_mod, "_usr_home", tmp_path)
+        monkeypatch.setattr(cfg_mod, "default_home", tyagent_root / "tyagent")
+
+        profile_dir = tyagent_root / "tyagent"
+        profile_dir.mkdir(parents=True)
+        # Minimal config — no platforms section at all
+        (profile_dir / "config.yaml").write_text("agent:\n  model: test-model\n")
+
+        cfg = load_config()
+        assert cfg.agent.model == "test-model"
+
+        # The config.yaml should now have platform skeletons
+        written = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert "platforms" in written
+        assert "feishu" in written["platforms"]
+
+    def test_existing_platform_config_not_overwritten(self, monkeypatch, tmp_path) -> None:
+        """User's existing platform config is preserved after merge."""
+        import tyagent.config as cfg_mod
+
+        tyagent_root = tmp_path / ".tyagent"
+        monkeypatch.setattr(cfg_mod, "_usr_home", tmp_path)
+        monkeypatch.setattr(cfg_mod, "default_home", tyagent_root / "tyagent")
+
+        profile_dir = tyagent_root / "tyagent"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text(
+            "platforms:\n"
+            "  feishu:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      app_id: my-app\n"
+            "      domain: lark\n"
+        )
+
+        cfg = load_config()
+        written = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        feishu = written["platforms"]["feishu"]
+        assert feishu["enabled"] is True  # User's value preserved
+        assert feishu["extra"]["app_id"] == "my-app"
+        assert feishu["extra"]["domain"] == "lark"
+
+    def test_no_config_file_uses_defaults(self, monkeypatch, tmp_path) -> None:
+        """When no config.yaml exists, defaults include platform skeletons."""
+        import tyagent.config as cfg_mod
+
+        tyagent_root = tmp_path / ".tyagent"
+        monkeypatch.setattr(cfg_mod, "_usr_home", tmp_path)
+        monkeypatch.setattr(cfg_mod, "default_home", tyagent_root / "tyagent")
+
+        # No config file at all — should use defaults
+        cfg = cfg_mod.TyAgentConfig()
+        assert cfg.platforms == {}  # Default TyAgentConfig has empty platforms
+
+    def test_merge_defaults_with_empty_platforms(self, monkeypatch, tmp_path) -> None:
+        """_deep_merge_defaults can handle EMPTY platforms section."""
+        import tyagent.config as cfg_mod
+
+        from tyagent.config import _deep_merge_defaults, _discover_platform_schemas
+
+        raw_user = {}
+        full_defaults = dict(cfg_mod.DEFAULT_CONFIG)
+        platform_defaults = _discover_platform_schemas()
+        if platform_defaults:
+            full_defaults["platforms"] = {
+                **full_defaults.get("platforms", {}),
+                **platform_defaults,
+            }
+        changed = _deep_merge_defaults(raw_user, full_defaults)
+        assert changed
+        assert "platforms" in raw_user
+        assert "feishu" in raw_user["platforms"]
+        assert raw_user["platforms"]["feishu"]["enabled"] is False

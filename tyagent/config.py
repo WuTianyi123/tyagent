@@ -59,6 +59,12 @@ def _deep_merge_defaults(user: Dict[str, Any], defaults: Dict[str, Any]) -> bool
 
     Returns True if any key was added (caller should re-save config.yaml).
     Never overwrites an existing user value — only fills absent keys.
+
+    Special handling for ``platforms``: each known platform adapter provides
+    a schema skeleton via ``_discover_platform_schemas()``.  When *defaults*
+    includes ``platforms``, the merge fills in skeleton entries for any
+    platform NOT already in the user config — meaning ``config.yaml``
+    auto-populates with all supported platforms and their defaults.
     """
     changed = False
     for key, default_val in defaults.items():
@@ -350,6 +356,64 @@ def _migrate_api_key_to_env(raw: Dict[str, Any], profile_dir: Path) -> bool:
     return True
 
 
+# ── Platform schema auto-discovery ────────────────────────────────────────────
+
+
+def _discover_platform_schemas() -> Dict[str, Any]:
+    """Discover all registered platform adapters and return their schema defaults.
+
+    Scans ``tyagent.platforms.*`` modules, triggers ``__init_subclass__``
+    registration in ``BasePlatformAdapter``, then collects each adapter's
+    ``config_schema`` and converts it to a defaults dict via
+    ``schema_to_defaults()``.
+
+    Returns a dict like ``{"feishu": {"enabled": False, "extra": {...}}, ...}``
+    suitable for merging into the full defaults dict in ``load_config()``.
+    """
+    from tyagent.config_field import schema_to_defaults
+    from tyagent.platforms.base import BasePlatformAdapter
+
+    registry = BasePlatformAdapter.get_registry()
+    platforms: Dict[str, Any] = {}
+    for name, adapter_cls in registry.items():
+        schema = getattr(adapter_cls, "config_schema", None)
+        if schema:
+            platforms[name] = schema_to_defaults(schema)
+        else:
+            platforms[name] = {"enabled": False}
+    return platforms
+
+
+def _validate_platform_configs(raw: Dict[str, Any]) -> None:
+    """Validate each platform section against its adapter's schema.
+
+    Errors are logged as warnings at startup — never fatal.  Users can still
+    start with partial or slightly misconfigured platforms.
+    """
+    from tyagent.config_field import validate_config
+    from tyagent.platforms.base import BasePlatformAdapter
+
+    registry = BasePlatformAdapter.get_registry()
+    platforms_raw = raw.get("platforms", {})
+    if not isinstance(platforms_raw, dict):
+        return
+
+    for name, platform_raw in platforms_raw.items():
+        if not isinstance(platform_raw, dict):
+            continue
+        adapter_cls = registry.get(name)
+        if adapter_cls is None:
+            logger.debug("No adapter registered for platform %r — skipping validation", name)
+            continue
+        schema = getattr(adapter_cls, "config_schema", None)
+        if not schema:
+            continue
+
+        errors = validate_config(schema, platform_raw)
+        for err in errors:
+            logger.warning("Config validation [%s]: %s", name, err)
+
+
 def load_config(config_path: Optional[Path] = None, profile: Optional[str] = None) -> TyAgentConfig:
     """Load tyagent configuration.
 
@@ -381,9 +445,19 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
         if _migrate_api_key_to_env(raw, profile_dir):
             _yaml_dump(raw, yaml_path)
             logger.info("Migrated api_key to .env")
-        if _deep_merge_defaults(raw, DEFAULT_CONFIG):
+        # ── Discover platform schemas and build full defaults ──
+        platform_defaults = _discover_platform_schemas()
+        full_defaults = dict(DEFAULT_CONFIG)
+        if platform_defaults:
+            full_defaults["platforms"] = {
+                **full_defaults.get("platforms", {}),
+                **platform_defaults,
+            }
+        if _deep_merge_defaults(raw, full_defaults):
             _yaml_dump(raw, yaml_path)
-            logger.info("Config schema updated with new defaults.")
+            logger.info("Config schema updated with new platform defaults.")
+        # ── Validate platform configs ──────────────────────────
+        _validate_platform_configs(raw)
         cfg = TyAgentConfig.from_dict(raw)
         # Override home_dir / sessions_dir to use the actual profile
         # directory, not whatever is stored in the config file.

@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from tyagent.config import default_home
+from tyagent.config_field import ConfigField
 from tyagent.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
@@ -601,6 +602,24 @@ def _resolve_extension(
 
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark platform adapter."""
+
+    config_schema = {
+        "enabled": ConfigField(bool, default=False, doc="启用飞书平台"),
+        "extra": {
+            "app_id": ConfigField(str, required=True, doc="飞书开放平台应用的 App ID"),
+            "app_secret": ConfigField(str, required=True, secret=True,
+                                       doc="飞书开放平台应用的 App Secret"),
+            "domain": ConfigField(str, default="feishu", choices=["feishu", "lark"],
+                                  doc="API 域名（feishu=国内, lark=海外）"),
+            "encrypt_key": ConfigField(str, default="",
+                                       doc="飞书事件订阅的加密密钥（不需要则留空）"),
+            "verification_token": ConfigField(str, default="",
+                                              doc="飞书事件订阅的验证令牌（不需要则留空）"),
+            "group_policy": ConfigField(str, default="mention",
+                                        choices=["open", "mention", "disabled"],
+                                        doc="群聊消息处理策略（open=全部, mention=仅@, disabled=关闭）"),
+        },
+    }
 
     def __init__(self, config: Any, home_dir: Optional[Path] = None):
         super().__init__(config, "feishu", home_dir=home_dir)

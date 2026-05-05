@@ -92,9 +92,97 @@ class BasePlatformAdapter(ABC):
     - Connecting and authenticating
     - Receiving messages
     - Sending messages/responses
+
+    Auto-registration
+    -----------------
+    Every subclass is registered in ``_registry`` via ``__init_subclass__``,
+    keyed by ``platform_name`` or a lowercase derivation of the class name.
+    The registry is used by ``config.load_config()`` to discover platform
+    config schemas and validate user config at startup.
+
+    Config schema
+    -------------
+    Subclasses should declare ``config_schema`` — a nested dict whose
+    structure mirrors the platform's section in config.yaml.  Leaf values
+    are ``ConfigField`` instances (from ``tyagent.config_field``).  See
+    ``tyagent.platforms.feishu.FeishuAdapter`` for a worked example.
     """
 
+    _registry: Dict[str, type] = {}
+    """Auto-populated mapping of platform name → adapter class."""
+
+    config_schema: Dict[str, Any] = {}
+    """Schema dict for this platform's config section.  Override in subclasses."""
+
     MAX_MESSAGE_LENGTH: int = 4096
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Auto-register every concrete adapter in ``_registry``."""
+        super().__init_subclass__(**kwargs)
+        if cls is BasePlatformAdapter or not hasattr(cls, "__abstractmethods__"):
+            # Concrete subclasses only — skip ABC bases
+            name = getattr(cls, "platform_name", None)
+            if not name:
+                # Derive from class name: FeishuAdapter → feishu
+                name = cls.__name__.lower().replace("adapter", "").strip("_")
+            cls._registry[name] = cls
+
+    @classmethod
+    def get_registry(cls) -> Dict[str, type]:
+        """Return the adapter registry, lazily importing all platform modules.
+
+        Safe to call at startup — imports ``tyagent.platforms.*`` to ensure
+        all adapters have fired ``__init_subclass__``.
+        """
+        import importlib
+        import pkgutil
+
+        try:
+            import tyagent.platforms as _platforms_pkg
+        except ImportError:
+            return dict(cls._registry)
+
+        for _importer, modname, _ispkg in pkgutil.iter_modules(
+            _platforms_pkg.__path__
+        ):
+            if modname.startswith("_") or modname == "base":
+                continue
+            try:
+                importlib.import_module(f"tyagent.platforms.{modname}")
+            except ImportError:
+                continue  # Skip platforms with missing dependencies
+
+        return dict(cls._registry)
+
+    @classmethod
+    def _clear_registry(cls) -> None:
+        """Clear the adapter registry (useful for test isolation)."""
+        cls._registry.clear()
+
+    @classmethod
+    def validate_platform_config(cls, config_obj: Any) -> List[str]:
+        """Validate a ``PlatformConfig`` against this adapter's schema.
+
+        Returns a list of error strings (empty = valid).
+        """
+        from tyagent.config_field import validate_config
+
+        schema = cls.config_schema
+        if not schema:
+            return []
+
+        cfg_dict: Dict[str, Any] = {"enabled": getattr(config_obj, "enabled", False)}
+        token = getattr(config_obj, "token", None)
+        if token:
+            cfg_dict["token"] = token
+        api_key = getattr(config_obj, "api_key", None)
+        if api_key:
+            cfg_dict["api_key"] = api_key
+        extra = getattr(config_obj, "extra", {})
+        if isinstance(extra, dict) and extra:
+            cfg_dict["extra"] = dict(extra)
+
+        return validate_config(schema, cfg_dict)
 
     def __init__(self, config: Any, platform_name: str, *, home_dir: Optional[Path] = None):
         self.config = config
