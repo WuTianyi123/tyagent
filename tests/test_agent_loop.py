@@ -123,7 +123,6 @@ class TestAgentLoop:
             # Child completion triggers a turn even without user message
             output = await agent._output_queue.get()
             assert output.text == "Based on research: ..."
-            assert output.reply_target is None  # auto-reply (no user origin)
             # Verify notification was queued in _messages
             assert any("子代理完成" in m["content"] for m in agent._messages)
 

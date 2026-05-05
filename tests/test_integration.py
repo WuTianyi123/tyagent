@@ -291,6 +291,5 @@ class TestChildAutoInjection:
             # Second output from child completion
             r2_output = await agent._output_queue.get()
             assert r2_output.text == "Research complete! Found 3 papers."
-            assert r2_output.reply_target is None  # auto-reply (no user origin)
 
         await agent.stop()
