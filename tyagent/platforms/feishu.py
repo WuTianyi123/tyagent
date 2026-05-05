@@ -606,18 +606,24 @@ class FeishuAdapter(BasePlatformAdapter):
     config_schema = {
         "enabled": ConfigField(bool, default=False, doc="启用飞书平台"),
         "extra": {
-            "app_id": ConfigField(str, required=True, doc="飞书开放平台应用的 App ID"),
-            "app_secret": ConfigField(str, required=True, secret=True,
-                                       doc="飞书开放平台应用的 App Secret"),
-            "domain": ConfigField(str, default="feishu", choices=["feishu", "lark"],
-                                  doc="API 域名（feishu=国内, lark=海外）"),
-            "encrypt_key": ConfigField(str, default="",
-                                       doc="飞书事件订阅的加密密钥（不需要则留空）"),
-            "verification_token": ConfigField(str, default="",
-                                              doc="飞书事件订阅的验证令牌（不需要则留空）"),
-            "group_policy": ConfigField(str, default="mention",
-                                        choices=["open", "mention", "disabled"],
-                                        doc="群聊消息处理策略（open=全部, mention=仅@, disabled=关闭）"),
+            "connection": {
+                "app_id": ConfigField(str, required=True, doc="飞书开放平台应用的 App ID"),
+                "app_secret": ConfigField(str, required=True, secret=True,
+                                           doc="飞书开放平台应用的 App Secret"),
+                "domain": ConfigField(str, default="feishu", choices=["feishu", "lark"],
+                                      doc="API 域名（feishu=国内, lark=海外）"),
+            },
+            "event_subscription": {
+                "encrypt_key": ConfigField(str, default="",
+                                           doc="飞书事件订阅的加密密钥（不需要则留空）"),
+                "verification_token": ConfigField(str, default="",
+                                                  doc="飞书事件订阅的验证令牌（不需要则留空）"),
+            },
+            "behavior": {
+                "group_policy": ConfigField(str, default="mention",
+                                            choices=["open", "mention", "disabled"],
+                                            doc="群聊消息处理策略（open=全部, mention=仅@, disabled=关闭）"),
+            },
         },
     }
 
@@ -629,12 +635,30 @@ class FeishuAdapter(BasePlatformAdapter):
                 "Install it with: uv add lark-oapi"
             )
 
-        self.app_id: str = config.extra.get("app_id", "")
-        self.app_secret: str = config.extra.get("app_secret", "")
-        self.domain: str = config.extra.get("domain", "feishu")
-        self.encrypt_key: str = config.extra.get("encrypt_key", "")
-        self.verification_token: str = config.extra.get("verification_token", "")
-        self.group_policy: str = config.extra.get("group_policy", "mention")  # "open" | "mention" | "disabled"
+        self.app_id: str = (
+            (config.extra.get("connection", {}) or {}).get("app_id", "")
+            or config.extra.get("app_id", "")
+        )
+        self.app_secret: str = (
+            (config.extra.get("connection", {}) or {}).get("app_secret", "")
+            or config.extra.get("app_secret", "")
+        )
+        self.domain: str = (
+            (config.extra.get("connection", {}) or {}).get("domain", "feishu")
+            or config.extra.get("domain", "feishu")
+        )
+        self.encrypt_key: str = (
+            (config.extra.get("event_subscription", {}) or {}).get("encrypt_key", "")
+            or config.extra.get("encrypt_key", "")
+        )
+        self.verification_token: str = (
+            (config.extra.get("event_subscription", {}) or {}).get("verification_token", "")
+            or config.extra.get("verification_token", "")
+        )
+        self.group_policy: str = (
+            (config.extra.get("behavior", {}) or {}).get("group_policy", "mention")
+            or config.extra.get("group_policy", "mention")
+        )  # "open" | "mention" | "disabled"
 
         if not self.app_id or not self.app_secret:
             raise ValueError("Feishu adapter requires app_id and app_secret in config.extra")

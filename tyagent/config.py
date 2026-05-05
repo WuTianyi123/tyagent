@@ -356,6 +356,106 @@ def _migrate_api_key_to_env(raw: Dict[str, Any], profile_dir: Path) -> bool:
     return True
 
 
+# ── Platform config migration ──────────────────────────────────────────────────
+
+
+_FLAT_TO_GROUPED_FIELDS: Dict[str, str] = {
+    # ``extra`` key → target sub-group key
+    "app_id": "connection",
+    "app_secret": "connection",
+    "domain": "connection",
+    "encrypt_key": "event_subscription",
+    "verification_token": "event_subscription",
+    "group_policy": "behavior",
+}
+"""Maps old flat ``extra.*`` keys to their new sub-group names.
+
+Used by ``_migrate_platform_extra()`` to restructure platform config sections
+from flat to grouped layout.  Defined as a module-level constant so it's
+visible and testable without importing feishu-specific modules.
+"""
+
+
+def _migrate_platform_extra(raw: Dict[str, Any], platform: str = "feishu") -> bool:
+    """Migrate old flat ``extra.*`` → grouped ``extra.{group}.*`` in *platform*'s config.
+
+    The old schema had all fields flat inside ``extra``::
+
+        platforms:
+          feishu:
+            extra:
+              app_id: ...
+              app_secret: ...
+              domain: feishu
+              encrypt_key: ''
+              verification_token: ''
+              group_policy: mention
+
+    The new schema groups them by concern::
+
+        platforms:
+          feishu:
+            extra:
+              connection:
+                app_id: ...
+                app_secret: ...
+                domain: feishu
+              event_subscription:
+                encrypt_key: ...
+                verification_token: ...
+              behavior:
+                group_policy: mention
+
+    Returns ``True`` if any migration was performed (caller should re-save).
+    After migration the old flat keys are removed from ``extra``.
+    """
+    platforms_raw = raw.get("platforms", {})
+    if not isinstance(platforms_raw, dict):
+        return False
+
+    plat_raw = platforms_raw.get(platform)
+    if not isinstance(plat_raw, dict):
+        return False
+
+    extra = plat_raw.get("extra", {})
+    if not isinstance(extra, dict):
+        return False
+
+    # Detect old flat layout: any known flat key directly in extra
+    flat_keys_present = [k for k in _FLAT_TO_GROUPED_FIELDS if k in extra]
+    if not flat_keys_present:
+        return False
+
+    changed = False
+
+    # Group flat keys into their target sub-groups
+    groups: Dict[str, Dict[str, Any]] = {}
+    for flat_key in flat_keys_present:
+        group = _FLAT_TO_GROUPED_FIELDS[flat_key]
+        if group not in groups:
+            groups[group] = {}
+        groups[group][flat_key] = extra[flat_key]
+
+    for group_name, group_fields in groups.items():
+        existing_group = extra.get(group_name)
+        if isinstance(existing_group, dict):
+            # Don't overwrite existing sub-group values — only add missing
+            for k, v in group_fields.items():
+                if k not in existing_group:
+                    existing_group[k] = v
+                    changed = True
+        else:
+            extra[group_name] = group_fields
+            changed = True
+
+    # Remove old flat keys
+    for flat_key in flat_keys_present:
+        del extra[flat_key]
+        changed = True
+
+    return changed
+
+
 # ── Platform schema auto-discovery ────────────────────────────────────────────
 
 
@@ -445,6 +545,10 @@ def load_config(config_path: Optional[Path] = None, profile: Optional[str] = Non
         if _migrate_api_key_to_env(raw, profile_dir):
             _yaml_dump(raw, yaml_path)
             logger.info("Migrated api_key to .env")
+        # ── Migrate old flat platform config to grouped layout ──
+        if _migrate_platform_extra(raw):
+            _yaml_dump(raw, yaml_path)
+            logger.info("Migrated platform config to grouped layout.")
         # ── Discover platform schemas and build full defaults ──
         platform_defaults = _discover_platform_schemas()
         full_defaults = dict(DEFAULT_CONFIG)

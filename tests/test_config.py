@@ -685,9 +685,22 @@ class TestPlatformSchemaDiscovery:
         feishu = schemas["feishu"]
         assert feishu["enabled"] is False
         assert "extra" in feishu
-        assert feishu["extra"]["app_id"] is None
-        assert feishu["extra"]["domain"] == "feishu"
-        assert feishu["extra"]["group_policy"] == "mention"
+        extra = feishu["extra"]
+        # Connection group
+        assert "connection" in extra
+        assert extra["connection"]["app_id"] is None
+        assert extra["connection"]["domain"] == "feishu"
+        # Event subscription group
+        assert "event_subscription" in extra
+        assert extra["event_subscription"]["encrypt_key"] == ""
+        assert extra["event_subscription"]["verification_token"] == ""
+        # Behavior group
+        assert "behavior" in extra
+        assert extra["behavior"]["group_policy"] == "mention"
+        # Old flat keys should NOT be present
+        assert "app_id" not in extra
+        assert "encrypt_key" not in extra
+        assert "group_policy" not in extra
 
     def test_platform_defaults_merged_into_config(self, monkeypatch, tmp_path) -> None:
         """load_config adds platform skeletons to config.yaml."""
@@ -725,16 +738,17 @@ class TestPlatformSchemaDiscovery:
             "  feishu:\n"
             "    enabled: true\n"
             "    extra:\n"
-            "      app_id: my-app\n"
-            "      domain: lark\n"
+            "      connection:\n"
+            "        app_id: my-app\n"
+            "        domain: lark\n"
         )
 
         cfg = load_config()
         written = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
         feishu = written["platforms"]["feishu"]
         assert feishu["enabled"] is True  # User's value preserved
-        assert feishu["extra"]["app_id"] == "my-app"
-        assert feishu["extra"]["domain"] == "lark"
+        assert feishu["extra"]["connection"]["app_id"] == "my-app"
+        assert feishu["extra"]["connection"]["domain"] == "lark"
 
     def test_no_config_file_uses_defaults(self, monkeypatch, tmp_path) -> None:
         """When no config.yaml exists, defaults include platform skeletons."""
@@ -767,3 +781,66 @@ class TestPlatformSchemaDiscovery:
         assert "platforms" in raw_user
         assert "feishu" in raw_user["platforms"]
         assert raw_user["platforms"]["feishu"]["enabled"] is False
+        assert "connection" in raw_user["platforms"]["feishu"]["extra"]
+        assert raw_user["platforms"]["feishu"]["extra"]["connection"]["app_id"] is None
+
+    def test_migrate_flat_to_grouped(self) -> None:
+        """_migrate_platform_extra restructures old flat extra keys."""
+        from tyagent.config import _migrate_platform_extra
+
+        raw = {
+            "platforms": {
+                "feishu": {
+                    "enabled": True,
+                    "extra": {
+                        "app_id": "cli_abc",
+                        "app_secret": "s3cr3t",
+                        "domain": "lark",
+                        "encrypt_key": "",
+                        "verification_token": "",
+                        "group_policy": "open",
+                    },
+                },
+            },
+        }
+        changed = _migrate_platform_extra(raw)
+        assert changed
+
+        feishu = raw["platforms"]["feishu"]
+        extra = feishu["extra"]
+        # Old flat keys removed
+        assert "app_id" not in extra
+        assert "app_secret" not in extra
+        assert "encrypt_key" not in extra
+        # New grouped structure
+        assert extra["connection"]["app_id"] == "cli_abc"
+        assert extra["connection"]["app_secret"] == "s3cr3t"
+        assert extra["connection"]["domain"] == "lark"
+        assert extra["event_subscription"]["encrypt_key"] == ""
+        assert extra["event_subscription"]["verification_token"] == ""
+        assert extra["behavior"]["group_policy"] == "open"
+
+    def test_migrate_already_grouped_is_noop(self) -> None:
+        """_migrate_platform_extra returns False when already nested."""
+        from tyagent.config import _migrate_platform_extra
+
+        raw = {
+            "platforms": {
+                "feishu": {
+                    "enabled": True,
+                    "extra": {
+                        "connection": {"app_id": "cli_abc"},
+                        "event_subscription": {"encrypt_key": ""},
+                        "behavior": {"group_policy": "mention"},
+                    },
+                },
+            },
+        }
+        assert not _migrate_platform_extra(raw)
+
+    def test_migrate_no_feishu_section(self) -> None:
+        """_migrate_platform_extra returns False when feishu not in config."""
+        from tyagent.config import _migrate_platform_extra
+
+        raw = {"platforms": {"telegram": {"enabled": True}}}
+        assert not _migrate_platform_extra(raw)

@@ -10,6 +10,7 @@ tyagent/
 ├── types.py              # InboxMessage, AgentOutput, ReplyTarget（actor 模型消息类型）
 ├── events.py             # EventCollector（子代理完成事件桥接）
 ├── config.py             # TyAgentConfig, PlatformConfig, CompressionConfig
+├── config_field.py       # ConfigField schema descriptor + validate/config utilities
 ├── compaction.py         # Codex 风格上下文压缩（compact.rs 对齐）
 ├── prompt_builder.py     # system prompt 构建（7 层）
 ├── session.py            # Session + SessionStore（SQLite 后端）
