@@ -215,6 +215,7 @@ class ProgressSender:
         progress_msg_id: str | None = None
         can_edit = True
         last_edit_ts = 0.0
+        last_delivered_count = 0  # How many lines were last successfully sent
 
         try:
             while True:
@@ -258,6 +259,7 @@ class ProgressSender:
                     )
                     if result.success:
                         last_edit_ts = time.monotonic()
+                        last_delivered_count = len(progress_lines)
                     else:
                         can_edit = False
                         logger.warning(
@@ -265,8 +267,12 @@ class ProgressSender:
                             "falling back to new message",
                             progress_msg_id, type(self.adapter).__name__,
                         )
+                        # Send only the delta (lines not yet shown) to avoid
+                        # duplicating content the user has already seen.
+                        delta_lines = progress_lines[last_delivered_count:]
+                        delta_text = "\n".join(delta_lines) if delta_lines else text
                         fallback = await self.adapter.send_message(
-                            self.chat_id, text,
+                            self.chat_id, delta_text,
                             reply_to_message_id=self.reply_to_message_id,
                         )
                         if fallback.success and fallback.message_id:
@@ -274,6 +280,7 @@ class ProgressSender:
                             can_edit = True
                             self._progress_msg_type = getattr(fallback, "msg_type", None)
                             last_edit_ts = time.monotonic()
+                            last_delivered_count = len(progress_lines)
                 elif progress_msg_id is None:
                     result = await self.adapter.send_message(
                         self.chat_id, text,
@@ -293,8 +300,11 @@ class ProgressSender:
                         progress_msg_id = ""
                 else:
                     # Stale progress_msg_id with can_edit=False — retry send
+                    # Send only the delta to avoid duplicating already-shown lines.
+                    delta_lines = progress_lines[last_delivered_count:]
+                    delta_text = "\n".join(delta_lines) if delta_lines else text
                     retry = await self.adapter.send_message(
-                        self.chat_id, text,
+                        self.chat_id, delta_text,
                         reply_to_message_id=self.reply_to_message_id,
                     )
                     if retry.success and retry.message_id:
@@ -302,6 +312,7 @@ class ProgressSender:
                         can_edit = True
                         self._progress_msg_type = getattr(retry, "msg_type", None)
                         last_edit_ts = time.monotonic()
+                        last_delivered_count = len(progress_lines)
 
                 if self._done:
                     return
