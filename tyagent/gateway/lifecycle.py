@@ -74,12 +74,13 @@ class GatewaySupervisor:
             logger.info("Graceful restart: notifying active sessions...")
             await self._notify_active_sessions()
 
+            active_count = len(gw._sessions)
             logger.info(
                 "Graceful restart: draining up to %.0f seconds (%d active sessions)",
                 gw._restart_drain_timeout,
-                len(gw._sessions),
+                active_count,
             )
-            drained = await self._drain_active_agents(gw._restart_drain_timeout)
+            await self._drain_active_agents(gw._restart_drain_timeout)
 
             # Stop all session agents (actor model loops)
             for session_key in list(gw._sessions.keys()):
@@ -90,17 +91,11 @@ class GatewaySupervisor:
                         "Failed to stop session agent for %s", session_key
                     )
 
-            if not drained:
-                logger.warning(
-                    "Drain timeout reached — forcing restart with %d active session(s)",
-                    len(gw._sessions),
-                )
-
-            # Mark pending sessions for resume, so the new process can pick them up
+            # Mark any sessions that might need resume after restart
             for session_key in list(gw._sessions):
                 try:
                     gw.session_store.mark_resume_pending(
-                        session_key, reason="restart_timeout"
+                        session_key, reason="restart"
                     )
                 except Exception:
                     logger.exception(
@@ -169,21 +164,56 @@ class GatewaySupervisor:
     # ------------------------------------------------------------------
 
     async def _drain_active_agents(self, timeout: float) -> bool:
-        """Wait for all active sessions to complete, up to timeout seconds.
+        """Wait for in-flight turns to complete.
 
-        Returns True if all sessions drained, False on timeout.
+        Sessions are permanent actor-model loops — they don't disappear
+        from ``_sessions`` until ``_stop_session_agent()`` removes them
+        (which runs after this drain phase).
+
+        Instead of waiting for sessions to vanish (which would always
+        timeout), we check whether any agent is currently inside a turn
+        (LLM call or tool execution).  If so, we wait a brief period for
+        it to settle.  The subsequent ``stop()`` (5s shutdown_timeout)
+        provides the final grace period for any remaining in-flight work.
+
+        Returns True (drain "succeeded") — the 5s stop() timeout is the
+        real safety net, making this a soft courtesy wait rather than a
+        hard deadline.
         """
         gw = self._gateway
         if not gw._sessions:
             return True
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while gw._sessions:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return False
+
+        # Give any in-flight turns up to `timeout` seconds to finish
+        # naturally before stop() forces them.
+        start = time.monotonic()
+        busy_count = len(gw._sessions)
+        while time.monotonic() - start < timeout:
+            # Count sessions whose agent is currently running a turn.
+            # We approximate "busy" by checking if the agent's inbox
+            # is non-empty (a message queued but not yet consumed).
+            busy = 0
+            for ctx in gw._sessions.values():
+                agent = ctx.agent
+                if agent._running and not agent._inbox.empty():
+                    busy += 1
+                elif hasattr(agent, '_bg_tasks') and agent._bg_tasks:
+                    busy += 1
+            if busy == 0:
+                logger.info(
+                    "Drain complete (%d sessions, all idle) in %.1fs",
+                    busy_count, time.monotonic() - start,
+                )
+                return True
             await asyncio.sleep(0.5)
-        return True
+
+        remaining = len(gw._sessions)
+        logger.info(
+            "Drain courtesy wait elapsed (%d sessions, %d busy after %.1fs) "
+            "— proceeding to stop() which handles remaining in-flight work",
+            remaining, busy, time.monotonic() - start,
+        )
+        return True  # stop() is the real safety net
 
     async def _notify_active_sessions(self) -> None:
         """Send restart notification to all active sessions."""
