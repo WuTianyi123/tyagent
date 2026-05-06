@@ -586,6 +586,11 @@ class Gateway:
         self._load_adapters()
         self.supervisor.setup_signal_handlers()
         self.supervisor.check_recovery_on_startup()
+        # Handle restart marker: write synthetic "restart_completed" tool
+        # responses for any orphaned tool calls from the previous process.
+        # This runs before adapters connect so the DB is ready before any
+        # session resumes.
+        self.supervisor._handle_restart_marker_on_startup()
         if not self.adapters:
             logger.error("No adapters loaded. Check your configuration.")
             return

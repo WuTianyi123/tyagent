@@ -82,10 +82,9 @@ class GatewaySupervisor:
             )
             await self._drain_active_agents(gw._restart_drain_timeout)
 
-            # Persist synthetic responses for any orphaned tool calls before
-            # stopping agents, so the message chain is complete in the DB
-            # when the new process loads these sessions.
-            self._persist_orphaned_tool_responses()
+            # Write restart marker with pending tool call info so the new
+            # gateway process can write accurate "restart_completed" responses.
+            self._write_restart_marker()
 
             # Stop all session agents (actor model loops)
             for session_key in list(gw._sessions.keys()):
@@ -298,21 +297,22 @@ class GatewaySupervisor:
         except OSError as exc:
             logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
 
-    def _persist_orphaned_tool_responses(self) -> None:
-        """Persist synthetic tool responses for orphaned tool calls.
+    def _write_restart_marker(self) -> None:
+        """Write pending tool call info to a restart marker file.
 
-        Before stopping session agents during graceful restart, check the DB
-        for assistant messages with tool_calls that have no corresponding
-        tool response. Persist a synthetic "interrupted" response so the DB
-        has a complete message chain.
+        Instead of writing synthetic tool responses to the DB (which creates
+        a race condition — the actual tool execution might complete and also
+        write its result), we write a .restart_pending marker with the
+        orphaned tool call details. The new gateway process reads this marker
+        on startup and writes accurate "restart_completed" responses.
 
-        This prevents _sanitize_message_chain from having to insert synthetic
-        responses on the next startup, and ensures the tool call is properly
-        accounted for even if the tool's result was lost during shutdown.
+        This eliminates the self-contradiction of "waiting for tool execution
+        to complete while already deciding it didn't complete".
         """
         gw = self._gateway
+        marker = {"restarted_at": time.time(), "sessions": {}}
+
         for session_key in list(gw._sessions.keys()):
-            # Get session metadata for session_id
             try:
                 session = gw.session_store.get(session_key)
                 session_id = session.metadata.get("current_session_id", "")
@@ -322,23 +322,24 @@ class GatewaySupervisor:
             if not session_id:
                 continue
 
-            # Load raw messages from DB (not agent._messages which is sanitized)
+            # Load raw messages from DB
             try:
-                messages = gw.session_store.get_messages(session_key, session_id=session_id)
+                messages = gw.session_store.get_messages(
+                    session_key, session_id=session_id
+                )
             except Exception:
                 logger.exception("Failed to load messages for %s", session_key)
                 continue
             if not messages:
                 continue
 
-            # Check for orphaned tool calls: assistant messages whose tool_calls
-            # don't have corresponding tool responses in the DB.
+            # Find orphaned tool calls
+            pending = []
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
                 if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                     continue
                 tool_calls = msg["tool_calls"]
-                # Parse tool_calls if it's a JSON string (as stored in DB)
                 if isinstance(tool_calls, str):
                     try:
                         tool_calls = json.loads(tool_calls)
@@ -354,35 +355,117 @@ class GatewaySupervisor:
                     n_actual += 1
                     j += 1
                 if n_actual >= n_expected:
-                    continue  # All tool calls have responses
+                    continue
 
-                # Persist synthetic responses for orphaned tool calls
                 for tc in tool_calls[n_actual:]:
                     tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
                     fn_name = (
                         tc.get("function", {}).get("name", "?")
                         if isinstance(tc, dict) else "?"
                     )
-                    synthetic = json.dumps({
-                        "error": f"Gateway restarted before tool '{fn_name}' completed",
-                        "interrupted": True,
+                    pending.append({
+                        "tool_call_id": tc_id,
+                        "function_name": fn_name,
                     })
-                    try:
-                        gw.session_store.add_message(
-                            session_key, "tool", synthetic,
-                            session_id=session_id,
-                            tool_call_id=tc_id,
-                        )
-                        logger.info(
-                            "Persisted synthetic tool response for %s/%s "
-                            "(tool_call_id=%s, session=%s)",
-                            session_key, fn_name, tc_id, session_id,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to persist synthetic tool response for %s/%s",
-                            session_key, fn_name,
-                        )
+
+            if pending:
+                marker["sessions"][session_key] = {
+                    "session_id": session_id,
+                    "pending_tool_calls": pending,
+                }
+                logger.info(
+                    "Restart marker: %d orphaned tool call(s) for %s/%s",
+                    len(pending), session_key, session_id,
+                )
+
+        if not marker["sessions"]:
+            logger.info("No orphaned tool calls — skipping restart marker")
+            return
+
+        marker_path = gw.config.home_dir / ".restart_pending"
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+            logger.info(
+                "Wrote restart marker at %s (%d sessions)",
+                marker_path, len(marker["sessions"]),
+            )
+        except Exception as exc:
+            logger.error("Failed to write restart marker: %s", exc)
+
+    def _handle_restart_marker_on_startup(self) -> None:
+        """Read restart marker and write synthetic "restart_completed" tool responses.
+
+        Called on new gateway startup. For each session with pending tool calls,
+        writes a tool response to the DB indicating the gateway restart completed.
+        This replaces the old approach where the old process tried to write
+        synthetic responses (causing duplicate tool responses via race conditions).
+        """
+        gw = self._gateway
+        marker_path = gw.config.home_dir / ".restart_pending"
+
+        if not marker_path.exists():
+            return
+
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Failed to parse restart marker: %s — removing it", exc,
+            )
+            marker_path.unlink(missing_ok=True)
+            return
+
+        restarted_at = marker.get("restarted_at", time.time())
+        sessions_data = marker.get("sessions", {})
+        written = 0
+
+        for session_key, sdata in sessions_data.items():
+            session_id = sdata.get("session_id", "")
+            pending = sdata.get("pending_tool_calls", [])
+            if not session_id or not pending:
+                continue
+
+            for tc_info in pending:
+                tc_id = tc_info.get("tool_call_id", "")
+                fn_name = tc_info.get("function_name", "?")
+                if not tc_id:
+                    continue
+
+                # Compute elapsed time since restart was initiated
+                elapsed_seconds = max(0, time.time() - restarted_at)
+
+                synthetic = json.dumps({
+                    "success": True,
+                    "restart_completed": True,
+                    "duration_seconds": round(elapsed_seconds, 1),
+                    "message": f"Gateway restart completed ({elapsed_seconds:.1f}s)",
+                })
+
+                try:
+                    gw.session_store.add_message(
+                        session_key, "tool", synthetic,
+                        session_id=session_id,
+                        tool_call_id=tc_id,
+                    )
+                    written += 1
+                    logger.info(
+                        "Restart-completed response for %s/%s "
+                        "(tool_call_id=%s, elapsed=%.1fs)",
+                        session_key, fn_name, tc_id, elapsed_seconds,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to write restart-completed response for %s/%s",
+                        session_key, fn_name,
+                    )
+
+        # Clean up marker
+        try:
+            marker_path.unlink(missing_ok=True)
+            logger.debug("Removed restart marker (%d tool responses written)", written)
+        except OSError as exc:
+            logger.warning("Failed to remove restart marker: %s", exc)
 
     # ------------------------------------------------------------------
     # Restart notification (called from Gateway.start after adapters connect)
