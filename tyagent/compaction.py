@@ -27,11 +27,26 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ── Prompt file loader ─────────────────────────────────────────────────────
+
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+
+def _load_prompt(*parts: str) -> str:
+    """Load a prompt text file from ``tyagent/prompts/``."""
+    path = _PROMPTS_DIR.joinpath(*parts)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Failed to load prompt file: {path}") from exc
+
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -42,28 +57,11 @@ COMPACT_USER_MESSAGE_MAX_TOKENS: int = 20_000
 # Prefixed to the summary so the receiving model treats it as background
 # reference, not an active instruction.  Exact text from Codex CLI
 # templates/compact/summary_prefix.md.
-SUMMARY_PREFIX: str = (
-    "Another language model started to solve this problem and produced a summary "
-    "of its thinking process. You also have access to the state of the tools that "
-    "were used by that language model. Use this to build on the work that has "
-    "already been done and avoid duplicating work. Here is the summary produced "
-    "by the other language model, use the information in this summary to assist "
-    "with your own analysis:"
-)
+SUMMARY_PREFIX: str = _load_prompt("compact", "summary_prefix.md")
 
 # Compaction prompt sent as a standalone turn.  Exact text from Codex CLI
 # templates/compact/prompt.md.
-COMPACTION_PROMPT: str = (
-    "You are performing a CONTEXT CHECKPOINT COMPACTION. "
-    "Create a handoff summary for another LLM that will resume the task.\n\n"
-    "Include:\n"
-    "- Current progress and key decisions made\n"
-    "- Important context, constraints, or user preferences\n"
-    "- What remains to be done (clear next steps)\n"
-    "- Any critical data, examples, or references needed to continue\n\n"
-    "Be concise, structured, and focused on helping the next LLM "
-    "seamlessly continue the work."
-)
+COMPACTION_PROMPT: str = _load_prompt("compact", "prompt.md")
 
 # Approximate chars-per-token for budget calculations.
 _CHARS_PER_TOKEN: int = 4

@@ -1,7 +1,7 @@
 """System prompt assembly for tyagent.
 
 Layers (in order):
-  1. identity.md  — profile-specific agent identity (fallback: TYAGENT_IDENTITY)
+  1. identity.md  — profile-specific agent identity (fallback: prompts/identity/default.md)
   2. User custom system_prompt override (from config, if non-default)
   3. Session metadata (model, provider)
   4. Memory blocks — from MemoryStore snapshot (MEMORY.md + USER.md only)
@@ -17,14 +17,30 @@ from pathlib import Path
 from typing import List, Optional
 
 # ---------------------------------------------------------------------------
-# Constants
+# Prompt file loader
 # ---------------------------------------------------------------------------
 
-TYAGENT_IDENTITY = (
-    "You are tyagent, an AI agent framework. "
-    "You are helpful, knowledgeable, and direct. "
-    "You communicate clearly and prioritise being genuinely useful."
-)
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+
+def _load_prompt(*parts: str) -> str:
+    """Load a prompt text file from ``tyagent/prompts/``.
+
+    Usage: ``_load_prompt("identity", "default.md")`` loads
+    ``tyagent/prompts/identity/default.md``.
+    """
+    path = _PROMPTS_DIR.joinpath(*parts)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Failed to load prompt file: {path}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Constants (loaded from prompt files)
+# ---------------------------------------------------------------------------
+
+TYAGENT_IDENTITY = _load_prompt("identity", "default.md")
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +67,7 @@ def _get_memory_blocks() -> List[str]:
     """
     try:
         from tyagent.tools.memory_tool import get_store
+
         store = get_store()
         if store is None:
             return []
@@ -82,7 +99,7 @@ def build_system_prompt(
     """
     parts: list[str] = []
 
-    # Layer 1: identity — from identity.md or hardcoded fallback
+    # Layer 1: identity — from profile identity.md or packaged default
     if home_dir is not None:
         identity_text = _read_if_exists(home_dir / "identity.md")
         if identity_text:
