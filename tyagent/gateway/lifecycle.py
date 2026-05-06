@@ -82,6 +82,11 @@ class GatewaySupervisor:
             )
             await self._drain_active_agents(gw._restart_drain_timeout)
 
+            # Persist synthetic responses for any orphaned tool calls before
+            # stopping agents, so the message chain is complete in the DB
+            # when the new process loads these sessions.
+            self._persist_orphaned_tool_responses()
+
             # Stop all session agents (actor model loops)
             for session_key in list(gw._sessions.keys()):
                 try:
@@ -292,6 +297,75 @@ class GatewaySupervisor:
             logger.debug("Removed .clean_shutdown marker")
         except OSError as exc:
             logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
+
+    def _persist_orphaned_tool_responses(self) -> None:
+        """Persist synthetic tool responses for orphaned tool calls.
+
+        Before stopping session agents during graceful restart, check each
+        agent's in-memory message chain for assistant messages with tool_calls
+        that have no corresponding tool response. Persist a synthetic
+        "interrupted" response so the DB has a complete message chain.
+
+        This prevents _sanitize_message_chain from having to insert synthetic
+        responses on the next startup, and ensures the tool call is properly
+        accounted for even if the tool's result was lost during shutdown.
+        """
+        gw = self._gateway
+        for session_key in list(gw._sessions.keys()):
+            ctx = gw._sessions.get(session_key)
+            if ctx is None:
+                continue
+            agent = ctx.agent
+            messages: list[dict] = getattr(agent, "_messages", [])
+            if not messages:
+                continue
+
+            # Get the session metadata for session_id
+            try:
+                session = gw.session_store.get(session_key)
+                session_id = session.metadata.get("current_session_id", "")
+            except Exception:
+                logger.exception("Failed to get session for %s", session_key)
+                continue
+
+            for i in range(len(messages) - 1, -1, -1):
+                msg = messages[i]
+                if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                    continue
+                tool_calls = msg["tool_calls"]
+                n_expected = len(tool_calls)
+                n_actual = 0
+                j = i + 1
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    n_actual += 1
+                    j += 1
+                if n_actual >= n_expected:
+                    continue  # All tool calls have responses
+
+                # Persistent orphaned tool calls — insert synthetic responses
+                for tc in tool_calls[n_actual:]:
+                    tc_id = tc.get("id", "")
+                    fn_name = tc.get("function", {}).get("name", "?")
+                    synthetic = json.dumps({
+                        "error": f"Gateway restarted before tool '{fn_name}' completed",
+                        "interrupted": True,
+                    })
+                    try:
+                        gw.session_store.add_message(
+                            session_key, "tool", synthetic,
+                            session_id=session_id,
+                            tool_call_id=tc_id,
+                        )
+                        logger.info(
+                            "Persisted synthetic tool response for %s/%s "
+                            "(tool_call_id=%s, session=%s)",
+                            session_key, fn_name, tc_id, session_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist synthetic tool response for %s/%s",
+                            session_key, fn_name,
+                        )
 
     # ------------------------------------------------------------------
     # Restart notification (called from Gateway.start after adapters connect)

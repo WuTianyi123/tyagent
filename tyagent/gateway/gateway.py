@@ -7,6 +7,7 @@ and handles session lifecycle.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import OrderedDict
@@ -104,12 +105,19 @@ def _sanitize_message_chain(
                             if isinstance(tc, dict)
                             else getattr(tc, "id", "unknown")
                         )
+                        fn_name = (
+                            tc.get("function", {}).get("name", "?")
+                            if isinstance(tc, dict)
+                            else "?"
+                        )
                         synthetic.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": tc_id,
-                                "content": "(tool call interrupted — "
-                                "gateway restarted or crashed)",
+                                "content": json.dumps({
+                                    "error": f"Gateway restarted before tool '{fn_name}' completed",
+                                    "interrupted": True,
+                                }),
                             }
                         )
                     result = (
