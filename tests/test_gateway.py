@@ -643,6 +643,202 @@ class TestGatewayDrainAndRestart:
         gw.session_store.close()
 
 
+# ---------------------------------------------------------------------------
+# Restart marker — write + handle on startup
+# ---------------------------------------------------------------------------
+
+
+class TestRestartMarker:
+    """Tests for _write_restart_marker and _handle_restart_marker_on_startup."""
+
+    def _add_orphaned_tool_call(self, store, session_key):
+        """Helper: add an assistant message with tool_calls but no tool response."""
+        session = store.get(session_key)
+        session.add_message("user", "do something")
+        session.add_message(
+            "assistant", "",
+            tool_calls=[{
+                "id": "call_orphan_1",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": '{"command": "echo hi"}'},
+            }],
+        )
+        return session
+
+    def _add_active_session(self, gw, session_key, session):
+        """Register a session as active in gw._sessions for restart marker tests."""
+        from tyagent.gateway.gateway import SessionContext
+        from unittest.mock import MagicMock
+        agent = MagicMock()
+        agent._messages = []
+        gw._sessions[session_key] = SessionContext(
+            agent, MagicMock(), platform_name="test", chat_id="chat1",
+        )
+
+    def test_write_marker_no_orphans(self, tmp_path):
+        """No orphaned tool calls → no restart marker written."""
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        session.add_message("user", "hello")
+        session.add_message("assistant", "ok")
+        self._add_active_session(gw, "test:key", session)
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert not marker_path.exists(), "Should not write marker when no orphans"
+        gw.session_store.close()
+
+    def test_write_marker_with_orphans(self, tmp_path):
+        """Orphaned tool calls → marker file written with correct content."""
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
+        self._add_active_session(gw, "test:key", session)
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert marker_path.exists(), "Marker should exist"
+        import json
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert "restarted_at" in marker
+        assert "sessions" in marker
+        assert "test:key" in marker["sessions"]
+        sdata = marker["sessions"]["test:key"]
+        assert "session_id" in sdata
+        assert len(sdata["pending_tool_calls"]) == 1
+        tc = sdata["pending_tool_calls"][0]
+        assert tc["tool_call_id"] == "call_orphan_1"
+        assert tc["function_name"] == "terminal"
+        gw.session_store.close()
+        marker_path.unlink(missing_ok=True)
+
+    def test_write_marker_multiple_sessions(self, tmp_path):
+        """Multiple sessions with orphans → all recorded in marker."""
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+        s_a = self._add_orphaned_tool_call(gw.session_store, "session_a")
+        s_b = self._add_orphaned_tool_call(gw.session_store, "session_b")
+        self._add_active_session(gw, "session_a", s_a)
+        self._add_active_session(gw, "session_b", s_b)
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert marker_path.exists()
+        import json
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert "session_a" in marker["sessions"]
+        assert "session_b" in marker["sessions"]
+        gw.session_store.close()
+        marker_path.unlink(missing_ok=True)
+
+    def test_handle_marker_writes_synthetic_responses(self, tmp_path):
+        """Marker exists → synthetic 'restart_completed' responses written to DB."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
+        session_id = session.metadata.get("current_session_id", "")
+
+        # Manually write a restart marker (as the old process would)
+        marker = {
+            "restarted_at": time.time(),
+            "sessions": {
+                "test:key": {
+                    "session_id": session_id,
+                    "pending_tool_calls": [
+                        {"tool_call_id": "call_orphan_1", "function_name": "terminal"},
+                    ],
+                }
+            },
+        }
+        marker_path = config.home_dir / ".restart_pending"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        # Marker should be removed
+        assert not marker_path.exists()
+
+        # DB should now have a tool response for the orphaned call
+        messages = gw.session_store.get_messages("test:key", session_id=session_id)
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_msgs) >= 1
+        # The LAST tool message should be our synthetic response
+        last_tool = tool_msgs[-1]
+        assert last_tool["tool_call_id"] == "call_orphan_1"
+        parsed = json.loads(last_tool["content"])
+        assert parsed.get("restart_completed") is True
+        assert parsed.get("success") is True
+        gw.session_store.close()
+
+    def test_handle_marker_no_file(self, tmp_path):
+        """No marker file → no-op, no errors."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        # Should not raise
+        gw.supervisor._handle_restart_marker_on_startup()
+        gw.session_store.close()
+
+    def test_handle_marker_corrupted_file(self, tmp_path):
+        """Corrupted marker file → cleaned up, no crash."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        marker_path = config.home_dir / ".restart_pending"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("not valid json{{{", encoding="utf-8")
+
+        # Should not raise
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        # Corrupted marker should be removed
+        assert not marker_path.exists()
+        gw.session_store.close()
+
+    def test_handle_marker_sanitize_consistent(self, tmp_path):
+        """After handler writes synthetic response, _sanitize_message_chain
+        should find the chain complete (no orphaned calls)."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
+        session_id = session.metadata.get("current_session_id", "")
+
+        # Write marker
+        marker = {
+            "restarted_at": time.time(),
+            "sessions": {
+                "test:key": {
+                    "session_id": session_id,
+                    "pending_tool_calls": [
+                        {"tool_call_id": "call_orphan_1", "function_name": "terminal"},
+                    ],
+                }
+            },
+        }
+        marker_path = config.home_dir / ".restart_pending"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        # Handle marker (writes synthetic response to DB)
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        # Now simulate session load: get messages and sanitize
+        messages = gw.session_store.get_messages("test:key", session_id=session_id)
+        sanitized = _sanitize_message_chain(messages)
+
+        # The sanitized chain should be the same length as original (no new inserts)
+        assert len(sanitized) == len(messages), (
+            f"_sanitize_message_chain should not add new messages "
+            f"({len(sanitized)} vs {len(messages)})"
+        )
+        gw.session_store.close()
+
+
 class TestLegacyMigration:
     """Tests for migrate_legacy_home()."""
 
