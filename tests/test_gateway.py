@@ -506,8 +506,8 @@ class TestGatewayDrainAndRestart:
         gw.session_store.close()
 
     @pytest.mark.asyncio
-    async def test_on_message_suspended_session_archives_and_creates_fresh(self, tmp_path):
-        """Suspended session is archived, fresh created, user notified."""
+    async def test_on_message_suspended_session_clears_flag_and_continues(self, tmp_path):
+        """Suspended session is not archived — flag is cleared, old messages preserved."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         agent = MagicMock()
         agent.clone = MagicMock(return_value=agent)  # per-session clone
@@ -522,18 +522,26 @@ class TestGatewayDrainAndRestart:
         session.add_message("user", "old msg")
         gw.session_store.suspend_session("feishu:chat1", reason="crash_recovery")
 
-        event = _make_event(text="hello")
-        result = await gw._on_message(event)
+        assert gw.session_store.is_suspended("feishu:chat1"), "precondition"
 
-        # Should have sent a recovery message first
-        recovery_calls = adapter.send_message.call_args_list
-        assert len(recovery_calls) >= 1
-        # Check that a recovery/notification message was sent (Chinese text about recovery)
-        first_text = recovery_calls[0][0][1]
-        assert "异常中断" in first_text or "恢复" in first_text
+        try:
+            await gw._on_message(_make_event(text="hello"))
+        except Exception:
+            pass  # agent mock limitations — not testing that path
 
-        # Session should no longer be suspended
+        # Session should no longer be suspended (flag was cleared)
         assert not gw.session_store.is_suspended("feishu:chat1")
+
+        # Session should retain its messages (not archived)
+        messages = gw.session_store.get_messages("feishu:chat1")
+        assert any(msg.get("content") == "old msg" for msg in messages), \
+            "Session should retain old messages"
+
+        # Should NOT have sent a crash recovery message
+        recovery_calls = adapter.send_message.call_args_list
+        no_recovery = all("异常中断" not in str(args) for args, _ in recovery_calls)
+        assert no_recovery, "Should not send crash recovery message"
+
         gw.session_store.close()
 
     @pytest.mark.asyncio
@@ -594,7 +602,7 @@ class TestGatewayDrainAndRestart:
                 marker.unlink()
 
     def test_check_recovery_clean_shutdown_file_absent(self, tmp_path):
-        """If no .clean_shutdown, sessions should be suspended."""
+        """If no .clean_shutdown, sessions continue normally (not suspended)."""
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)
 
@@ -604,14 +612,14 @@ class TestGatewayDrainAndRestart:
         if marker.exists():
             marker.unlink()
 
-        # Create a session and mark it recently active
+        # Create a session
         session = gw.session_store.get("test:key")
         session.add_message("user", "hello")
 
         gw.supervisor.check_recovery_on_startup()
 
-        # Session should be suspended if it was recently active
-        assert gw.session_store.is_suspended("test:key")
+        # Session should NOT be suspended — it continues from persisted data
+        assert not gw.session_store.is_suspended("test:key")
         gw.session_store.close()
 
     @pytest.mark.asyncio

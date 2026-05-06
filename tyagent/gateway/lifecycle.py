@@ -243,19 +243,18 @@ class GatewaySupervisor:
         If the marker exists with restart requestor info, save it as a
         pending notification to be sent once adapters are connected.
 
-        If the marker is absent, assume unclean shutdown and suspend
-        recently-active sessions.
+        If the marker is absent, sessions continue normally from persisted
+        data — SQLite guarantees data consistency across crashes.
         """
         gw = self._gateway
         gw._restart_notification_pending = None  # type: ignore[assignment]
         marker_path = gw.config.home_dir / ".clean_shutdown"
 
         if not marker_path.exists():
-            logger.info(
-                "No clean shutdown marker — assuming unclean shutdown, "
-                "suspending recent sessions"
+            logger.warning(
+                "No clean shutdown marker — gateway may not have shut down cleanly, "
+                "but sessions will continue normally from persisted data"
             )
-            self._suspend_recent_sessions()
             return
 
         # Parse marker — new format is JSON, old format is plain "clean"
@@ -263,9 +262,8 @@ class GatewaySupervisor:
             raw = marker_path.read_text(encoding="utf-8").strip()
             marker = json.loads(raw) if raw.startswith("{") else {"reason": raw}
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to parse .clean_shutdown marker: %s", exc)
+            logger.warning("Failed to parse .clean_shutdown marker: %s — sessions will continue normally", exc)
             marker_path.unlink(missing_ok=True)
-            self._suspend_recent_sessions()
             return
 
         logger.info(
@@ -294,21 +292,6 @@ class GatewaySupervisor:
             logger.debug("Removed .clean_shutdown marker")
         except OSError as exc:
             logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
-
-    def _suspend_recent_sessions(self) -> None:
-        """Suspend sessions that were recently active (unclean shutdown recovery)."""
-        gw = self._gateway
-        try:
-            suspended = gw.session_store.suspend_recently_active(max_age_seconds=120)
-            if suspended:
-                logger.warning(
-                    "Suspended %d recently-active session(s) due to unclean shutdown",
-                    suspended,
-                )
-            else:
-                logger.debug("No recently-active sessions to suspend")
-        except Exception:
-            logger.exception("Failed to suspend recent sessions on startup")
 
     # ------------------------------------------------------------------
     # Restart notification (called from Gateway.start after adapters connect)

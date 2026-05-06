@@ -187,9 +187,9 @@ class StreamConsumer:
                             delivered = await self._try_edit(self._accumulated)
                             if not delivered:
                                 # Edit failed — send remaining content as new message.
-                                # When _edit_permanently_disabled, send only the tail
+                                # When a fallback_prefix is known, send only the tail
                                 # (content the user hasn't seen yet) to avoid duplicate.
-                                if self._edit_permanently_disabled and self._fallback_prefix and self._accumulated.startswith(self._fallback_prefix):
+                                if self._fallback_prefix and self._accumulated.startswith(self._fallback_prefix):
                                     tail = self._accumulated[len(self._fallback_prefix):].lstrip()
                                     if tail:
                                         result = await self.adapter.send_message(self.chat_id, tail, reply_to_message_id=self._reply_to_message_id)
@@ -298,8 +298,10 @@ class StreamConsumer:
             # prevent editing (e.g., API doesn't support editing this message type).
             if "230072" not in (result.error or ""):
                 self._edit_permanently_disabled = True
-                # Save what the user has already seen, so final fallback sends only the tail
-                self._fallback_prefix = (self._last_sent_text or "").rstrip(" ▉")
+            # Save what the user has already seen, so final fallback sends only the tail.
+            # This applies to ALL edit failures to prevent duplicating content
+            # in the fallback new message.
+            self._fallback_prefix = (self._last_sent_text or "").rstrip(" ▉")
             logger.warning(
                 "Edit message failed (non-flood, not retryable): error=%s — "
                 "progressive edit %s, final content sent on stream end",

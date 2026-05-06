@@ -305,22 +305,17 @@ class Gateway:
             )
             return None
 
-        # If session is suspended (crash recovery), archive it and create fresh
+        # If session is suspended, just clear the flag and continue normally.
+        # Session data is persisted in SQLite and is ACID-safe, so there's no
+        # need to archive — the session picks up where it left off.
         if self.session_store.is_suspended(session_key):
             logger.info(
-                "Session %s was suspended — archiving and creating fresh session",
+                "Session %s was suspended — clearing flag and continuing",
                 session_key,
             )
-            self.session_store.archive(session_key)
             self.session_store.clear_resume_pending(session_key)
-            session = self.session_store.get_or_create_after_archive(session_key)
-            await adapter.send_message(
-                event.chat_id or "",
-                "🔄 检测到异常中断，已为您恢复新会话。之前的对话已归档保留。",
-                reply_to_message_id=event.message_id,
-            )
-        else:
-            session = self.session_store.get(session_key)
+
+        session = self.session_store.get(session_key)
 
         # Dispatch built-in commands via registry
         if event.is_command():

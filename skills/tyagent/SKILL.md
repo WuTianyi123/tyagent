@@ -47,10 +47,10 @@ Global flags: `-c, --config <path>` for custom config, `--profile <name>` for na
 ## Service Management
 
 ```bash
-# Start / Stop / Restart
+# Start / Stop / Restart (use `tyagent gateway restart` for graceful restart)
 systemctl --user start tyagent-gateway
 systemctl --user stop tyagent-gateway
-systemctl --user restart tyagent-gateway
+tyagent gateway restart
 systemctl --user status tyagent-gateway
 
 # View logs

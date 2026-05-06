@@ -358,20 +358,28 @@ class SessionStore:
         return True
 
     def clear_resume_pending(self, session_key: str) -> bool:
-        """Clear resume_pending flags from session metadata.
+        """Clear resume_pending and suspended flags from session metadata.
 
-        Returns True if the flag was present and cleared, False otherwise.
+        Both flags indicate the session was interrupted (graceful restart
+        or crash); clearing them allows the session to continue normally.
+
+        Returns True if any flag was present and cleared, False otherwise.
         """
         with self._metadata_lock:
             session_dict = self._db.get_or_create_session(session_key)[0]
             metadata = session_dict["metadata"]
-            if "resume_pending" not in metadata:
-                return False
+            had_any = bool(
+                metadata.get("resume_pending") or metadata.get("suspended")
+            )
             metadata.pop("resume_pending", None)
             metadata.pop("resume_reason", None)
             metadata.pop("resume_marked_at", None)
-            self._db.update_session_metadata(session_key, metadata)
-        return True
+            metadata.pop("suspended", None)
+            metadata.pop("suspend_reason", None)
+            metadata.pop("suspend_at", None)
+            if had_any:
+                self._db.update_session_metadata(session_key, metadata)
+            return had_any
 
     def suspend_session(self, session_key: str, reason: str = "crash_recovery") -> bool:
         """Suspend a session, marking it as explicitly suspended.

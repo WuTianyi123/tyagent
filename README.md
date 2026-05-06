@@ -22,8 +22,8 @@ uv run python tyagent_cli.py gateway install
 
 # 管理服务
 systemctl --user start tyagent-gateway
-systemctl --user restart tyagent-gateway
 systemctl --user stop tyagent-gateway
+tyagent gateway restart              # 优雅重启（SIGUSR1），会话不中断
 systemctl --user status tyagent-gateway
 journalctl --user -u tyagent-gateway -f
 ```
