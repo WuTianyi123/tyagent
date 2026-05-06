@@ -644,9 +644,13 @@ class TyAgent:
             inbox_task = loop.create_task(self._inbox.get())
             stop_task = loop.create_task(self._stop_event.wait())
 
-            tasks = [inbox_task, stop_task]
-            mailbox_task = loop.create_task(self._mailbox.wait_next(timeout=None))
-            tasks.append(mailbox_task)
+            # Child agents also wait on mailbox for followup messages.
+            # Root agent checks mailbox non-blockingly after inbox/stop.
+            if self._child_mode:
+                mailbox_task = loop.create_task(self._mailbox.wait_next(timeout=None))
+                tasks = [inbox_task, stop_task, mailbox_task]
+            else:
+                tasks = [inbox_task, stop_task]
 
             done, pending = await asyncio.wait(
                 tasks,
@@ -678,10 +682,32 @@ class TyAgent:
                     self._notify_parent_on_exit()
                 break
 
-            # ── Drain mailbox ───────────────────────────────────
-            mailbox_msgs, should_trigger = self._mailbox.drain_with_trigger_info()
-            for m in mailbox_msgs:
-                self._messages.append(m)
+            # ── Drain mailbox (pull mode) ────────────────────────
+            # Root agent: only FinalNotification (child exit) triggers
+            # a turn.  InterAgentMessage stays in the mailbox for
+            # explicit wait_task polling.
+            # Child agent: also drains InterAgentMessage from parent
+            # (followup_task sends messages with trigger_turn=True).
+            if self._child_mode:
+                mailbox_msgs, should_trigger = self._mailbox.drain_with_trigger_info()
+                for m in mailbox_msgs:
+                    self._messages.append(m)
+            else:
+                mailbox_finals = self._mailbox.drain_final_notifications()
+                should_trigger = bool(mailbox_finals)
+                for fn in mailbox_finals:
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            f"（子代理完成）{fn.task_path} "
+                            f"({fn.duration_seconds:.1f}s):\n\n"
+                            f"{fn.summary or '已完成'}"
+                        ) if fn.success else (
+                            f"（子代理失败）{fn.task_path} "
+                            f"({fn.duration_seconds:.1f}s): "
+                            f"{fn.error or '未知错误'}"
+                        ),
+                    })
 
             # ── Process user message ───────────────────────────
             has_user_message = inbox_task in done
@@ -804,7 +830,7 @@ class TyAgent:
             author=task_path,
             recipient=self._parent_mailbox.owner_path,
             content=msg_text,
-            trigger_turn=True,  # parent should process this result
+            trigger_turn=False,  # pull mode: parent uses wait_task to poll
         ))
 
     def _notify_parent_on_exit(self) -> None:

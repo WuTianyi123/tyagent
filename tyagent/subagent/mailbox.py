@@ -97,6 +97,27 @@ class Mailbox:
         """True when there are pending items."""
         return bool(self._queue)
 
+    def has_final_notification(self) -> bool:
+        """True when there is at least one FinalNotification pending."""
+        return any(isinstance(item, FinalNotification) for item in self._queue)
+
+    def drain_final_notifications(self) -> List[FinalNotification]:
+        """Drain and return only FinalNotification items.
+
+        InterAgentMessage items stay in the mailbox for ``wait_task``.
+        """
+        kept: List[MailboxItem] = []
+        finals: List[FinalNotification] = []
+        for item in self._queue:
+            if isinstance(item, FinalNotification):
+                finals.append(item)
+            else:
+                kept.append(item)
+        self._queue = kept
+        if not self._queue:
+            self._event.clear()
+        return finals
+
     # ── wait ────────────────────────────────────────────────────
 
     async def wait_next(self, timeout: Optional[float] = None) -> bool:
