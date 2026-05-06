@@ -666,9 +666,8 @@ class Gateway:
         GatewaySupervisor.schedule_restart_notification(self)
 
         # Eagerly initialize sessions with history and trigger a proactive turn.
-        # This lets the agent check its status, continue interrupted work, or
-        # send an init message without waiting for the first user message.
-        await self._init_active_sessions()
+        # DISABLED: causes agent restart loop on startup — needs redesign
+        # await self._init_active_sessions()
 
         # Wait for shutdown signal
         await self._shutdown_event.wait()
