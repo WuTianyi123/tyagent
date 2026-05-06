@@ -848,9 +848,8 @@ class TestRestartMarker:
         session.add_message("assistant", "world")
         self._add_active_session(gw, "test:key", session)
 
-        # Without a real API key, validation should skip (returns True)
-        result = await gw.supervisor.validate_message_chains()
-        assert result is True
+        # Without a real API key, validation should skip (no error)
+        await gw.supervisor.validate_message_chains()
         gw.session_store.close()
 
     @pytest.mark.asyncio
@@ -879,9 +878,8 @@ class TestRestartMarker:
             mock_instance.post.return_value = mock_resp
             mock_client.return_value.__aenter__.return_value = mock_instance
 
-            result = await gw.supervisor.validate_message_chains()
+            await gw.supervisor.validate_message_chains()
 
-        assert result is True
         gw.session_store.close()
 
     @pytest.mark.asyncio
@@ -908,9 +906,9 @@ class TestRestartMarker:
             mock_instance.post.return_value = mock_resp
             mock_client.return_value.__aenter__.return_value = mock_instance
 
-            result = await gw.supervisor.validate_message_chains()
+            with pytest.raises(RuntimeError, match="validation failed"):
+                await gw.supervisor.validate_message_chains()
 
-        assert result is False
         gw.session_store.close()
 
 

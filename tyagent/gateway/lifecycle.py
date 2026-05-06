@@ -76,14 +76,10 @@ class GatewaySupervisor:
             await self._notify_active_sessions()
 
             # Pre-flight check: validate message chains before drain/restart.
-            # This catches orphaned tool call issues early by sending a minimal
-            # request (max_tokens=1) to the LLM API. Failures are logged as
-            # warnings but don't block restart — _sanitize_message_chain on
-            # startup is the safety net.
-            try:
-                await self.validate_message_chains()
-            except Exception:
-                logger.exception("Message chain validation failed unexpectedly")
+            # Sends a minimal request (max_tokens=1) to the LLM API. If any
+            # session's chain is rejected, a RuntimeError is raised and the
+            # restart is aborted — the operator must fix the chain first.
+            await self.validate_message_chains()
 
             active_count = len(gw._sessions)
             logger.info(
@@ -308,17 +304,16 @@ class GatewaySupervisor:
         except OSError as exc:
             logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
 
-    async def validate_message_chains(self) -> bool:
+    async def validate_message_chains(self) -> None:
         """Pre-flight check: validate all active sessions' message chains.
 
         Sends a minimal request (max_tokens=1) to the LLM API for each
-        active session's message chain. If the API rejects the chain
-        (e.g. orphaned tool calls with invalid format), logs a warning.
+        active session's message chain. If the API rejects any chain
+        (e.g. orphaned tool calls with invalid format), raises a
+        RuntimeError with details to block the restart.
 
-        Returns True if all chains are valid, False if any failed.
-        This is a best-effort check — failures are logged but don't
-        block restart; the _sanitize_message_chain on startup provides
-        a safety net.
+        This prevents restarting into a state where the LLM will reject
+        the message chain, ensuring the new process starts cleanly.
         """
         gw = self._gateway
         agent_cfg = gw.config.agent
@@ -389,11 +384,10 @@ class GatewaySupervisor:
                 )
 
         if not all_ok:
-            logger.warning(
-                "Message chain validation found issues — "
-                "restart will proceed but _sanitize_message_chain will attempt repair"
+            raise RuntimeError(
+                "Message chain validation failed for one or more sessions — "
+                "restart aborted. Check logs above for details."
             )
-        return all_ok
 
     def _write_restart_marker(self) -> None:
         """Write pending tool call info to a restart marker file.
