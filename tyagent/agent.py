@@ -644,9 +644,27 @@ class TyAgent:
 
         Uses ``asyncio.wait(FIRST_COMPLETED)`` to block until any event source
         has new data, then processes it in priority order.
+
+        On startup, if the message chain ends with a tool response (e.g. a
+        result collected after restart), processes that turn immediately
+        without waiting for a user message.
         """
         loop = asyncio.get_running_loop()
         from tyagent.tools.registry import registry
+
+        # ── Auto-process chain tail on startup ──────────────────
+        # If the last message is a tool response (collected after restart
+        # by _collect_orphan_terminal_results), run a turn proactively
+        # so the model can continue working without waiting for user input.
+        if self._messages and self._messages[-1].get("role") == "tool":
+            logger.info(
+                "Agent loop: tool response at end of chain — processing proactively"
+            )
+            tools = registry.get_definitions()
+            self._inject_child_status()
+            content = await self._run_turn(tools=tools)
+            if content.strip():
+                await self._output_queue.put(AgentOutput(text=content))
 
         while self._running:
             inbox_task = loop.create_task(self._inbox.get())
