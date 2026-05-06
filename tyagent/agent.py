@@ -270,13 +270,19 @@ class TyAgent:
                     pass
 
             entry = registry._tools.get(func_name)
-            if entry and asyncio.iscoroutinefunction(entry.handler):
-                result = await entry.handler(func_args, parent_agent=self)
-            else:
-                _loop = asyncio.get_running_loop()
-                result = await _loop.run_in_executor(
-                    None, registry.dispatch, func_name, func_args, self,
-                )
+            # Set current tool_call_id so tool handlers (e.g. terminal) can
+            # include it in pending markers for post-restart result collection.
+            self._current_tool_call_id = tc_id
+            try:
+                if entry and asyncio.iscoroutinefunction(entry.handler):
+                    result = await entry.handler(func_args, parent_agent=self)
+                else:
+                    _loop = asyncio.get_running_loop()
+                    result = await _loop.run_in_executor(
+                        None, registry.dispatch, func_name, func_args, self,
+                    )
+            finally:
+                self._current_tool_call_id = ""
 
             messages.append({
                 "role": "tool", "tool_call_id": tc_id, "content": result,

@@ -723,6 +723,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     # Get session info for the pending marker
     session_key = getattr(parent_agent, "session_key", "") if parent_agent else ""
     session_id = getattr(parent_agent, "current_session_id", "") if parent_agent else ""
+    tool_call_id = getattr(parent_agent, "_current_tool_call_id", "") if parent_agent else ""
 
     # Create a temp output file and pending marker
     output_dir = Path(tempfile.gettempdir())
@@ -751,7 +752,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             pending_dir.mkdir(parents=True, exist_ok=True)
             marker = pending_dir / f"{uuid.uuid4().hex[:16]}.json"
             marker_data = {
-                "tool_call_id": "",
+                "tool_call_id": tool_call_id,
                 "session_key": session_key,
                 "session_id": session_id,
                 "command": command[:200],
