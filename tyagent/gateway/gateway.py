@@ -494,7 +494,7 @@ class Gateway:
         continue interrupted work, send a greeting) without waiting for
         the first user message.
         """
-        for session_key in self.session_store.get_all_session_keys():
+        for session_key in self.session_store.all_session_keys():
             if session_key in self._sessions:
                 continue
             try:
