@@ -1,10 +1,11 @@
 """System prompt assembly for tyagent.
 
 Layers (in order):
-  1. identity.md  — profile-specific agent identity (fallback: prompts/identity/default.md)
-  2. User custom system_prompt override (from config, if non-default)
-  3. Session metadata (model, provider)
-  4. Memory blocks — from MemoryStore snapshot (MEMORY.md + USER.md only)
+  1. base_instructions/default.md  — foundational behaviour rules
+  2. identity.md                   — profile-specific agent identity (fallback: prompts/identity/default.md)
+  3. User custom system_prompt     — from config, if non-default
+  4. Session metadata              — model, provider
+  5. Memory blocks                 — from MemoryStore snapshot (MEMORY.md + USER.md only)
 
 User context comes exclusively from the memory tool's USER.md store,
 NOT from a separate user.md file at the profile root.  The two would
@@ -40,6 +41,7 @@ def _load_prompt(*parts: str) -> str:
 # Constants (loaded from prompt files)
 # ---------------------------------------------------------------------------
 
+BASE_INSTRUCTIONS = _load_prompt("base_instructions", "default.md")
 TYAGENT_IDENTITY = _load_prompt("identity", "default.md")
 
 
@@ -99,23 +101,23 @@ def build_system_prompt(
     """
     parts: list[str] = []
 
-    # Layer 1: identity — from profile identity.md or packaged default
+    # Layer 1: base instructions — foundational behavioural rules
+    parts.append(BASE_INSTRUCTIONS)
+
+    # Layer 2: identity — from profile identity.md or packaged default
+    identity_text = None
     if home_dir is not None:
         identity_text = _read_if_exists(home_dir / "identity.md")
-        if identity_text:
-            parts.append(identity_text)
+    parts.append(identity_text or TYAGENT_IDENTITY)
 
-    if not parts:
-        parts.append(TYAGENT_IDENTITY)
-
-    # Layer 2: user's custom system_prompt (skip if empty/unset)
+    # Layer 3: user's custom system_prompt (skip if empty/unset)
     if user_prompt and user_prompt.strip():
         parts.append(user_prompt)
 
-    # Layer 3: session metadata
+    # Layer 4: session metadata
     parts.append(f"Current model: {model}")
 
-    # Layer 4: memory blocks — from MemoryStore snapshot
+    # Layer 5: memory blocks — from MemoryStore snapshot
     for block in _get_memory_blocks():
         parts.append(block)
 
