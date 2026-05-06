@@ -746,6 +746,11 @@ class TyAgent:
                 logger.exception("Unexpected error in agent loop")
                 content = f"❌ 内部错误: {exc}"
 
+            # Persist error content (path A: _dispatch_on_message already
+            # handles normal turns; error turns skip _run_turn's persist)
+            if turn_error:
+                self._dispatch_on_message(content, None, None)
+
             # ── Child mode: notify parent of turn completion ───
             if self._child_mode:
                 self._notify_parent_of_turn(content, error=turn_error)

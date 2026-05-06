@@ -542,12 +542,6 @@ class Gateway:
                 # Auto-reply (child completion triggered)
                 await adapter.send_message(chat_id, output.text)
 
-            # Persist to session store
-            try:
-                self.session_store.add_message(session_key, "assistant", output.text)
-            except Exception:
-                logger.exception("Failed to persist output for %s", session_key)
-
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
         ctx = self._sessions.pop(session_key, None)
