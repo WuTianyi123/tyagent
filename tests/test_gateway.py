@@ -838,6 +838,81 @@ class TestRestartMarker:
         )
         gw.session_store.close()
 
+    @pytest.mark.asyncio
+    async def test_validate_chains_ok(self, tmp_path):
+        """Valid message chain → validation passes."""
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        session.add_message("user", "hello")
+        session.add_message("assistant", "world")
+        self._add_active_session(gw, "test:key", session)
+
+        # Without a real API key, validation should skip (returns True)
+        result = await gw.supervisor.validate_message_chains()
+        assert result is True
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_validate_chains_with_mock_api(self, tmp_path):
+        """Mock a successful API response → validation passes."""
+        from tyagent.config import AgentConfig
+        config = _make_config(
+            sessions_dir=tmp_path / "sessions",
+            home_dir=tmp_path,
+            agent=AgentConfig(api_key="test-key", base_url="http://localhost:19999", model="test-model"),
+        )
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        session.add_message("user", "hello")
+        session.add_message("assistant", "world")
+        self._add_active_session(gw, "test:key", session)
+
+        with patch("tyagent.gateway.lifecycle.httpx.AsyncClient") as mock_client:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "usage": {"prompt_tokens": 42},
+                "choices": [{"message": {"content": "ok"}}],
+            }
+            mock_instance = AsyncMock()
+            mock_instance.post.return_value = mock_resp
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await gw.supervisor.validate_message_chains()
+
+        assert result is True
+        gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_validate_chains_with_bad_api(self, tmp_path):
+        """Mock a 400 response → validation fails."""
+        from tyagent.config import AgentConfig
+        config = _make_config(
+            sessions_dir=tmp_path / "sessions",
+            home_dir=tmp_path,
+            agent=AgentConfig(api_key="test-key", base_url="http://localhost:19999", model="test-model"),
+        )
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        session.add_message("user", "hello")
+        # Add a malformed assistant message that could trigger API rejection
+        session.add_message("assistant", "", tool_calls=[])
+        self._add_active_session(gw, "test:key", session)
+
+        with patch("tyagent.gateway.lifecycle.httpx.AsyncClient") as mock_client:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 400
+            mock_resp.text = '{"error":{"message":"Bad request"}}'
+            mock_instance = AsyncMock()
+            mock_instance.post.return_value = mock_resp
+            mock_client.return_value.__aenter__.return_value = mock_instance
+
+            result = await gw.supervisor.validate_message_chains()
+
+        assert result is False
+        gw.session_store.close()
+
 
 class TestLegacyMigration:
     """Tests for migrate_legacy_home()."""

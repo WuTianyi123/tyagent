@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import httpx
 import signal
 import time
 from pathlib import Path
@@ -68,11 +69,21 @@ class GatewaySupervisor:
     # ------------------------------------------------------------------
 
     async def _do_graceful_restart(self) -> None:
-        """Perform graceful restart: notify, drain, mark sessions, exit."""
+        """Perform graceful restart: notify, validate, drain, mark sessions, exit."""
         gw = self._gateway
         try:
             logger.info("Graceful restart: notifying active sessions...")
             await self._notify_active_sessions()
+
+            # Pre-flight check: validate message chains before drain/restart.
+            # This catches orphaned tool call issues early by sending a minimal
+            # request (max_tokens=1) to the LLM API. Failures are logged as
+            # warnings but don't block restart — _sanitize_message_chain on
+            # startup is the safety net.
+            try:
+                await self.validate_message_chains()
+            except Exception:
+                logger.exception("Message chain validation failed unexpectedly")
 
             active_count = len(gw._sessions)
             logger.info(
@@ -296,6 +307,93 @@ class GatewaySupervisor:
             logger.debug("Removed .clean_shutdown marker")
         except OSError as exc:
             logger.warning("Failed to remove .clean_shutdown marker: %s", exc)
+
+    async def validate_message_chains(self) -> bool:
+        """Pre-flight check: validate all active sessions' message chains.
+
+        Sends a minimal request (max_tokens=1) to the LLM API for each
+        active session's message chain. If the API rejects the chain
+        (e.g. orphaned tool calls with invalid format), logs a warning.
+
+        Returns True if all chains are valid, False if any failed.
+        This is a best-effort check — failures are logged but don't
+        block restart; the _sanitize_message_chain on startup provides
+        a safety net.
+        """
+        gw = self._gateway
+        agent_cfg = gw.config.agent
+        if not agent_cfg.api_key or not agent_cfg.base_url:
+            return True  # Can't validate without API config
+
+        headers = {
+            "Authorization": f"Bearer {agent_cfg.api_key}",
+            "Content-Type": "application/json",
+        }
+        all_ok = True
+
+        for session_key in list(gw._sessions.keys()):
+            try:
+                session = gw.session_store.get(session_key)
+                session_id = session.metadata.get("current_session_id", "")
+                if not session_id:
+                    continue
+                messages = gw.session_store.get_messages(
+                    session_key, session_id=session_id
+                )
+                if not messages:
+                    continue
+            except Exception:
+                logger.exception("Failed to load session %s for validation", session_key)
+                continue
+
+            # Build a minimal API request with the message chain
+            payload = {
+                "model": agent_cfg.model,
+                "max_tokens": 1,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "You are a validation probe."},
+                    *[
+                        {"role": m["role"], "content": m.get("content", "")}
+                        | ({"tool_calls": m["tool_calls"]} if m.get("tool_calls") else {})
+                        for m in messages
+                    ],
+                ],
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"{agent_cfg.base_url}/chat/completions",
+                        headers=headers, json=payload,
+                    )
+                if resp.status_code >= 400:
+                    body = resp.text[:500]
+                    logger.warning(
+                        "Session %s message chain validation FAILED "
+                        "(HTTP %d): %s",
+                        session_key, resp.status_code, body,
+                    )
+                    all_ok = False
+                else:
+                    logger.info(
+                        "Session %s message chain validation OK "
+                        "(%d messages, %d prompt tokens)",
+                        session_key, len(messages),
+                        resp.json().get("usage", {}).get("prompt_tokens", "?"),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Session %s validation request failed: %s — skipping",
+                    session_key, exc,
+                )
+
+        if not all_ok:
+            logger.warning(
+                "Message chain validation found issues — "
+                "restart will proceed but _sanitize_message_chain will attempt repair"
+            )
+        return all_ok
 
     def _write_restart_marker(self) -> None:
         """Write pending tool call info to a restart marker file.
