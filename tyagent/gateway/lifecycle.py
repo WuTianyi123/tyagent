@@ -431,7 +431,12 @@ class GatewaySupervisor:
             if not messages:
                 continue
 
-            # Find orphaned tool calls
+            # Find orphaned tool calls — only the MOST RECENT orphaned
+            # turn matters. Earlier orphaned tool calls were abandoned by
+            # subsequent user/assistant messages and should NOT get
+            # synthetic responses (they would break the message chain by
+            # appearing after the current assistant message with wrong
+            # tool_call_ids).
             pending = []
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
@@ -453,8 +458,11 @@ class GatewaySupervisor:
                     n_actual += 1
                     j += 1
                 if n_actual >= n_expected:
-                    continue
+                    continue  # All tool calls have responses, not orphaned
 
+                # Found the most recent orphaned tool call(s).
+                # Earlier orphaned calls are abandoned (superseded by
+                # subsequent user messages) — don't include them.
                 for tc in tool_calls[n_actual:]:
                     tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
                     fn_name = (
@@ -465,6 +473,7 @@ class GatewaySupervisor:
                         "tool_call_id": tc_id,
                         "function_name": fn_name,
                     })
+                break  # Only the most recent orphaned turn
 
             if pending:
                 marker["sessions"][session_key] = {
@@ -524,10 +533,39 @@ class GatewaySupervisor:
             if not session_id or not pending:
                 continue
 
+            # Load current messages to check for existing tool responses
+            try:
+                current_msgs = gw.session_store.get_messages(
+                    session_key, session_id=session_id
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to load messages for %s — skipping", session_key,
+                )
+                continue
+
+            # Build set of existing tool_call_ids that already have responses
+            existing_responses: set[str] = set()
+            for m in current_msgs:
+                if m.get("role") == "tool" and m.get("tool_call_id"):
+                    tc_id = m["tool_call_id"]
+                    if isinstance(tc_id, str):
+                        existing_responses.add(tc_id)
+
             for tc_info in pending:
                 tc_id = tc_info.get("tool_call_id", "")
                 fn_name = tc_info.get("function_name", "?")
                 if not tc_id:
+                    continue
+
+                # Skip if a tool response already exists for this call_id
+                # (tool execution completed during the old process's stop timeout)
+                if tc_id in existing_responses:
+                    logger.info(
+                        "Skipping restart-completed response for %s/%s "
+                        "(tool_call_id=%s) — response already exists",
+                        session_key, fn_name, tc_id,
+                    )
                     continue
 
                 # Compute elapsed time since restart was initiated
