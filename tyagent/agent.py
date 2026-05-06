@@ -23,6 +23,8 @@ from tyagent.config import CompressionConfig
 from tyagent.events import EventCollector
 from tyagent.model_metadata import get_model_context_length
 from tyagent.prompt_builder import build_system_prompt
+from tyagent.subagent.mailbox import Mailbox
+from tyagent.subagent.task_tree import TaskTree
 from tyagent.types import AgentOutput, InboxMessage, ReplyTarget
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,7 @@ class TyAgent:
         model: str = "anthropic/claude-sonnet-4",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        provider: Optional[str] = None,
         max_tool_turns: Optional[int] = 200,
         system_prompt: str = "You are a helpful assistant.",
         reasoning_effort: Optional[str] = "high",
@@ -62,7 +65,27 @@ class TyAgent:
         self.home_dir = home_dir
         self.context_length = context_length
         self.api_key = api_key or os.environ.get("TYAGENT_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
-        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if base_url:
+            self.base_url = base_url
+        elif os.environ.get("OPENAI_BASE_URL"):
+            self.base_url = os.environ["OPENAI_BASE_URL"]
+        else:
+            # Resolve from provider, fallback to model prefix, default to OpenAI
+            _PROVIDER_URLS = {
+                "openai": "https://api.openai.com/v1",
+                "deepseek": "https://api.deepseek.com/v1",
+                "anthropic": "https://api.anthropic.com/v1",
+            }
+            if provider and provider in _PROVIDER_URLS:
+                self.base_url = _PROVIDER_URLS[provider]
+            elif model.lower().startswith("deepseek-"):
+                self.base_url = "https://api.deepseek.com/v1"
+            elif model.lower().startswith("gpt-") or model.lower().startswith("o1-") or model.lower().startswith("o3-"):
+                self.base_url = "https://api.openai.com/v1"
+            elif model.lower().startswith("claude-"):
+                self.base_url = "https://api.anthropic.com/v1"
+            else:
+                self.base_url = "https://api.openai.com/v1"
         self.max_tool_turns = max_tool_turns
         self.system_prompt = system_prompt
         self.reasoning_effort = reasoning_effort
@@ -106,8 +129,21 @@ class TyAgent:
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
         self._child_agents: Dict[str, "TyAgent"] = {}
-        """Running child agents keyed by task_id (for send_input lookup)."""
+        """Running child agents keyed by task_path (for send_input lookup)."""
         self._event_collector: Optional[EventCollector] = None
+        # ── v2 Sub-agent infrastructure ──────────────────────────
+        self._task_path: str = "/root"
+        """Canonical task path of THIS agent in the tree."""
+        self._child_mode: bool = False
+        """True when this agent was spawned as a child."""
+        self._parent_mailbox: Optional[Mailbox] = None
+        """Parent agent's mailbox (child sends completion here)."""
+        self._task_tree: Optional[TaskTree] = None
+        """Task path registry for this agent's spawned children."""
+        self._mailbox: Mailbox = Mailbox(owner_path="/root")
+        """This agent's own mailbox for incoming inter-agent messages."""
+        self._allowed_tool_names: Optional[List[str]] = None
+        """Tool names this agent is allowed to use (restricted for children)."""
         # When True, _run_turn checks inbox between tool calls (child agents)
         self._check_inbox_between_turns: bool = False
         # System prompt built once at init, then cached for prefix-cache
@@ -596,7 +632,11 @@ class TyAgent:
         ))
 
     async def _agent_loop(self) -> None:
-        """Permanent agent event loop — select! over inbox, collector, stop."""
+        """Permanent agent event loop — waits on inbox, mailbox, and stop signal.
+
+        Uses ``asyncio.wait(FIRST_COMPLETED)`` to block until any event source
+        has new data, then processes it in priority order.
+        """
         loop = asyncio.get_running_loop()
         from tyagent.tools.registry import registry
 
@@ -605,10 +645,8 @@ class TyAgent:
             stop_task = loop.create_task(self._stop_event.wait())
 
             tasks = [inbox_task, stop_task]
-            child_task = None
-            if self._event_collector:
-                child_task = loop.create_task(self._event_collector.wait_next())
-                tasks.append(child_task)
+            mailbox_task = loop.create_task(self._mailbox.wait_next(timeout=None))
+            tasks.append(mailbox_task)
 
             done, pending = await asyncio.wait(
                 tasks,
@@ -618,8 +656,6 @@ class TyAgent:
                 t.cancel()
 
             if stop_task in done:
-                # Handle the message consumed by inbox_task (if both
-                # stop_task and inbox_task completed in the same tick).
                 if inbox_task in done:
                     msg = inbox_task.result()
                     if msg.turn_done_cb:
@@ -627,8 +663,6 @@ class TyAgent:
                             msg.turn_done_cb()
                         except Exception:
                             pass
-                # Drain any remaining inbox messages — their turn_done
-                # callbacks must be fired so ProgressSenders are finished.
                 while not self._inbox.empty():
                     try:
                         msg = self._inbox.get_nowait()
@@ -639,26 +673,15 @@ class TyAgent:
                                 pass
                     except asyncio.QueueEmpty:
                         break
+                # ── Child mode: notify parent on exit ──────────
+                if self._child_mode:
+                    self._notify_parent_on_exit()
                 break
 
-            # ── Child completion notifications ─────────────────
-            # Injected into _messages but do NOT trigger a turn.
-            # They queue naturally; the next user-initiated turn
-            # will include them in context.
-            child_events = []
-            if self._event_collector is not None:
-                child_events = self._event_collector.drain_completed()
-            for event in child_events:
-                task_id = event["task_id"]
-                result = event["result"]
-                summary = result.get("summary", "")
-                if summary:
-                    text = f"（子代理完成）任务 {task_id}:\n\n{summary}"
-                elif result.get("success"):
-                    text = f"（子代理完成）任务 {task_id} 已成功结束"
-                else:
-                    text = f"（子代理完成）任务 {task_id} 失败:\n\n{result.get('error', '未知错误')}"
-                self._messages.append({"role": "user", "content": text})
+            # ── Drain mailbox ───────────────────────────────────
+            mailbox_msgs, should_trigger = self._mailbox.drain_with_trigger_info()
+            for m in mailbox_msgs:
+                self._messages.append(m)
 
             # ── Process user message ───────────────────────────
             has_user_message = inbox_task in done
@@ -672,43 +695,134 @@ class TyAgent:
                 current_tool_cb = msg.tool_progress_cb
                 current_turn_done = msg.turn_done_cb
 
-            # ── Run turn with error handling ───────────────────
+            # ── Decide whether to run a turn ────────────────────
+            if not has_user_message and not should_trigger:
+                continue
+
+            # ── Run turn ───────────────────────────────────────
             tools = registry.get_definitions()
+            if self._allowed_tool_names is not None:
+                tools = [t for t in tools if t.get("function", {}).get("name") in self._allowed_tool_names]
+
+            # ── Inject active sub-agent summary ───────────────
+            self._inject_child_status()
             prev_tool_cb = self._tool_progress_callback
             self._tool_progress_callback = current_tool_cb
+            turn_error = None
             try:
                 content = await self._run_turn(tools=tools)
-                if content.strip():
-                    await self._output_queue.put(AgentOutput(
-                        text=content,
-                        reply_target=current_reply,
-                    ))
-                elif current_reply is not None:
-                    # Non-empty response required but got empty — put placeholder
-                    await self._output_queue.put(AgentOutput(
-                        text="(no response)",
-                        reply_target=current_reply,
-                    ))
             except AgentError as exc:
+                turn_error = str(exc)
                 logger.error("Agent loop error: %s", exc)
-                await self._output_queue.put(AgentOutput(
-                    text=f"❌ 错误: {exc}",
-                    reply_target=current_reply,
-                ))
+                content = f"❌ 错误: {exc}"
             except Exception as exc:
+                turn_error = str(exc)
                 logger.exception("Unexpected error in agent loop")
+                content = f"❌ 内部错误: {exc}"
+
+            # ── Child mode: notify parent of turn completion ───
+            if self._child_mode:
+                self._notify_parent_of_turn(content, error=turn_error)
+
+            # ── Output ──────────────────────────────────────────
+            if content.strip():
                 await self._output_queue.put(AgentOutput(
-                    text=f"❌ 内部错误: {exc}",
+                    text=content,
                     reply_target=current_reply,
                 ))
-            finally:
-                self._tool_progress_callback = prev_tool_cb
-                # Signal that this message's turn is done
-                if current_turn_done:
-                    try:
-                        current_turn_done()
-                    except Exception:
-                        pass
+            elif current_reply is not None:
+                await self._output_queue.put(AgentOutput(
+                    text="(no response)",
+                    reply_target=current_reply,
+                ))
+
+            self._tool_progress_callback = prev_tool_cb
+            if current_turn_done:
+                try:
+                    current_turn_done()
+                except Exception:
+                    pass
+
+    # ── Child-mode parent notification ─────────────────────────
+
+    def _inject_child_status(self) -> None:
+        """Inject a compact active sub-agents summary into _messages.
+
+        Called before every turn so the LLM never loses track of
+        running children even across compactions or long tool chains.
+        Only the topmost non-root nodes are shown (not the full tree).
+
+        Skipped when ``_task_tree`` is None or has no children.
+        """
+        tree = self._task_tree
+        if tree is None:
+            return
+        agents = [
+            (p, tree.path_status(p) or "unknown")
+            for p in tree.all_paths()
+            if p != tree.root_path
+        ]
+        if not agents:
+            return
+
+        # Compact: sort by path, truncate if too many
+        agents.sort()
+        if len(agents) <= 6:
+            entries = ", ".join(f"{p}({st})" for p, st in agents)
+        else:
+            shown = agents[:5]
+            entries = ", ".join(f"{p}({st})" for p, st in shown)
+            entries += f", ... ({len(agents)} total)"
+
+        text = f"Active sub-agents: {entries}"
+        self._messages.append({"role": "user", "content": text})
+
+    def _notify_parent_of_turn(
+        self, content: str, *, error: Optional[str] = None,
+    ) -> None:
+        """Send turn result to parent's mailbox (child mode only).
+
+        Called after each turn completes so the parent agent can decide
+        whether to send follow-up work or close this child.
+        """
+        if self._parent_mailbox is None:
+            return
+        task_path = self._task_path or "/root/child"
+        if error:
+            msg_text = f"Turn error ({task_path}): {error}"
+        elif content.strip():
+            # Truncate to a reasonable summary size for mailbox
+            summary = content[:1500].strip()
+            if len(content) > 1500:
+                summary += "…"
+            msg_text = f"Turn completed ({task_path}):\n\n{summary}"
+        else:
+            msg_text = f"Turn completed ({task_path}) — no output"
+
+        from tyagent.subagent.mailbox import InterAgentMessage
+        self._parent_mailbox.send(InterAgentMessage(
+            author=task_path,
+            recipient=self._parent_mailbox.owner_path,
+            content=msg_text,
+            trigger_turn=True,  # parent should process this result
+        ))
+
+    def _notify_parent_on_exit(self) -> None:
+        """Send FinalNotification to parent when child's agent loop exits.
+
+        Called from ``_agent_loop`` just before ``break`` on stop.
+        """
+        if self._parent_mailbox is None:
+            return
+        task_path = self._task_path or "/root/child"
+        from tyagent.subagent.mailbox import FinalNotification
+        self._parent_mailbox.send(FinalNotification(
+            task_path=task_path,
+            success=True,
+            summary=f"Agent {task_path} shut down",
+            error=None,
+            duration_seconds=0.0,
+        ))
 
     async def close(self) -> None:
         """Close agent and clean up."""
@@ -716,6 +830,8 @@ class TyAgent:
             await self.stop()
         self._bg_tasks.clear()
         self._event_collector = None
+        self._task_tree = None
+        self._child_agents.clear()
         await self._client.aclose()
 
     @classmethod
@@ -726,6 +842,7 @@ class TyAgent:
             model=config.model,
             api_key=getattr(config, "api_key", None),
             base_url=config.base_url,
+            provider=getattr(config, "provider", None),
             max_tool_turns=getattr(config, "max_tool_turns", 200),
             system_prompt=config.system_prompt,
             reasoning_effort=getattr(config, "reasoning_effort", "high"),

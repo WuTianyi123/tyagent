@@ -422,9 +422,18 @@ class Gateway:
                 message_id=event.message_id or "",
             )
             # Capture progress_sender in closure so turn_done finishes it
+            # Also remove the ⌨️ processing reaction now that the agent turn
+            # has truly completed (scheme B: response done → reaction gone).
             _ps = progress_sender
+            _adapter = adapter
+            _ev_msg_id = event.message_id
             def _turn_done() -> None:
                 _ps.finish()
+                if _ev_msg_id and hasattr(_adapter, 'remove_pending_reaction'):
+                    try:
+                        _adapter.remove_pending_reaction(_ev_msg_id)
+                    except Exception:
+                        pass
 
             await agent.send_message(
                 final_text,
@@ -436,6 +445,11 @@ class Gateway:
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
             progress_sender.finish()
+            if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
+                try:
+                    adapter.remove_pending_reaction(event.message_id)
+                except Exception:
+                    pass
             try: await progress_task
             except: pass
             await adapter.send_message(
@@ -445,6 +459,11 @@ class Gateway:
         except Exception:
             logger.exception("Unexpected agent error")
             progress_sender.finish()
+            if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
+                try:
+                    adapter.remove_pending_reaction(event.message_id)
+                except Exception:
+                    pass
             try: await progress_task
             except: pass
             await adapter.send_message(
@@ -470,8 +489,11 @@ class Gateway:
         agent = self._get_or_create_agent(session_key)
 
         # Start the permanent agent loop with history and persistence
+        # Sanitize the message chain to repair orphaned tool_calls from
+        # crashes/restarts mid-tool-execution (e.g. assistant with 2 tool_calls
+        # but only 1 tool response persisted before kill).
         await agent.start(
-            history=session.messages,
+            history=_sanitize_message_chain(session.messages),
             on_message=persist_message,
         )
 

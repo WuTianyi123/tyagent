@@ -708,6 +708,9 @@ class TestLegacyMigration:
 
 class _MinimalAdapter(BasePlatformAdapter):
     """Minimal concrete adapter for testing."""
+    def __init__(self, config=None, *, platform_name="test", home_dir=None):
+        super().__init__(config, platform_name=platform_name, home_dir=home_dir)
+
     async def connect(self) -> None:
         pass
     async def disconnect(self) -> None:
@@ -718,6 +721,135 @@ class _MinimalAdapter(BasePlatformAdapter):
         pass
     async def send_message(self, target, text, **kwargs):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Gateway._load_adapters — config → adapter integration
+# ---------------------------------------------------------------------------
+
+
+class TestLoadAdapters:
+    """Integration: _load_adapters() exercises the full config→adapter chain
+    that unit tests of get_connected_platforms() alone don't cover. The bug
+    where get_connected_platforms() read old-format extra.app_id slipped
+    through because no test called _load_adapters() with new-format config."""
+
+    @pytest.mark.asyncio
+    async def test_loads_adapter_from_new_format_config(self, tmp_path):
+        """New-format config (extra.connection.app_id) → adapter is loaded."""
+        from tyagent.config import PlatformConfig, TyAgentConfig, AgentConfig
+        import tyagent.gateway.gateway as gw_mod
+
+        config = TyAgentConfig(
+            platforms={
+                "feishu": PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "connection": {
+                            "app_id": "cli_test_app",
+                            "app_secret": "test_secret",
+                        },
+                    },
+                ),
+            },
+            agent=AgentConfig(model="test", api_key="k"),
+            sessions_dir=tmp_path / "sessions",
+        )
+
+        saved_registry = dict(gw_mod._PLATFORM_REGISTRY)
+        try:
+            with patch.object(gw_mod, "_load_builtin_platforms"):
+                gw_mod._PLATFORM_REGISTRY.clear()
+                gw_mod._PLATFORM_REGISTRY["feishu"] = _MinimalAdapter
+
+                gw = Gateway(config)
+                gw._load_adapters()
+
+                assert "feishu" in gw.adapters
+                assert isinstance(gw.adapters["feishu"], _MinimalAdapter)
+        finally:
+            gw_mod._PLATFORM_REGISTRY.clear()
+            gw_mod._PLATFORM_REGISTRY.update(saved_registry)
+            gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_skips_adapter_without_app_id(self, tmp_path):
+        """New-format config without app_id → adapter NOT loaded."""
+        from tyagent.config import PlatformConfig, TyAgentConfig, AgentConfig
+        import tyagent.gateway.gateway as gw_mod
+
+        config = TyAgentConfig(
+            platforms={
+                "feishu": PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "connection": {
+                            "app_secret": "test_secret",
+                            # no app_id
+                        },
+                    },
+                ),
+            },
+            agent=AgentConfig(model="test", api_key="k"),
+            sessions_dir=tmp_path / "sessions",
+        )
+
+        saved_registry = dict(gw_mod._PLATFORM_REGISTRY)
+        try:
+            with patch.object(gw_mod, "_load_builtin_platforms"):
+                gw_mod._PLATFORM_REGISTRY.clear()
+                gw_mod._PLATFORM_REGISTRY["feishu"] = _MinimalAdapter
+
+                gw = Gateway(config)
+                gw._load_adapters()
+
+                assert "feishu" not in gw.adapters
+        finally:
+            gw_mod._PLATFORM_REGISTRY.clear()
+            gw_mod._PLATFORM_REGISTRY.update(saved_registry)
+            gw.session_store.close()
+
+    @pytest.mark.asyncio
+    async def test_skips_disabled_platform(self, tmp_path):
+        """Disabled platform (even with valid creds) → NOT loaded."""
+        from tyagent.config import PlatformConfig, TyAgentConfig, AgentConfig
+        import tyagent.gateway.gateway as gw_mod
+
+        config = TyAgentConfig(
+            platforms={
+                "feishu": PlatformConfig(
+                    enabled=False,
+                    extra={
+                        "connection": {
+                            "app_id": "cli_test_app",
+                            "app_secret": "test_secret",
+                        },
+                    },
+                ),
+            },
+            agent=AgentConfig(model="test", api_key="k"),
+            sessions_dir=tmp_path / "sessions",
+        )
+
+        saved_registry = dict(gw_mod._PLATFORM_REGISTRY)
+        try:
+            with patch.object(gw_mod, "_load_builtin_platforms"):
+                gw_mod._PLATFORM_REGISTRY.clear()
+                gw_mod._PLATFORM_REGISTRY["feishu"] = _MinimalAdapter
+
+                gw = Gateway(config)
+                gw._load_adapters()
+
+                assert "feishu" not in gw.adapters
+        finally:
+            gw_mod._PLATFORM_REGISTRY.clear()
+            gw_mod._PLATFORM_REGISTRY.update(saved_registry)
+            gw.session_store.close()
+
+
+# ---------------------------------------------------------------------------
+# Adapter home_dir
+# ---------------------------------------------------------------------------
 
 
 class TestAdapterHomeDir:

@@ -394,11 +394,46 @@ class TestTyAgentConfigGetConnectedPlatforms:
         cfg = TyAgentConfig(
             platforms={
                 "feishu": PlatformConfig(
-                    enabled=True, extra={"app_id": "abc123"}
+                    enabled=True, extra={"connection": {"app_id": "abc123"}}
                 )
             }
         )
         assert cfg.get_connected_platforms() == ["feishu"]
+
+    def test_feishu_grouped_full_config_connected(self):
+        """Feishu with all three extra groups populated should connect."""
+        cfg = TyAgentConfig(
+            platforms={
+                "feishu": PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "connection": {
+                            "app_id": "my-app",
+                            "app_secret": "sec",
+                            "domain": "feishu",
+                        },
+                        "behavior": {"group_policy": "mention"},
+                        "event_subscription": {
+                            "encrypt_key": "",
+                            "verification_token": "",
+                        },
+                    },
+                )
+            }
+        )
+        assert cfg.get_connected_platforms() == ["feishu"]
+
+    def test_feishu_connection_group_without_app_id_excluded(self):
+        """Connection group present but app_id missing → not connected."""
+        cfg = TyAgentConfig(
+            platforms={
+                "feishu": PlatformConfig(
+                    enabled=True,
+                    extra={"connection": {"domain": "feishu"}},
+                )
+            }
+        )
+        assert cfg.get_connected_platforms() == []
 
     def test_feishu_without_app_id_excluded(self):
         cfg = TyAgentConfig(

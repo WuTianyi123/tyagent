@@ -1,5 +1,5 @@
-"""Tests for async sub-agent tools — spawn, wait, close, list."""
-
+"""Tests for v2 sub-agent tools — spawn, wait, close, list, send_input,
+send_message, followup_task, resume_agent."""
 from __future__ import annotations
 
 import json
@@ -10,20 +10,24 @@ import pytest
 from tyagent.agent import TyAgent
 from tyagent.tools import delegate_tool
 from tyagent.tools.delegate_tool import (
-    DELEGATE_BLOCKED_TOOLS,
+    CHILD_BLOCKED_TOOLS,
     DEFAULT_SUBAGENT_MAX_TOOL_TURNS,
+    ROOT_PATH,
     _handle_close_task,
+    _handle_followup_task,
     _handle_list_tasks,
+    _handle_resume_agent,
+    _handle_send_input,
+    _handle_send_message,
     _handle_spawn_task,
     _handle_wait_task,
-    _run_child_async,
 )
 from tyagent.tools.registry import registry
 
+# Only async tests need this — sync registration/schema tests work without
+pytestmark = pytest.mark.asyncio
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Helpers ────────────────────────────────────────────────
 
 
 def _make_agent(**overrides) -> MagicMock:
@@ -35,316 +39,327 @@ def _make_agent(**overrides) -> MagicMock:
     agent.system_prompt = overrides.get("system_prompt", "You are a test agent.")
     agent.reasoning_effort = overrides.get("reasoning_effort", None)
     agent._compression_config = overrides.get("compression", None)
+    agent._task_path = ROOT_PATH
+    agent._task_tree = delegate_tool.TaskTree()
+    agent._mailbox = delegate_tool.Mailbox(owner_path=ROOT_PATH)
+    agent._child_agents = {}
+    agent._bg_tasks = {}
+    agent._tool_progress_callback = None
+    agent.home_dir = None
+    agent.context_length = None
+    agent._max_tokens = 4096
+    agent._temperature = 0.7
+    agent._http_timeout = 120.0
+    agent._shutdown_timeout = 5.0
+    agent.send_message = AsyncMock()
+    agent.close = AsyncMock()
     return agent
 
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════
 # Registration & schema
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════
 
 
-class TestAsyncToolsRegistration:
-    def test_spawn_task_registered(self):
-        assert "spawn_task" in registry.get_all_names()
+class TestV2ToolsRegistration:
+    def test_all_eight_tools_registered(self):
+        names = registry.get_all_names()
+        for tool in ("spawn_task", "wait_task", "close_task", "list_tasks",
+                     "send_input", "send_message", "followup_task", "resume_agent"):
+            assert tool in names, f"Missing tool: {tool}"
 
-    def test_wait_task_registered(self):
-        assert "wait_task" in registry.get_all_names()
-
-    def test_close_task_registered(self):
-        assert "close_task" in registry.get_all_names()
-
-    def test_list_tasks_registered(self):
-        assert "list_tasks" in registry.get_all_names()
-
-    def test_spawn_schema_has_goal_required(self):
-        schemas = registry.get_definitions(names=["spawn_task"])
-        assert len(schemas) == 1
-        fn = schemas[0]["function"]
-        assert "goal" in fn["parameters"]["required"]
-        assert "goal" in fn["parameters"]["properties"]
-
-    def test_spawn_schema_has_max_tool_turns_with_bounds(self):
+    def test_spawn_schema_requires_task_name_and_goal(self):
         schemas = registry.get_definitions(names=["spawn_task"])
         fn = schemas[0]["function"]
-        mt = fn["parameters"]["properties"]["max_tool_turns"]
-        assert mt["minimum"] == 1
-        assert mt["maximum"] == 200
+        required = fn["parameters"]["required"]
+        assert "task_name" in required
+        assert "goal" in required
 
-    def test_wait_schema_has_task_ids_required(self):
+    def test_spawn_schema_has_fork_turns(self):
+        schemas = registry.get_definitions(names=["spawn_task"])
+        fn = schemas[0]["function"]
+        props = fn["parameters"]["properties"]
+        assert "fork_turns" in props
+
+    def test_wait_v2_schema_no_targets(self):
         schemas = registry.get_definitions(names=["wait_task"])
-        assert len(schemas) == 1
         fn = schemas[0]["function"]
-        assert "task_ids" in fn["parameters"]["required"]
+        # v2: no "targets" or "task_ids" — only timeout
+        assert "targets" not in fn["parameters"].get("required", [])
+        assert "task_ids" not in fn["parameters"].get("required", [])
+        assert "timeout" in fn["parameters"]["properties"]
 
-    def test_close_schema_has_task_id_required(self):
+    def test_close_schema_has_target_required(self):
         schemas = registry.get_definitions(names=["close_task"])
-        assert len(schemas) == 1
         fn = schemas[0]["function"]
-        assert "task_id" in fn["parameters"]["required"]
+        assert "target" in fn["parameters"]["required"]
 
+    def test_list_tasks_schema_has_path_prefix(self):
+        schemas = registry.get_definitions(names=["list_tasks"])
+        fn = schemas[0]["function"]
+        assert "path_prefix" in fn["parameters"]["properties"]
 
-# ---------------------------------------------------------------------------
-# Blocked tools
-# ---------------------------------------------------------------------------
-
-
-class TestBlockedTools:
-    def test_memory_is_blocked(self):
-        assert "memory" in DELEGATE_BLOCKED_TOOLS
-
-    def test_spawn_task_is_blocked(self):
-        assert "spawn_task" in DELEGATE_BLOCKED_TOOLS
-
-    def test_wait_task_is_blocked(self):
-        assert "wait_task" in DELEGATE_BLOCKED_TOOLS
-
-    def test_close_task_is_blocked(self):
-        assert "close_task" in DELEGATE_BLOCKED_TOOLS
-
-    def test_list_tasks_is_blocked(self):
-        assert "list_tasks" in DELEGATE_BLOCKED_TOOLS
-
-    def test_send_input_is_blocked(self):
-        assert "send_input" in DELEGATE_BLOCKED_TOOLS
-
-    def test_blocked_tools_is_immutable(self):
-        with pytest.raises(Exception):
-            DELEGATE_BLOCKED_TOOLS.remove("memory")
-
-
-# ---------------------------------------------------------------------------
-# send_input — mid-turn messaging to child agents
-# ---------------------------------------------------------------------------
-
-
-class TestSendInput:
-    """Tests for _handle_send_input — sending messages to running children."""
-
-    @pytest.mark.asyncio
-    async def test_valid_send(self):
-        """send_input puts a message in the child's inbox."""
-        child = MagicMock(spec=TyAgent)
-        child.send_message = AsyncMock()
-        parent = _make_agent()
-        parent._child_agents = {"abc": child}
-
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"target": "abc", "message": "Hello"}, parent_agent=parent,
-        ))
-        assert result["success"] is True
-        assert result["target"] == "abc"
-        child.send_message.assert_called_once_with("（来自主代理的指导）Hello")
-
-    @pytest.mark.asyncio
-    async def test_interrupt_flag(self):
-        """interrupt=true is accepted and reflected in status."""
-        child = MagicMock(spec=TyAgent)
-        child.send_message = AsyncMock()
-        parent = _make_agent()
-        parent._child_agents = {"abc": child}
-
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"target": "abc", "message": "H", "interrupt": True},
-            parent_agent=parent,
-        ))
-        assert result["status"] == "interrupted"
-
-    @pytest.mark.asyncio
-    async def test_missing_target(self):
-        """Missing target yields an error."""
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"message": "Hi"}, parent_agent=_make_agent(),
-        ))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_missing_message(self):
-        """Missing message yields an error."""
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"target": "abc"}, parent_agent=_make_agent(),
-        ))
-        assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_unknown_target(self):
-        """Non-existent task_id yields an error."""
-        parent = _make_agent()
-        parent._child_agents = {}
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"target": "nonexistent", "message": "Hi"},
-            parent_agent=parent,
-        ))
-        assert "error" in result
-        assert "not found" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_no_parent_agent(self):
-        """Missing parent_agent yields an error."""
-        from tyagent.tools.delegate_tool import _handle_send_input
-        result = json.loads(await _handle_send_input(
-            {"target": "abc", "message": "Hi"},
-        ))
-        assert "error" in result
-
-    def test_send_input_registered(self):
-        """send_input is registered as a tool."""
-        from tyagent.tools.registry import registry
-        assert "send_input" in registry.get_all_names()
-
-    def test_send_input_has_required_params(self):
-        """send_input schema has target and message as required."""
-        from tyagent.tools.registry import registry
-        schemas = registry.get_definitions(names=["send_input"])
-        assert len(schemas) == 1
+    def test_send_message_registered(self):
+        schemas = registry.get_definitions(names=["send_message"])
         fn = schemas[0]["function"]
         assert "target" in fn["parameters"]["required"]
         assert "message" in fn["parameters"]["required"]
 
+    def test_followup_task_registered(self):
+        schemas = registry.get_definitions(names=["followup_task"])
+        fn = schemas[0]["function"]
+        assert "target" in fn["parameters"]["required"]
+        assert "message" in fn["parameters"]["required"]
 
-# ---------------------------------------------------------------------------
-# _run_child_async — async child agent runner
-# ---------------------------------------------------------------------------
+    def test_resume_agent_registered(self):
+        schemas = registry.get_definitions(names=["resume_agent"])
+        fn = schemas[0]["function"]
+        assert "id" in fn["parameters"]["required"]
 
 
-class TestRunChildAsync:
-    """Tests for the async child agent runner."""
+# ═══════════════════════════════════════════════════════════
+# Blocked tools (only memory for children)
+# ═══════════════════════════════════════════════════════════
 
-    @pytest.mark.asyncio
-    async def test_successful_child_run(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="Child completed task successfully.")
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
 
-            result = await _run_child_async(
-                task_id="t1",
-                model="test", api_key="k", base_url="http://x",
-                system_prompt="Test system prompt", reasoning_effort=None,
-                goal="Do a thing", tool_names=["read_file", "write_file"],
-                max_tool_turns=30, context=None,
-            )
+class TestChildBlockedTools:
+    def test_only_memory_is_blocked(self):
+        assert CHILD_BLOCKED_TOOLS == frozenset(["memory"])
 
-        assert result["success"] is True
-        assert result["summary"] == "Child completed task successfully."
-        assert result["error"] is None
-        assert "duration_seconds" in result
+    def test_spawn_is_not_blocked_for_children(self):
+        assert "spawn_task" not in CHILD_BLOCKED_TOOLS
 
-    @pytest.mark.asyncio
-    async def test_child_run_with_context(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="done")
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
+    def test_wait_is_not_blocked_for_children(self):
+        assert "wait_task" not in CHILD_BLOCKED_TOOLS
 
-            await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="Base prompt.", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30,
-                context="Extra context here",
-            )
 
-            _, kwargs = mock_cls.call_args
-            system = kwargs["system_prompt"]
-            assert "Base prompt." in system
-            assert "Extra context here" in system
+# ═══════════════════════════════════════════════════════════
+# spawn_task handler
+# ═══════════════════════════════════════════════════════════
 
-    @pytest.mark.asyncio
-    async def test_child_run_without_context_uses_pure_system_prompt(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="done")
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
 
-            await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="Pure prompt.", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30, context=None,
-            )
+class TestSpawnTask:
+    async def test_requires_task_name(self):
+        result = await _handle_spawn_task({"goal": "do X"}, parent_agent=None)
+        data = json.loads(result)
+        assert data["error"]
 
-            _, kwargs = mock_cls.call_args
-            assert kwargs["system_prompt"] == "Pure prompt."
+    async def test_requires_goal(self):
+        ag = _make_agent()
+        result = await _handle_spawn_task({"task_name": "do_x"}, parent_agent=ag)
+        data = json.loads(result)
+        assert data["error"]
 
-    @pytest.mark.asyncio
-    async def test_child_failure_captured(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(side_effect=RuntimeError("Boom"))
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
+    async def test_returns_task_path(self):
+        ag = _make_agent()
+        result = await _handle_spawn_task(
+            {"task_name": "test_task", "goal": "do something"},
+            parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert "task_path" in data
+        assert data["task_path"] == "/root/test_task"
+        assert data["status"] == "running"
 
-            result = await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="p", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30, context=None,
-            )
+    async def test_rejects_duplicate_task_name(self):
+        ag = _make_agent()
+        await _handle_spawn_task(
+            {"task_name": "dup", "goal": "first"}, parent_agent=ag,
+        )
+        result = await _handle_spawn_task(
+            {"task_name": "dup", "goal": "second"}, parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert data["error"]
 
-        assert result["success"] is False
-        assert "Boom" in result["error"]
+    async def test_requires_parent_agent(self):
+        result = await _handle_spawn_task(
+            {"task_name": "orphan", "goal": "help"}, parent_agent=None,
+        )
+        data = json.loads(result)
+        assert data["error"]
+        assert "session agent" in str(data["error"])
 
-    @pytest.mark.asyncio
-    async def test_child_close_failure_is_silent(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="done")
-            mock_child.close = AsyncMock(side_effect=RuntimeError("Close failed"))
-            mock_cls.return_value = mock_child
 
-            result = await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="p", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30, context=None,
-            )
+# ═══════════════════════════════════════════════════════════
+# wait_task handler
+# ═══════════════════════════════════════════════════════════
 
-        assert result["success"] is True
-        assert result["summary"] == "done"
 
-    @pytest.mark.asyncio
-    async def test_empty_summary_stripped(self):
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="   ")
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
+class TestWaitTask:
+    async def test_waits_for_mailbox(self):
+        ag = _make_agent()
+        # Pre-fill mailbox with a notification
+        ag._mailbox.send(delegate_tool.FinalNotification(
+            task_path="/root/test", success=True,
+            summary="all done", error=None, duration_seconds=1.0,
+        ))
+        result = await _handle_wait_task({"timeout": 1}, parent_agent=ag)
+        data = json.loads(result)
+        assert data["timed_out"] is False
+        assert "completions" in data
+        assert any(c["task_path"] == "/root/test" for c in data["completions"])
 
-            result = await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="p", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30, context=None,
-            )
+    async def test_requires_parent_agent(self):
+        result = await _handle_wait_task({"timeout": 1}, parent_agent=None)
+        data = json.loads(result)
+        assert data["error"]
 
-        assert result["summary"] == ""
 
-    @pytest.mark.asyncio
-    async def test_notifies_collector(self):
-        collector = MagicMock()
-        with patch("tyagent.tools.delegate_tool.registry.get_definitions", return_value=[]), \
-             patch("tyagent.tools.delegate_tool.TyAgent") as mock_cls:
-            mock_child = MagicMock()
-            mock_child.chat = AsyncMock(return_value="done")
-            mock_child.close = AsyncMock()
-            mock_cls.return_value = mock_child
+# ═══════════════════════════════════════════════════════════
+# close_task handler
+# ═══════════════════════════════════════════════════════════
 
-            await _run_child_async(
-                task_id="t1", model="test", api_key="k", base_url="http://x",
-                system_prompt="p", reasoning_effort=None,
-                goal="task", tool_names=[], max_tool_turns=30,
-                context=None, collector=collector,
-            )
 
-        collector.notify_child_done.assert_called_once()
-        args, _ = collector.notify_child_done.call_args
-        assert args[0] == "t1"
+class TestCloseTask:
+    async def test_close_existing(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "child", agent=None)
+        result = await _handle_close_task({"target": "child"}, parent_agent=ag)
+        data = json.loads(result)
+        assert "previous_status" in data
+
+    async def test_close_not_found(self):
+        ag = _make_agent()
+        result = await _handle_close_task({"target": "ghost"}, parent_agent=ag)
+        data = json.loads(result)
+        assert not data["success"]
+
+    async def test_requires_parent_agent(self):
+        result = await _handle_close_task({"target": "x"}, parent_agent=None)
+        data = json.loads(result)
+        assert data["error"]
+
+
+# ═══════════════════════════════════════════════════════════
+# list_tasks handler
+# ═══════════════════════════════════════════════════════════
+
+
+class TestListTasks:
+    async def test_list_empty(self):
+        ag = _make_agent()
+        result = await _handle_list_tasks({}, parent_agent=ag)
+        data = json.loads(result)
+        assert data["agents"] == []
+
+    async def test_list_with_agents(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "a", agent=None)
+        ag._task_tree.register(ROOT_PATH, "b", agent=None)
+        result = await _handle_list_tasks({}, parent_agent=ag)
+        data = json.loads(result)
+        assert len(data["agents"]) == 2
+        names = {a["agent_name"] for a in data["agents"]}
+        assert "/root/a" in names
+        assert "/root/b" in names
+
+    async def test_list_with_path_prefix(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "main", agent=None)
+        ag._task_tree.register("/root/main", "sub", agent=None)
+        ag._task_tree.register(ROOT_PATH, "side", agent=None)
+
+        result = await _handle_list_tasks(
+            {"path_prefix": "/root/main"}, parent_agent=ag,
+        )
+        data = json.loads(result)
+        names = {a["agent_name"] for a in data["agents"]}
+        assert "/root/main" in names
+        assert "/root/main/sub" in names
+        assert "/root/side" not in names
+
+
+# ═══════════════════════════════════════════════════════════
+# send_input handler
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSendInput:
+    async def test_send_to_running_child(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "child", agent=None)
+
+        child_mock = MagicMock(spec=TyAgent)
+        child_mock.send_message = AsyncMock()
+        ag._child_agents["/root/child"] = child_mock
+
+        result = await _handle_send_input(
+            {"target": "child", "message": "rethink!"},
+            parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert data["success"] is True
+        child_mock.send_message.assert_called_once()
+
+    async def test_child_not_found(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "child", agent=None)
+        result = await _handle_send_input(
+            {"target": "ghost", "message": "hi"},
+            parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert not data["success"]
+
+
+# ═══════════════════════════════════════════════════════════
+# send_message handler
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSendMessage:
+    async def test_send_message_no_trigger(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "child", agent=None)
+        child_mock = MagicMock(spec=TyAgent)
+        child_mock.send_message = AsyncMock()
+        ag._child_agents["/root/child"] = child_mock
+
+        result = await _handle_send_message(
+            {"target": "child", "message": "fyi"},
+            parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["status"] == "delivered"
+
+
+# ═══════════════════════════════════════════════════════════
+# followup_task handler
+# ═══════════════════════════════════════════════════════════
+
+
+class TestFollowupTask:
+    async def test_followup_triggers_turn(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "child", agent=None)
+        child_mock = MagicMock(spec=TyAgent)
+        child_mock._mailbox = delegate_tool.Mailbox()
+        child_mock.send_message = AsyncMock()
+        ag._child_agents["/root/child"] = child_mock
+
+        result = await _handle_followup_task(
+            {"target": "child", "message": "new task"},
+            parent_agent=ag,
+        )
+        data = json.loads(result)
+        assert data["success"] is True
+        # Mailbox should have received an InterAgentMessage with trigger_turn=True
+        assert child_mock._mailbox.peek() is True
+
+
+# ═══════════════════════════════════════════════════════════
+# resume_agent handler
+# ═══════════════════════════════════════════════════════════
+
+
+class TestResumeAgent:
+    async def test_resume_not_supported_yet(self):
+        ag = _make_agent()
+        ag._task_tree.register(ROOT_PATH, "old", agent=None)
+        ag._task_tree.set_status("/root/old", "completed")
+        result = await _handle_resume_agent({"id": "/root/old"}, parent_agent=ag)
+        data = json.loads(result)
+        assert not data["success"]
+        assert "not yet supported" in str(data["error"])

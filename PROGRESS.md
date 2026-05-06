@@ -41,7 +41,7 @@
 - `tyagent/migrate.py`：v1→v2 自动迁移
 
 ### Actor 模型 + 异步子代理（2026-04-28）
-- Gateway actor 模型：`select!` over inbox/collector/stop
+- Gateway actor 模型：asyncio.wait(FIRST_COMPLETED) over inbox/collector/stop
 - 子代理工具：`spawn`/`wait`/`close`/`list_tasks`
 - `session_key` 隔离（`/new` = archive 旧 + 新 key 不删数据）
 - `EventCollector` 子代理完成事件桥接

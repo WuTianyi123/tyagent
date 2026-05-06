@@ -35,6 +35,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "agent": {
         "provider": _DEFAULT_PROVIDER,
         "model": _DEFAULT_MODEL,
+        "base_url": None,
         "max_tool_turns": 200,
         "reasoning_effort": "high",
         "system_prompt": "",
@@ -314,9 +315,12 @@ class TyAgentConfig:
         for name, cfg in self.platforms.items():
             if not cfg.enabled:
                 continue
-            if name == "feishu" and cfg.extra.get("app_id"):
-                connected.append(name)
-            elif cfg.token or cfg.api_key:
+            if name == "feishu":
+                conn = cfg.extra.get("connection", {}) or {}
+                if conn.get("app_id"):
+                    connected.append(name)
+                    continue
+            if cfg.token or cfg.api_key:
                 connected.append(name)
         return connected
 

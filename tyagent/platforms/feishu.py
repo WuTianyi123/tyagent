@@ -57,7 +57,6 @@ _DEDUP_TTL_SECONDS = 24 * 60 * 60
 
 # Feishu processing reaction constants
 _FEISHU_REACTION_IN_PROGRESS = "Typing"        # ⌨️ badge — processing
-_FEISHU_PROCESSING_REACTION_CACHE_SIZE = 100   # LRU bound for reaction handles
 
 # Content-Type to extension mapping (supplements mimetypes)
 _CT_EXT_OVERRIDES = {
@@ -637,27 +636,21 @@ class FeishuAdapter(BasePlatformAdapter):
 
         self.app_id: str = (
             (config.extra.get("connection", {}) or {}).get("app_id", "")
-            or config.extra.get("app_id", "")
         )
         self.app_secret: str = (
             (config.extra.get("connection", {}) or {}).get("app_secret", "")
-            or config.extra.get("app_secret", "")
         )
         self.domain: str = (
             (config.extra.get("connection", {}) or {}).get("domain", "feishu")
-            or config.extra.get("domain", "feishu")
         )
         self.encrypt_key: str = (
             (config.extra.get("event_subscription", {}) or {}).get("encrypt_key", "")
-            or config.extra.get("encrypt_key", "")
         )
         self.verification_token: str = (
             (config.extra.get("event_subscription", {}) or {}).get("verification_token", "")
-            or config.extra.get("verification_token", "")
         )
         self.group_policy: str = (
             (config.extra.get("behavior", {}) or {}).get("group_policy", "mention")
-            or config.extra.get("group_policy", "mention")
         )  # "open" | "mention" | "disabled"
 
         if not self.app_id or not self.app_secret:
@@ -835,17 +828,14 @@ class FeishuAdapter(BasePlatformAdapter):
         return False
 
     def _remember_processing_reaction(self, message_id: str, reaction_id: str) -> None:
-        """Store a processing reaction handle in the LRU cache."""
-        cache = self._pending_processing_reactions
-        cache[message_id] = reaction_id
-        cache.move_to_end(message_id)
-        while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
-            evicted, _ = cache.popitem(last=False)
-            logger.warning(
-                "[Feishu] Evicted processing reaction for %s from cache (limit %d) — "
-                "⌨️ badge will be permanent on that message",
-                evicted, _FEISHU_PROCESSING_REACTION_CACHE_SIZE,
-            )
+        """Store a processing reaction handle.
+
+        No LRU eviction needed — entries are naturally cleaned up by
+        _pop_processing_reaction when each turn completes.  The number
+        of concurrent entries equals the number of concurrent active
+        turns (one per session), not the total message volume.
+        """
+        self._pending_processing_reactions[message_id] = reaction_id
 
     def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
         """Retrieve and remove a stored processing reaction handle."""
@@ -882,6 +872,20 @@ class FeishuAdapter(BasePlatformAdapter):
         if reaction_id:
             await self._remove_reaction(message_id, reaction_id)
 
+    def remove_pending_reaction(self, message_id: str) -> None:
+        """Synchronously schedule removal of the ⌨️ reaction.
+
+        Safe to call from sync callbacks (e.g. turn_done_cb in gateway).
+        Uses run_coroutine_threadsafe to schedule the async removal on
+        the adapter's event loop.
+        """
+        if not message_id or not self._loop or self._loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._remove_processing_reaction(message_id),
+            self._loop,
+        )
+
     # ---- Processing status reactions ----
 
     def _on_message(self, data: Any) -> None:
@@ -908,20 +912,21 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("Received message from %s in %s chat %s: %r",
                     event.sender_id, event.chat_type, event.chat_id, event.text)
 
-        # Schedule a single orchestrator coroutine that adds the ⌨️ reaction,
-        # then runs the handler, then cleans up — all in one atomic sequence.
-        # This eliminates the race where a fast handler could complete before
-        # _add_processing_reaction's API call had returned its reaction_id.
+        # Schedule a single orchestrator coroutine that adds the ⌨️ reaction.
+        # The reaction is removed by gateway's _turn_done callback after the
+        # agent's turn truly completes (not when _handle_message returns, which
+        # fires after message enqueue).
         async def _handle_with_reaction(ev: MessageEvent) -> Optional[str]:
-            """Add ⌨️, run handler, clean up — single coroutine, no race.
+            """Add ⌨️, run handler — reaction removed by turn_done callback.
 
-            Uses try/finally so the ⌨️ badge is always removed even if the
-            coroutine is cancelled (gateway shutdown).
+            The ⌨️ stays until the agent finishes generating its response
+            (scheme B: "response done → reaction gone").  On CancelledError
+            (gateway shutdown), we attempt best-effort cleanup here, though
+            the reaction may persist as a known cosmetic edge case.
 
             Note: base.py's _handle_message already catches all Exception and
             returns None, so exceptions from the message handler never propagate
-            here. The handler's result (str or None) is returned as-is; reaction
-            cleanup happens regardless.
+            here. The handler's result (str or None) is returned as-is.
             """
             do_reaction = (
                 self._reactions_enabled()
@@ -932,9 +937,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 if do_reaction:
                     await self._add_processing_reaction(ev.message_id)
                 return await self._handle_message(ev)
-            finally:
+            except asyncio.CancelledError:
                 if do_reaction:
                     await self._remove_processing_reaction(ev.message_id)
+                raise
 
         future = asyncio.run_coroutine_threadsafe(
             _handle_with_reaction(event), self._loop

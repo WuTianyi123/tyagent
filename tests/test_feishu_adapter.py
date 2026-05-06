@@ -1,18 +1,20 @@
-"""Tests for FeishuAdapter edit_message method.
+"""Tests for FeishuAdapter — edit_message method and credential extraction.
 
 Run with: python3 -m pytest tests/test_feishu_adapter.py -v
+
+Tests use real PlatformConfig objects (not MagicMock) so format migration
+issues are caught at test time. Only external dependencies are mocked:
+FEISHU_AVAILABLE (import guard) and _client (Lark SDK).
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import pytest
 
+from tyagent.config import PlatformConfig
 from tyagent.platforms.base import SendResult
 from tyagent.platforms.feishu import FeishuAdapter
 
@@ -21,32 +23,100 @@ from tyagent.platforms.feishu import FeishuAdapter
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
-def mock_config():
-    """Create a mock config with valid app credentials."""
-    config = MagicMock()
-    config.extra = {
-        "app_id": "cli_xxx",
-        "app_secret": "secret_xxx",
-        "domain": "feishu",
-    }
-    return config
+def platform_config():
+    """Real PlatformConfig with valid new-format credentials."""
+    return PlatformConfig(
+        enabled=True,
+        extra={
+            "connection": {
+                "app_id": "cli_test_app",
+                "app_secret": "test_app_secret",
+            },
+        },
+    )
 
 
 @pytest.fixture
-def adapter(mock_config):
-    """Create a FeishuAdapter instance with mocked dependencies."""
+def adapter(platform_config, tmp_path):
+    """FeishuAdapter with real config, mocked external deps only."""
     with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
-        with patch("tyagent.platforms.feishu.Path.home") as mock_home:
-            mock_home.return_value = Path("/tmp")
-            a = FeishuAdapter(mock_config)
-            a._client = MagicMock()
-            return a
+        a = FeishuAdapter(platform_config, home_dir=tmp_path)
+        a._client = MagicMock()
+        return a
+
+
+# ---------------------------------------------------------------------------
+# Tests: credential extraction from real config
+# ---------------------------------------------------------------------------
+
+
+class TestCredentialExtraction:
+    """Verify FeishuAdapter correctly extracts credentials from config.
+
+    These use real PlatformConfig objects — no MagicMock config.
+    If the extraction path changes (e.g., extra.connection.app_id →
+    extra.app_id), these tests will FAIL, not silently pass.
+    """
+
+    def test_extracts_app_id_from_connection_group(self, platform_config):
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            adapter = FeishuAdapter(platform_config)
+        assert adapter.app_id == "cli_test_app"
+
+    def test_extracts_app_secret_from_connection_group(self, platform_config):
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            adapter = FeishuAdapter(platform_config)
+        assert adapter.app_secret == "test_app_secret"
+
+    def test_extracts_domain_with_default(self, platform_config):
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            adapter = FeishuAdapter(platform_config)
+        assert adapter.domain == "feishu"
+
+    def test_empty_app_id_raises_valueerror(self):
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "connection": {
+                    "app_id": "",
+                    "app_secret": "secret",
+                },
+            },
+        )
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            with pytest.raises(ValueError, match="app_id"):
+                FeishuAdapter(config)
+
+    def test_missing_connection_group_raises_valueerror(self):
+        """Config with no connection group should fail — no fallback to old
+        format."""
+        config = PlatformConfig(enabled=True, extra={"other": "data"})
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            with pytest.raises(ValueError, match="app_id"):
+                FeishuAdapter(config)
+
+    def test_domain_from_config(self):
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "connection": {
+                    "app_id": "test",
+                    "app_secret": "secret",
+                    "domain": "lark",
+                },
+            },
+        )
+        with patch("tyagent.platforms.feishu.FEISHU_AVAILABLE", True):
+            adapter = FeishuAdapter(config)
+        assert adapter.domain == "lark"
 
 
 # ---------------------------------------------------------------------------
 # Tests: edit_message with client not initialized
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_edit_message_returns_failure_when_client_not_initialized(adapter):
@@ -64,6 +134,8 @@ async def test_edit_message_returns_failure_when_client_not_initialized(adapter)
 # ---------------------------------------------------------------------------
 # Tests: edit_message calls UPDATE API correctly
 # ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_edit_message_calls_update_api_with_text_msg_type(adapter):
     """Edit with text message should call the UPDATE API."""
@@ -83,7 +155,6 @@ async def test_edit_message_calls_update_api_with_text_msg_type(adapter):
     assert result.success is True
     assert result.message_id == "om_xxx"
     mock_update.assert_called_once()
-    # Verify the request was built correctly (check args of the call)
     args, kwargs = mock_update.call_args
     req = args[0]
     assert req.message_id == "om_xxx"
@@ -195,34 +266,3 @@ async def test_edit_message_handles_exception(adapter):
     assert result.success is False
     assert "Connection failed" in (result.error or "")
     assert result.retryable is True
-
-
-if __name__ == "__main__":
-    import traceback
-
-    tests = [
-        test_edit_message_returns_failure_when_client_not_initialized,
-        test_edit_message_calls_update_api_with_text_msg_type,
-        test_edit_message_calls_update_api_with_specified_msg_type,
-        test_edit_message_returns_message_id_on_success,
-        test_edit_message_returns_error_on_api_failure,
-        test_edit_message_with_markdown_content,
-        test_edit_message_handles_exception,
-    ]
-
-    passed = 0
-    failed = 0
-    for test in tests:
-        try:
-            import asyncio
-            asyncio.run(test(FeishuAdapter.__new__(FeishuAdapter)))
-            print(f"  PASS  {test.__name__}")
-            passed += 1
-        except Exception as exc:
-            print(f"  FAIL  {test.__name__}: {exc}")
-            traceback.print_exc()
-            failed += 1
-
-    print(f"\n{'=' * 50}")
-    print(f"Results: {passed} passed, {failed} failed")
-    sys.exit(0 if failed == 0 else 1)

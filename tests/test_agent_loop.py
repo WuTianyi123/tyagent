@@ -5,7 +5,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from tyagent.agent import TyAgent, AgentOutput, ReplyTarget
-from tyagent.events import EventCollector
+from tyagent.subagent.mailbox import FinalNotification
 
 pytestmark = pytest.mark.asyncio
 
@@ -101,15 +101,15 @@ class TestAgentLoop:
         await agent.stop()
 
     async def test_agent_loop_child_completion_triggers_turn(self):
-        """Child completion injected via collector triggers a turn."""
+        """Child completion injected via mailbox triggers a turn."""
         agent = TyAgent(model="test", api_key="k", base_url="http://x")
-        agent._event_collector = EventCollector()
 
-        # Child completes immediately
-        agent._event_collector.notify_child_done("c1", {
-            "success": True, "summary": "research done",
-            "error": None, "duration_seconds": 0.5,
-        })
+        # Send a FinalNotification to the mailbox before starting
+        agent._mailbox.send(FinalNotification(
+            task_path="/root/research",
+            success=True, summary="research done",
+            error=None, duration_seconds=0.5,
+        ))
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -120,11 +120,11 @@ class TestAgentLoop:
 
         with patch.object(agent._client, "post", AsyncMock(return_value=mock_response)):
             await agent.start()
-            # Child completion triggers a turn even without user message
+            # Child completion in mailbox triggers a turn even without user message
             output = await agent._output_queue.get()
             assert output.text == "Based on research: ..."
             # Verify notification was queued in _messages
-            assert any("子代理完成" in m["content"] for m in agent._messages)
+            assert any("research done" in m["content"] for m in agent._messages)
 
         await agent.stop()
 
