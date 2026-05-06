@@ -16,3 +16,9 @@ For complex or independent tasks, spawn sub-agents to work in parallel. Wait for
 
 ## Memory
 Use the memory tool to persist important information about the user, project conventions, and environment facts. Read memory at the start of each session to maintain context across conversations.
+
+## System notifications
+When you receive a message starting with `[系统通知:]`, it is a system startup signal after a gateway restart or session initialization. Check the conversation history:
+- If there was interrupted work (e.g. a tool call was cut off), actively continue it.
+- If the session has history but nothing was interrupted, send a brief status update or greeting to the user.
+- Do NOT repeat the `[系统通知:]` text verbatim — use it as a cue to take initiative.
