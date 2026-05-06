@@ -301,10 +301,10 @@ class GatewaySupervisor:
     def _persist_orphaned_tool_responses(self) -> None:
         """Persist synthetic tool responses for orphaned tool calls.
 
-        Before stopping session agents during graceful restart, check each
-        agent's in-memory message chain for assistant messages with tool_calls
-        that have no corresponding tool response. Persist a synthetic
-        "interrupted" response so the DB has a complete message chain.
+        Before stopping session agents during graceful restart, check the DB
+        for assistant messages with tool_calls that have no corresponding
+        tool response. Persist a synthetic "interrupted" response so the DB
+        has a complete message chain.
 
         This prevents _sanitize_message_chain from having to insert synthetic
         responses on the next startup, and ensures the tool call is properly
@@ -312,27 +312,41 @@ class GatewaySupervisor:
         """
         gw = self._gateway
         for session_key in list(gw._sessions.keys()):
-            ctx = gw._sessions.get(session_key)
-            if ctx is None:
-                continue
-            agent = ctx.agent
-            messages: list[dict] = getattr(agent, "_messages", [])
-            if not messages:
-                continue
-
-            # Get the session metadata for session_id
+            # Get session metadata for session_id
             try:
                 session = gw.session_store.get(session_key)
                 session_id = session.metadata.get("current_session_id", "")
             except Exception:
                 logger.exception("Failed to get session for %s", session_key)
                 continue
+            if not session_id:
+                continue
 
+            # Load raw messages from DB (not agent._messages which is sanitized)
+            try:
+                messages = gw.session_store.get_messages(session_key, session_id=session_id)
+            except Exception:
+                logger.exception("Failed to load messages for %s", session_key)
+                continue
+            if not messages:
+                continue
+
+            # Check for orphaned tool calls: assistant messages whose tool_calls
+            # don't have corresponding tool responses in the DB.
             for i in range(len(messages) - 1, -1, -1):
                 msg = messages[i]
                 if msg.get("role") != "assistant" or not msg.get("tool_calls"):
                     continue
                 tool_calls = msg["tool_calls"]
+                # Parse tool_calls if it's a JSON string (as stored in DB)
+                if isinstance(tool_calls, str):
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                if not isinstance(tool_calls, list):
+                    continue
+
                 n_expected = len(tool_calls)
                 n_actual = 0
                 j = i + 1
@@ -342,10 +356,13 @@ class GatewaySupervisor:
                 if n_actual >= n_expected:
                     continue  # All tool calls have responses
 
-                # Persistent orphaned tool calls — insert synthetic responses
+                # Persist synthetic responses for orphaned tool calls
                 for tc in tool_calls[n_actual:]:
-                    tc_id = tc.get("id", "")
-                    fn_name = tc.get("function", {}).get("name", "?")
+                    tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+                    fn_name = (
+                        tc.get("function", {}).get("name", "?")
+                        if isinstance(tc, dict) else "?"
+                    )
                     synthetic = json.dumps({
                         "error": f"Gateway restarted before tool '{fn_name}' completed",
                         "interrupted": True,
