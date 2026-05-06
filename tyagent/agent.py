@@ -63,6 +63,8 @@ class TyAgent:
     ):
         self.model = model
         self.home_dir = home_dir
+        self.session_key: str = ""
+        self.current_session_id: str = ""
         self.context_length = context_length
         self.api_key = api_key or os.environ.get("TYAGENT_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
         if base_url:

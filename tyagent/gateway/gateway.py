@@ -490,6 +490,8 @@ class Gateway:
             return self._sessions[session_key].agent
 
         agent = self._get_or_create_agent(session_key)
+        agent.session_key = session_key
+        agent.current_session_id = session.metadata.get("current_session_id", "")
 
         # Start the permanent agent loop with history and persistence
         # Sanitize the message chain to repair orphaned tool_calls from

@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Check if a process is still running by sending signal 0."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 class GatewaySupervisor:
     """Manages gateway lifecycle: signals, graceful restart, drain, recovery.
 
@@ -596,6 +605,126 @@ class GatewaySupervisor:
             logger.debug("Removed restart marker (%d tool responses written)", written)
         except OSError as exc:
             logger.warning("Failed to remove restart marker: %s", exc)
+
+        # Collect completed terminal command results from detached subprocesses.
+        # This captures real tool output that completed after the gateway exited.
+        try:
+            self._collect_orphan_terminal_results()
+        except Exception:
+            logger.exception("Failed to collect terminal results")
+
+    def _collect_orphan_terminal_results(self) -> None:
+        """Collect completed terminal command results after restart.
+
+        Scans ``.terminal_pending/`` in the home directory for marker files
+        from detached subprocesses. If the output file exists and has content
+        (the process completed), reads the result and writes a real tool
+        response to the database instead of a synthetic one.
+
+        This captures terminal command output even when the gateway restarted
+        or crashed while the command was running.
+        """
+        gw = self._gateway
+        pending_dir = gw.config.home_dir / ".terminal_pending"
+        if not pending_dir.exists():
+            return
+
+        markers = list(pending_dir.glob("*.json"))
+        if not markers:
+            return
+
+        logger.info("Scanning %d terminal pending markers...", len(markers))
+
+        for marker_path in markers:
+            try:
+                data = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Invalid terminal marker %s: %s — removing", marker_path.name, exc)
+                marker_path.unlink(missing_ok=True)
+                continue
+
+            output_path = Path(data.get("output_path", ""))
+            session_key = data.get("session_key", "")
+            session_id = data.get("session_id", "")
+            tool_call_id = data.get("tool_call_id", "")
+            started_at = data.get("started_at", 0)
+
+            # Check if the output file exists and has content
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                # Process is still running or never started — check if PID is alive
+                pid = data.get("pid")
+                if pid and _pid_is_alive(pid):
+                    logger.debug(
+                        "Terminal process %d still running for %s — skipping",
+                        pid, marker_path.name,
+                    )
+                    continue
+                # Stale marker — no output and process dead
+                logger.warning(
+                    "Stale terminal marker %s (no output, process dead) — removing",
+                    marker_path.name,
+                )
+                marker_path.unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
+                continue
+
+            # Read the output
+            try:
+                with open(output_path) as f:
+                    output_text = f.read()
+            except OSError as exc:
+                logger.warning("Failed to read output for %s: %s", marker_path.name, exc)
+                marker_path.unlink(missing_ok=True)
+                continue
+
+            if not session_key or not session_id:
+                logger.warning(
+                    "Terminal marker %s missing session info — removing",
+                    marker_path.name,
+                )
+                marker_path.unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
+                continue
+
+            # Build a real terminal tool response
+            max_out = 50_000
+            was_truncated = False
+            if len(output_text) > max_out:
+                output_text = output_text[:max_out]
+                was_truncated = True
+
+            # Try to get exit code; if not available, assume success
+            exit_code = 0
+            elapsed = time.time() - started_at if started_at > 0 else 0
+            result_data: dict = {
+                "output": output_text,
+                "exit_code": exit_code,
+                "collected_after_restart": True,
+                "elapsed_seconds": round(elapsed, 1),
+            }
+            if was_truncated:
+                result_data["truncated"] = True
+                result_data["hint"] = "Output was truncated."
+
+            try:
+                gw.session_store.add_message(
+                    session_key, "tool", json.dumps(result_data, ensure_ascii=False),
+                    session_id=session_id,
+                    tool_call_id=tool_call_id or "",
+                )
+                logger.info(
+                    "Collected terminal result for %s/%s (%d chars, %.1fs)",
+                    session_key, marker_path.name, len(output_text), elapsed,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Failed to write collected terminal result for %s: %s",
+                    session_key, exc,
+                )
+
+            # Clean up
+            marker_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Restart notification (called from Gateway.start after adapters connect)

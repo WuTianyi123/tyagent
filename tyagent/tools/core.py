@@ -16,6 +16,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -683,7 +685,13 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
-    """Execute a shell command."""
+    """Execute a shell command.
+
+    Uses subprocess.Popen with preexec_fn=os.setpgrp to detach the subprocess
+    from the parent process group. stdout/stderr are written to a temp file.
+    A .terminal_pending marker is created so the result can be collected even
+    if the gateway restarts before the command completes.
+    """
     command = args.get("command", "")
     timeout = int(args.get("timeout", 180))
     workdir = args.get("workdir")
@@ -695,6 +703,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     command = command.strip()
 
     cwd = None
+    home_dir = None
     if workdir:
         try:
             cwd = str(_resolve_path(workdir))
@@ -702,28 +711,75 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             return tool_error(f"Invalid workdir '{workdir}': {exc}")
         # Track workspace state for session recovery
         if parent_agent is not None and hasattr(parent_agent, "home_dir"):
-            state_file = parent_agent.home_dir / ".workspace_cwd"
+            home_dir = parent_agent.home_dir
+            state_file = home_dir / ".workspace_cwd"
             try:
                 state_file.write_text(cwd)
             except OSError:
                 pass  # best-effort; don't fail the tool call
+    elif parent_agent is not None and hasattr(parent_agent, "home_dir"):
+        home_dir = parent_agent.home_dir
+
+    # Get session info for the pending marker
+    session_key = getattr(parent_agent, "session_key", "") if parent_agent else ""
+    session_id = getattr(parent_agent, "current_session_id", "") if parent_agent else ""
+
+    # Create a temp output file and pending marker
+    output_dir = Path(tempfile.gettempdir())
+    output_path = output_dir / f"tyagent_term_{uuid.uuid4().hex[:16]}.out"
+    marker = None  # track for cleanup
 
     try:
         # Ensure isolated HOME is inherited by subprocess
         env = os.environ.copy()
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=cwd,
-            env=env,
-        )
-        output = proc.stdout
-        stderr = proc.stderr
-        if stderr:
-            output = (output or "") + "\n" + stderr
+        
+        with open(output_path, 'w') as out_f:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=out_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=cwd,
+                env=env,
+                preexec_fn=os.setpgrp,  # Detach from parent's process group
+            )
+        
+        # Write a pending marker so the result can be collected after restart
+        if home_dir is not None:
+            pending_dir = home_dir / ".terminal_pending"
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            marker = pending_dir / f"{uuid.uuid4().hex[:16]}.json"
+            marker_data = {
+                "tool_call_id": "",
+                "session_key": session_key,
+                "session_id": session_id,
+                "command": command[:200],
+                "started_at": time.time(),
+                "output_path": str(output_path),
+                "pid": proc.pid,
+            }
+            marker.write_text(json.dumps(marker_data, ensure_ascii=False), encoding="utf-8")
+
+        # Wait for completion
+        try:
+            stdout_data, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            # Read partial output
+            with open(output_path) as f:
+                partial = f.read()
+            _cleanup_terminal_marker(marker, output_path)
+            return tool_error(
+                f"Command timed out after {timeout} seconds. "
+                f"Partial output ({len(partial)} chars) may be available. "
+                "For long-running tasks, consider running in background or increasing timeout."
+            )
+
+        # Read full output from file
+        with open(output_path) as f:
+            output = f.read()
 
         # Truncate very large output
         max_out = 50_000
@@ -741,14 +797,29 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             result["hint"] = "Output was truncated. Use grep/head/tail or redirect to a file for large outputs."
         if proc.returncode != 0:
             result["error"] = f"Command exited with code {proc.returncode}"
+        
+        # Clean up on success
+        _cleanup_terminal_marker(marker, output_path)
         return tool_result(result)
-    except subprocess.TimeoutExpired:
-        return tool_error(
-            f"Command timed out after {timeout} seconds. "
-            "For long-running tasks, consider running in background or increasing timeout."
-        )
+        
     except Exception as exc:
+        # On exception (e.g., gateway crash), the marker and output file remain
+        # so the next gateway startup can collect the result.
         return tool_error(f"Command execution failed: {type(exc).__name__}: {exc}")
+
+
+def _cleanup_terminal_marker(marker_path: Optional[Path], output_path: Path) -> None:
+    """Clean up a terminal pending marker and its output file."""
+    try:
+        if marker_path is not None and marker_path.exists():
+            marker_path.unlink()
+    except OSError:
+        pass
+    try:
+        if output_path.exists():
+            output_path.unlink()
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
