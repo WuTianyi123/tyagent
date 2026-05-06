@@ -123,7 +123,7 @@ ExecStart={python_path} -m tyagent_cli gateway
 WorkingDirectory={project_root}
 Environment="PATH={':'.join(path_entries)}"
 {env_block}{env_file_line}
-Restart=on-failure
+Restart=always
 RestartSec=10
 RestartForceExitStatus=75
 KillMode=mixed
