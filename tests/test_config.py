@@ -139,8 +139,7 @@ class TestAgentConfigToDict:
             "model": "anthropic/claude-sonnet-4",
             "base_url": None,
             "system_prompt": "",
-            "max_tokens": 4096,
-            "temperature": 0.7,
+
             "http_timeout": 120.0,
             "max_tool_turns": 200,
             "reasoning_effort": "high",
@@ -824,11 +823,11 @@ class TestPlatformSchemaDiscovery:
         from tyagent.config import _prune_and_merge
 
         canonical = {
-            "agent": {"model": "gpt-4", "temperature": 0.7},
+            "agent": {"model": "gpt-4"},
             "compression": {"auto_compact_limit": None},
         }
         raw = {
-            "agent": {"model": "gpt-4", "temperature": 0.7, "old_field": "stale"},
+            "agent": {"model": "gpt-4", "old_field": "stale"},
             "compression": {"auto_compact_limit": None, "cut_ratio": 0.5, "api_key": "x"},
             "obsolete_section": {"a": 1},
         }

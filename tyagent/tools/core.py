@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -684,6 +685,39 @@ TERMINAL_SCHEMA = {
 }
 
 
+def _write_gateway_interrupt_marker(
+    home_dir: Path,
+    tool_call_id: str,
+    session_key: str,
+    session_id: str,
+    command: str,
+) -> None:
+    """Write a marker for a terminal command that will trigger a gateway restart.
+
+    The marker lives in ``.gateway_interrupt/`` under the home directory.
+    When the gateway restarts, ``_handle_restart_marker_on_startup`` reads
+    these markers and writes a normal success tool response (the command
+    succeeded — the restart is expected).
+    """
+    marker_dir = home_dir / ".gateway_interrupt"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = marker_dir / f"{uuid.uuid4().hex[:16]}.json"
+    marker_data = {
+        "tool_call_id": tool_call_id,
+        "session_key": session_key,
+        "session_id": session_id,
+        "command": command,
+        "started_at": time.time(),
+        "reason": "restart_trigger",
+    }
+    with open(marker_path, "w") as f:
+        json.dump(marker_data, f, ensure_ascii=False)
+    logger.info(
+        "Gateway interrupt marker written for tool_call_id=%s (command: %.60s)",
+        tool_call_id, command,
+    )
+
+
 def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Execute a shell command.
 
@@ -724,6 +758,25 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     session_key = getattr(parent_agent, "session_key", "") if parent_agent else ""
     session_id = getattr(parent_agent, "current_session_id", "") if parent_agent else ""
     tool_call_id = getattr(parent_agent, "_current_tool_call_id", "") if parent_agent else ""
+
+    # Detect commands that will trigger a gateway restart.
+    # These need a special marker so the restart machinery can fill in
+    # a normal success tool response (the command succeeded — the restart
+    # is the expected outcome).  Otherwise the tool would have no response
+    # and the message chain would be broken.
+    _RESTART_TRIGGERS = (
+        r"tyagent\s+gateway\s+restart",
+        r"systemctl\s+(--user\s+)?restart\s+tyagent-gateway",
+        r"kill\s+-SIGUSR1\s+",
+        r"uv\s+run\s+python\s+tyagent_cli\.py\s+gateway\s+restart",
+        r"python\s+tyagent_cli\.py\s+gateway\s+restart",
+    )
+    will_restart = any(re.search(p, command) for p in _RESTART_TRIGGERS)
+
+    if will_restart and home_dir is not None and tool_call_id:
+        _write_gateway_interrupt_marker(
+            home_dir, tool_call_id, session_key, session_id, command[:200],
+        )
 
     # Create a temp output file and pending marker
     output_dir = Path(tempfile.gettempdir())

@@ -56,8 +56,6 @@ class TyAgent:
         compression: Optional[CompressionConfig] = None,
         home_dir: Optional[Path] = None,
         context_length: Optional[int] = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
         http_timeout: float = 120.0,
         shutdown_timeout: float = 5.0,
     ):
@@ -91,8 +89,6 @@ class TyAgent:
         self.max_tool_turns = max_tool_turns
         self.system_prompt = system_prompt
         self.reasoning_effort = reasoning_effort
-        self._max_tokens = max_tokens
-        self._temperature = temperature
         self._http_timeout = http_timeout
         self._shutdown_timeout = shutdown_timeout
         c = compression or CompressionConfig()
@@ -196,8 +192,6 @@ class TyAgent:
         """Return the base payload for a chat completion request."""
         payload: Dict[str, Any] = {
             "model": self.model,
-            "max_tokens": self._max_tokens,
-            "temperature": self._temperature,
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
@@ -906,8 +900,6 @@ class TyAgent:
             compression=compression,
             home_dir=home_dir,
             context_length=getattr(config, "context_length", None),
-            max_tokens=getattr(config, "max_tokens", 4096),
-            temperature=getattr(config, "temperature", 0.7),
             http_timeout=getattr(config, "http_timeout", 120.0),
             shutdown_timeout=getattr(config, "shutdown_timeout", 5.0),
         )
@@ -929,8 +921,6 @@ class TyAgent:
             compression=self._compression_config,
             home_dir=self.home_dir,
             context_length=self.context_length,
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
             http_timeout=self._http_timeout,
             shutdown_timeout=self._shutdown_timeout,
         )

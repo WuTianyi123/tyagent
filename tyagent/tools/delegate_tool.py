@@ -128,8 +128,6 @@ async def _launch_child_agent(
         compression=_build_parent_compression(parent_agent),
         home_dir=parent_agent.home_dir,
         context_length=parent_agent.context_length,
-        max_tokens=getattr(parent_agent, "_max_tokens", 4096),
-        temperature=getattr(parent_agent, "_temperature", 0.7),
         http_timeout=getattr(parent_agent, "_http_timeout", 120.0),
         shutdown_timeout=getattr(parent_agent, "_shutdown_timeout", 5.0),
     )

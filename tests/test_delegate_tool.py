@@ -47,8 +47,7 @@ def _make_agent(**overrides) -> MagicMock:
     agent._tool_progress_callback = None
     agent.home_dir = None
     agent.context_length = None
-    agent._max_tokens = 4096
-    agent._temperature = 0.7
+    pass
     agent._http_timeout = 120.0
     agent._shutdown_timeout = 5.0
     agent.send_message = AsyncMock()

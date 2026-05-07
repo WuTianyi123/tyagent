@@ -384,98 +384,98 @@ class GatewaySupervisor:
     def _write_restart_marker(self) -> None:
         """Write pending tool call info to a restart marker file.
 
-        Instead of writing synthetic tool responses to the DB (which creates
-        a race condition — the actual tool execution might complete and also
-        write its result), we write a .restart_pending marker with the
-        orphaned tool call details. The new gateway process reads this marker
-        on startup and writes accurate "restart_completed" responses.
+        Only collects tool calls that are **related to this restart**:
 
-        This eliminates the self-contradiction of "waiting for tool execution
-        to complete while already deciding it didn't complete".
+        1.  ``.gateway_interrupt/`` markers written by the terminal tool
+            before executing commands that trigger a gateway restart
+            (e.g. ``tyagent gateway restart``).  These get a normal
+            success response — the restart IS the expected outcome.
+
+        2.  In-flight tool calls that are currently executing during
+            drain.  These may be interrupted — we record them so the
+            new process can write an "unknown failure" response.
+
+        Historical orphaned tool calls in the DB are NOT touched —
+        they are unrelated to this restart and writing synthetic
+        responses for them would break the message chain.
         """
         gw = self._gateway
         marker = {"restarted_at": time.time(), "sessions": {}}
+        home_dir: Path = gw.config.home_dir
 
+        # ── Collect gateway_interrupt markers ──────────────────
+        interrupt_dir = home_dir / ".gateway_interrupt"
+        if interrupt_dir.exists():
+            for _mf in interrupt_dir.glob("*.json"):
+                try:
+                    data = json.loads(_mf.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                sk = data.get("session_key", "")
+                sid = data.get("session_id", "")
+                tcid = data.get("tool_call_id", "")
+                if not sk or not sid or not tcid:
+                    continue
+                marker.setdefault("sessions", {})
+                entry = marker["sessions"].setdefault(sk, {
+                    "session_id": sid,
+                    "pending_tool_calls": [],
+                })
+                entry["pending_tool_calls"].append({
+                    "tool_call_id": tcid,
+                    "function_name": "terminal",
+                    "reason": "restart_trigger",
+                    "command": data.get("command", "")[:200],
+                })
+                logger.info(
+                    "Restart marker: restart-trigger terminal for %s/%s "
+                    "(tool_call_id=%s)",
+                    sk, sid, tcid,
+                )
+
+        # ── Collect in-flight tool calls during drain ──────────
         for session_key in list(gw._sessions.keys()):
+            ctx = gw._sessions.get(session_key)
+            if ctx is None:
+                continue
+            agent = ctx.agent
+            # Check if agent is running a turn right now
+            if not agent._running:
+                continue
+            # Agents with non-empty inbox are mid-turn
+            if agent._inbox.empty():
+                continue
+            # Get the current tool_call_id (set by _execute_tool_calls)
+            tc_id = getattr(agent, "_current_tool_call_id", "") or ""
+            if not tc_id:
+                continue
             try:
                 session = gw.session_store.get(session_key)
                 session_id = session.metadata.get("current_session_id", "")
             except Exception:
-                logger.exception("Failed to get session for %s", session_key)
                 continue
             if not session_id:
                 continue
+            entry = marker.setdefault("sessions", {}).setdefault(session_key, {
+                "session_id": session_id,
+                "pending_tool_calls": [],
+            })
+            entry["pending_tool_calls"].append({
+                "tool_call_id": tc_id,
+                "function_name": "?",
+                "reason": "unknown_failure",
+            })
+            logger.info(
+                "Restart marker: in-flight tool call for %s/%s "
+                "(tool_call_id=%s)",
+                session_key, session_id, tc_id,
+            )
 
-            # Load raw messages from DB
-            try:
-                messages = gw.session_store.get_messages(
-                    session_key, session_id=session_id
-                )
-            except Exception:
-                logger.exception("Failed to load messages for %s", session_key)
-                continue
-            if not messages:
-                continue
-
-            # Find orphaned tool calls — only the MOST RECENT orphaned
-            # turn matters. Earlier orphaned tool calls were abandoned by
-            # subsequent user/assistant messages and should NOT get
-            # synthetic responses (they would break the message chain by
-            # appearing after the current assistant message with wrong
-            # tool_call_ids).
-            pending = []
-            for i in range(len(messages) - 1, -1, -1):
-                msg = messages[i]
-                if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-                    continue
-                tool_calls = msg["tool_calls"]
-                if isinstance(tool_calls, str):
-                    try:
-                        tool_calls = json.loads(tool_calls)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                if not isinstance(tool_calls, list):
-                    continue
-
-                n_expected = len(tool_calls)
-                n_actual = 0
-                j = i + 1
-                while j < len(messages) and messages[j].get("role") == "tool":
-                    n_actual += 1
-                    j += 1
-                if n_actual >= n_expected:
-                    continue  # All tool calls have responses, not orphaned
-
-                # Found the most recent orphaned tool call(s).
-                # Earlier orphaned calls are abandoned (superseded by
-                # subsequent user messages) — don't include them.
-                for tc in tool_calls[n_actual:]:
-                    tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
-                    fn_name = (
-                        tc.get("function", {}).get("name", "?")
-                        if isinstance(tc, dict) else "?"
-                    )
-                    pending.append({
-                        "tool_call_id": tc_id,
-                        "function_name": fn_name,
-                    })
-                break  # Only the most recent orphaned turn
-
-            if pending:
-                marker["sessions"][session_key] = {
-                    "session_id": session_id,
-                    "pending_tool_calls": pending,
-                }
-                logger.info(
-                    "Restart marker: %d orphaned tool call(s) for %s/%s",
-                    len(pending), session_key, session_id,
-                )
-
-        if not marker["sessions"]:
-            logger.info("No orphaned tool calls — skipping restart marker")
+        if not marker.get("sessions"):
+            logger.info("No restart-related tool calls — skipping restart marker")
             return
 
-        marker_path = gw.config.home_dir / ".restart_pending"
+        marker_path = home_dir / ".restart_pending"
         try:
             marker_path.parent.mkdir(parents=True, exist_ok=True)
             marker_path.write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
@@ -541,6 +541,7 @@ class GatewaySupervisor:
             for tc_info in pending:
                 tc_id = tc_info.get("tool_call_id", "")
                 fn_name = tc_info.get("function_name", "?")
+                reason = tc_info.get("reason", "")
                 if not tc_id:
                     continue
 
@@ -548,21 +549,31 @@ class GatewaySupervisor:
                 # (tool execution completed during the old process's stop timeout)
                 if tc_id in existing_responses:
                     logger.info(
-                        "Skipping restart-completed response for %s/%s "
-                        "(tool_call_id=%s) — response already exists",
-                        session_key, fn_name, tc_id,
+                        "Skipping restart response for %s/%s "
+                        "(tool_call_id=%s, reason=%s) — response already exists",
+                        session_key, fn_name, tc_id, reason,
                     )
                     continue
 
-                # Compute elapsed time since restart was initiated
                 elapsed_seconds = max(0, time.time() - restarted_at)
 
-                synthetic = json.dumps({
-                    "success": True,
-                    "restart_completed": True,
-                    "duration_seconds": round(elapsed_seconds, 1),
-                    "message": f"Gateway restart completed ({elapsed_seconds:.1f}s)",
-                })
+                if reason == "restart_trigger":
+                    # Terminal command that triggered the restart — this is normal.
+                    synthetic = json.dumps({
+                        "success": True,
+                        "restart_completed": True,
+                        "duration_seconds": round(elapsed_seconds, 1),
+                        "message": f"Gateway restart completed ({elapsed_seconds:.1f}s)",
+                    })
+                else:
+                    # unknown_failure — tool was in-flight during drain,
+                    # we don't know why it didn't complete.
+                    synthetic = json.dumps({
+                        "success": False,
+                        "error": "Unknown failure — tool execution may have been interrupted by gateway restart",
+                        "interrupted": True,
+                        "duration_seconds": round(elapsed_seconds, 1),
+                    })
 
                 try:
                     gw.session_store.add_message(
@@ -572,13 +583,13 @@ class GatewaySupervisor:
                     )
                     written += 1
                     logger.info(
-                        "Restart-completed response for %s/%s "
-                        "(tool_call_id=%s, elapsed=%.1fs)",
-                        session_key, fn_name, tc_id, elapsed_seconds,
+                        "Restart response for %s/%s "
+                        "(tool_call_id=%s, reason=%s, elapsed=%.1fs)",
+                        session_key, fn_name, tc_id, reason, elapsed_seconds,
                     )
                 except Exception:
                     logger.exception(
-                        "Failed to write restart-completed response for %s/%s",
+                        "Failed to write restart response for %s/%s",
                         session_key, fn_name,
                     )
 
@@ -588,6 +599,15 @@ class GatewaySupervisor:
             logger.debug("Removed restart marker (%d tool responses written)", written)
         except OSError as exc:
             logger.warning("Failed to remove restart marker: %s", exc)
+
+        # Clean up gateway_interrupt markers (they are now processed)
+        interrupt_dir = gw.config.home_dir / ".gateway_interrupt"
+        if interrupt_dir.exists():
+            for _mf in interrupt_dir.glob("*.json"):
+                try:
+                    _mf.unlink()
+                except OSError:
+                    pass
 
         # Collect completed terminal command results from detached subprocesses.
         # This captures real tool output that completed after the gateway exited.

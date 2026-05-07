@@ -39,8 +39,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_tool_turns": 200,
         "reasoning_effort": "high",
         "system_prompt": "",
-        "max_tokens": 4096,
-        "temperature": 0.7,
         "http_timeout": 120.0,
         "shutdown_timeout": 5.0,
     },
@@ -249,8 +247,6 @@ class AgentConfig:
     system_prompt: str = ""
     reasoning_effort: Optional[str] = "high"  # None/"" = don't send
     context_length: Optional[int] = None
-    max_tokens: int = 4096
-    temperature: float = 0.7
     http_timeout: float = 120.0
     shutdown_timeout: float = 5.0
 
@@ -263,8 +259,6 @@ class AgentConfig:
             "model": self.model,
             "base_url": self.base_url,
             "system_prompt": self.system_prompt,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "http_timeout": self.http_timeout,
         }
         if self.max_tool_turns is not None:
@@ -288,8 +282,6 @@ class AgentConfig:
             system_prompt=data.get("system_prompt", ""),
             reasoning_effort=data.get("reasoning_effort", "high"),
             context_length=int(cl) if cl is not None else None,
-            max_tokens=data.get("max_tokens", 4096),
-            temperature=data.get("temperature", 0.7),
             http_timeout=data.get("http_timeout", 120.0),
             shutdown_timeout=data.get("shutdown_timeout", 5.0),
         )

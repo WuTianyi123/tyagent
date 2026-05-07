@@ -676,7 +676,7 @@ class TestRestartMarker:
         )
 
     def test_write_marker_no_orphans(self, tmp_path):
-        """No orphaned tool calls → no restart marker written."""
+        """No gateway_interrupt markers, no in-flight tool calls -> no marker."""
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
         session = gw.session_store.get("test:key")
@@ -687,48 +687,71 @@ class TestRestartMarker:
         gw.supervisor._write_restart_marker()
 
         marker_path = config.home_dir / ".restart_pending"
-        assert not marker_path.exists(), "Should not write marker when no orphans"
+        assert not marker_path.exists(), "Should not write marker when no restart-related calls"
         gw.session_store.close()
 
-    def test_write_marker_with_orphans(self, tmp_path):
-        """Orphaned tool calls → marker file written with correct content."""
+    def test_write_marker_with_gateway_interrupt(self, tmp_path):
+        """gateway_interrupt marker -> captured in .restart_pending."""
+        import json, time
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
-        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
-        self._add_active_session(gw, "test:key", session)
+
+        # Simulate a gateway_interrupt marker written by terminal tool
+        interrupt_dir = config.home_dir / ".gateway_interrupt"
+        interrupt_dir.mkdir(parents=True, exist_ok=True)
+        marker_data = {
+            "tool_call_id": "call_interrupt_1",
+            "session_key": "test:key",
+            "session_id": "sid1",
+            "command": "tyagent gateway restart",
+            "started_at": time.time(),
+            "reason": "restart_trigger",
+        }
+        (interrupt_dir / "test.json").write_text(json.dumps(marker_data), encoding="utf-8")
 
         gw.supervisor._write_restart_marker()
 
         marker_path = config.home_dir / ".restart_pending"
-        assert marker_path.exists(), "Marker should exist"
-        import json
+        assert marker_path.exists(), "Marker should exist when gateway_interrupt markers present"
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        assert "restarted_at" in marker
         assert "sessions" in marker
         assert "test:key" in marker["sessions"]
         sdata = marker["sessions"]["test:key"]
-        assert "session_id" in sdata
+        assert sdata["session_id"] == "sid1"
         assert len(sdata["pending_tool_calls"]) == 1
         tc = sdata["pending_tool_calls"][0]
-        assert tc["tool_call_id"] == "call_orphan_1"
+        assert tc["tool_call_id"] == "call_interrupt_1"
         assert tc["function_name"] == "terminal"
+        assert tc["reason"] == "restart_trigger"
         gw.session_store.close()
         marker_path.unlink(missing_ok=True)
 
     def test_write_marker_multiple_sessions(self, tmp_path):
-        """Multiple sessions with orphans → all recorded in marker."""
+        """Multiple gateway_interrupt markers -> all recorded."""
+        import json, time
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
-        s_a = self._add_orphaned_tool_call(gw.session_store, "session_a")
-        s_b = self._add_orphaned_tool_call(gw.session_store, "session_b")
-        self._add_active_session(gw, "session_a", s_a)
-        self._add_active_session(gw, "session_b", s_b)
+
+        interrupt_dir = config.home_dir / ".gateway_interrupt"
+        interrupt_dir.mkdir(parents=True, exist_ok=True)
+        for idx, (sk, sid, tcid) in enumerate([
+            ("session_a", "sid_a", "call_a"),
+            ("session_b", "sid_b", "call_b"),
+        ]):
+            data = {
+                "tool_call_id": tcid,
+                "session_key": sk,
+                "session_id": sid,
+                "command": f"restart {idx}",
+                "started_at": time.time(),
+                "reason": "restart_trigger",
+            }
+            (interrupt_dir / f"{idx}.json").write_text(json.dumps(data), encoding="utf-8")
 
         gw.supervisor._write_restart_marker()
 
         marker_path = config.home_dir / ".restart_pending"
         assert marker_path.exists()
-        import json
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         assert "session_a" in marker["sessions"]
         assert "session_b" in marker["sessions"]
@@ -750,7 +773,7 @@ class TestRestartMarker:
                 "test:key": {
                     "session_id": session_id,
                     "pending_tool_calls": [
-                        {"tool_call_id": "call_orphan_1", "function_name": "terminal"},
+                        {"tool_call_id": "call_orphan_1", "function_name": "terminal", "reason": "restart_trigger"},
                     ],
                 }
             },
@@ -815,7 +838,7 @@ class TestRestartMarker:
                 "test:key": {
                     "session_id": session_id,
                     "pending_tool_calls": [
-                        {"tool_call_id": "call_orphan_1", "function_name": "terminal"},
+                        {"tool_call_id": "call_orphan_1", "function_name": "terminal", "reason": "restart_trigger"},
                     ],
                 }
             },
