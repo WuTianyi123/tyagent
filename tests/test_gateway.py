@@ -680,7 +680,7 @@ class TestRestartMarker:
         )
 
     def test_write_marker_no_orphans(self, tmp_path):
-        """No gateway_interrupt markers, no in-flight tool calls -> no marker."""
+        """No in-flight tool calls → no marker."""
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
         session = gw.session_store.get("test:key")
@@ -695,7 +695,7 @@ class TestRestartMarker:
         gw.session_store.close()
 
     def test_handle_marker_writes_synthetic_responses(self, tmp_path):
-        """Marker exists → synthetic 'unknown failure' responses written to DB."""
+        """Marker exists → synthetic 'planned restart' responses written to DB."""
         import json, time
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)

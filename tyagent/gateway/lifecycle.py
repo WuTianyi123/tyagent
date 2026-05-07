@@ -386,11 +386,11 @@ class GatewaySupervisor:
 
         Only collects tool calls that are currently executing when the
         gateway drains.  These may be interrupted — we record them so
-        the new process can write an "unknown failure" response.
+        the new process can write a "planned gateway restart" response.
 
-        Real terminal output (including from restart-triggering commands)
-        is recovered from ``.terminal_pending/`` markers on next startup
-        — no synthetic responses are needed for those.
+        Real terminal output is recovered from ``.terminal_pending/``
+        markers on next startup — no synthetic responses are needed
+        for those.
         """
         gw = self._gateway
         marker: Dict[str, Any] = {"restarted_at": time.time(), "sessions": {}}
@@ -458,7 +458,7 @@ class GatewaySupervisor:
            write a synthetic response.
 
         This ensures real tool output is never silently replaced by a
-        synthetic "Unknown failure" message.
+        synthetic "planned gateway restart" message.
         """
         gw = self._gateway
 
