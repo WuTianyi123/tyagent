@@ -130,37 +130,20 @@ class GatewaySupervisor:
             )
 
         logger.info(
-            "Graceful restart complete — spawning systemctl restart and shutting down"
+            "Graceful restart complete — exiting with code 75 for systemd restart"
         )
-        import subprocess
 
-        # Spawn the restart command in the background.  If it fails we
-        # still shut down gracefully; the process manager (systemd) will
-        # restart us via its own Restart= policy.
-        try:
-            subprocess.Popen(
-                [
-                    "systemd-run",
-                    "--user",
-                    "--scope",
-                    "--unit=tyagent-restart-helper",
-                    "systemctl",
-                    "--user",
-                    "restart",
-                    "tyagent-gateway",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            logger.error(
-                "Failed to spawn systemctl restart: %s — relying on Restart= policy",
-                exc,
-            )
-
-        # Trigger the normal gateway shutdown path so that all cleanup
-        # (adapters, session agents, cached agents) runs before exit.
-        self.shutdown()
+        # Exit with code 75 (EX_TEMPFAIL).  The systemd service unit
+        # has Restart=always + RestartForceExitStatus=75, so systemd
+        # treats this exit as an intentional restart request and
+        # re-launches the gateway — no shell wrapper or systemd-run
+        # scope dance needed.
+        #
+        # os._exit() is used (not sys.exit()) because this runs inside
+        # the asyncio event loop, and sys.exit() would raise
+        # SystemExit which may be caught by test runners or the event
+        # loop.  os._exit() is immediate and unconditional.
+        os._exit(75)
 
     def _write_clean_shutdown_marker(self) -> None:
         """Write .clean_shutdown marker with restart requestor info."""
@@ -608,12 +591,19 @@ class GatewaySupervisor:
 
         # Collect completed terminal command results from detached subprocesses.
         # This captures real tool output that completed after the gateway exited.
+        # Store the set of affected sessions so Gateway.start can trigger them.
         try:
-            self._collect_orphan_terminal_results()
+            affected = self._collect_orphan_terminal_results()
+            if affected:
+                gw._restart_affected_sessions = affected
+                logger.info(
+                    "Collected terminal results for %d session(s): %s",
+                    len(affected), affected,
+                )
         except Exception:
             logger.exception("Failed to collect terminal results")
 
-    def _collect_orphan_terminal_results(self) -> None:
+    def _collect_orphan_terminal_results(self) -> set[str]:
         """Collect completed terminal command results after restart.
 
         Scans ``.terminal_pending/`` in the home directory for marker files
@@ -621,13 +611,17 @@ class GatewaySupervisor:
         (the process completed), reads the result and writes a real tool
         response to the database instead of a synthetic one.
 
+        Returns a set of session_keys that received new tool responses,
+        so the caller can trigger agent turns for those sessions.
+
         This captures terminal command output even when the gateway restarted
         or crashed while the command was running.
         """
+        affected: set[str] = set()
         gw = self._gateway
         pending_dir = gw.config.home_dir / ".terminal_pending"
         if not pending_dir.exists():
-            return
+            return affected
 
         markers = list(pending_dir.glob("*.json"))
         if not markers:
@@ -712,6 +706,7 @@ class GatewaySupervisor:
                     session_id=session_id,
                     tool_call_id=tool_call_id or "",
                 )
+                affected.add(session_key)
                 logger.info(
                     "Collected terminal result for %s/%s (%d chars, %.1fs)",
                     session_key, marker_path.name, len(output_text), elapsed,
@@ -725,6 +720,12 @@ class GatewaySupervisor:
             # Clean up
             marker_path.unlink(missing_ok=True)
             output_path.unlink(missing_ok=True)
+
+        return affected
+        """Trigger agent turns for sessions that received collected results."""
+        # This is called from Gateway.start after handlers run;
+        # the method is a no-op here — the actual trigger logic
+        # lives in Gateway._trigger_pending_tool_results().
 
     # ------------------------------------------------------------------
     # Restart notification (called from Gateway.start after adapters connect)

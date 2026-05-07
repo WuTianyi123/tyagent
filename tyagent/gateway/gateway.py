@@ -227,6 +227,7 @@ class Gateway:
         self._restart_drain_timeout: float = 60.0
         self._restart_requestor: Optional[Dict[str, str]] = None
         self._restart_notification_pending: Optional[Dict[str, str]] = None
+        self._restart_affected_sessions: set[str] = set()
         # Subsystems
         self.commands = CommandRegistry(self)
         self.supervisor = GatewaySupervisor(self)
@@ -665,9 +666,41 @@ class Gateway:
         # If there's a pending restart notification, schedule it
         GatewaySupervisor.schedule_restart_notification(self)
 
-        # Eagerly initialize sessions with history and trigger a proactive turn.
-        # DISABLED: causes agent restart loop on startup — needs redesign
-        # await self._init_active_sessions()
+        # Trigger agent turns for sessions that received collected terminal results
+        # (from _collect_orphan_terminal_results). The chain ends with a tool response
+        # and no user message — the agent should process it proactively.
+        affected = self._restart_affected_sessions
+        self._restart_affected_sessions = set()
+        if affected:
+            for session_key in affected:
+                try:
+                    platform = session_key.split(":", 1)[0] if ":" in session_key else ""
+                    adapter = self.adapters.get(platform)
+                    if adapter is None:
+                        continue
+                    chat_id = session_key.split(":", 1)[1] if ":" in session_key else ""
+                    session = self.session_store.get(session_key)
+                    if not session:
+                        continue
+                    _persist_sid = session.metadata.get("current_session_id", "")
+                    def _mk_persist(sid):
+                        def _p(role, content, **extras):
+                            self.session_store.add_message(
+                                session_key, role, content, session_id=sid, **extras,
+                            )
+                        return _p
+                    await self._ensure_session_agent(
+                        session_key, session, adapter, chat_id,
+                        _mk_persist(_persist_sid),
+                    )
+                    logger.info(
+                        "Triggered agent for session %s (collected terminal result)",
+                        session_key,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to trigger agent for session %s", session_key,
+                    )
 
         # Wait for shutdown signal
         await self._shutdown_event.wait()
