@@ -121,6 +121,9 @@ class TyAgent:
         self._running: bool = False
         self._loop_task: Optional[asyncio.Task] = None
         self._stop_event: asyncio.Event = asyncio.Event()
+        # True while inside _run_turn (LLM call or tool execution).
+        # Used by the drain loop to detect busy agents.
+        self._in_turn: bool = False
         self._messages: List[Dict[str, Any]] = []
         self._on_message: Optional[OnMessageCallback] = None
         self._tool_progress_callback: Optional[Callable] = None
@@ -436,6 +439,28 @@ class TyAgent:
         )
 
     async def _run_turn(
+        self,
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stream: bool = False,
+        stream_delta_callback: Optional[Callable[[str], None]] = None,
+        reasoning_callback: Optional[Callable[[str], None]] = None,
+        on_segment_break: Optional[Callable[[], None]] = None,
+    ) -> str:
+        """Public entry point that manages the _in_turn flag."""
+        self._in_turn = True
+        try:
+            return await self._do_run_turn(
+                tools=tools,
+                stream=stream,
+                stream_delta_callback=stream_delta_callback,
+                reasoning_callback=reasoning_callback,
+                on_segment_break=on_segment_break,
+            )
+        finally:
+            self._in_turn = False
+
+    async def _do_run_turn(
         self,
         *,
         tools: Optional[List[Dict[str, Any]]] = None,

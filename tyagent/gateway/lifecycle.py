@@ -192,13 +192,12 @@ class GatewaySupervisor:
         start = time.monotonic()
         busy_count = len(gw._sessions)
         while time.monotonic() - start < timeout:
-            # Count sessions whose agent is currently running a turn.
-            # We approximate "busy" by checking if the agent's inbox
-            # is non-empty (a message queued but not yet consumed).
+            # Count agents that are currently inside _run_turn (LLM call
+            # or tool execution) or managing background child-agent tasks.
             busy = 0
             for ctx in gw._sessions.values():
                 agent = ctx.agent
-                if agent._running and not agent._inbox.empty():
+                if agent._in_turn:
                     busy += 1
                 elif hasattr(agent, '_bg_tasks') and agent._bg_tasks:
                     busy += 1
