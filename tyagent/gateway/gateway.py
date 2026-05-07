@@ -599,6 +599,41 @@ class Gateway:
                 # Auto-reply (child completion triggered)
                 await adapter.send_message(chat_id, output.text)
 
+    async def _init_agents_on_startup(self) -> None:
+        """Initialize session agents for all sessions with message history.
+
+        Runs after adapters start. For each session that has messages,
+        creates the agent loop and output consumer. If the chain ends with
+        a tool response (collected after restart), _agent_loop auto-processes
+        it proactively. Otherwise the agent waits for inbox messages.
+        """
+        for session_key in self.session_store.all_session_keys():
+            if session_key in self._sessions:
+                continue
+            try:
+                session = self.session_store.get(session_key)
+                if not session or not session.messages:
+                    continue
+                platform = session_key.split(":", 1)[0] if ":" in session_key else ""
+                adapter = self.adapters.get(platform)
+                if adapter is None:
+                    continue
+                chat_id = session_key.split(":", 1)[1] if ":" in session_key else ""
+                _persist_sid = session.metadata.get("current_session_id", "")
+                def _mk_persist(sid):
+                    def _p(role, content, **extras):
+                        self.session_store.add_message(
+                            session_key, role, content, session_id=sid, **extras,
+                        )
+                    return _p
+                await self._ensure_session_agent(
+                    session_key, session, adapter, chat_id,
+                    _mk_persist(_persist_sid),
+                )
+                logger.info("Initialized agent for session %s", session_key)
+            except Exception:
+                logger.exception("Failed to init agent for %s", session_key)
+
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
         ctx = self._sessions.pop(session_key, None)
@@ -666,41 +701,11 @@ class Gateway:
         # If there's a pending restart notification, schedule it
         GatewaySupervisor.schedule_restart_notification(self)
 
-        # Trigger agent turns for sessions that received collected terminal results
-        # (from _collect_orphan_terminal_results). The chain ends with a tool response
-        # and no user message — the agent should process it proactively.
-        affected = self._restart_affected_sessions
-        self._restart_affected_sessions = set()
-        if affected:
-            for session_key in affected:
-                try:
-                    platform = session_key.split(":", 1)[0] if ":" in session_key else ""
-                    adapter = self.adapters.get(platform)
-                    if adapter is None:
-                        continue
-                    chat_id = session_key.split(":", 1)[1] if ":" in session_key else ""
-                    session = self.session_store.get(session_key)
-                    if not session:
-                        continue
-                    _persist_sid = session.metadata.get("current_session_id", "")
-                    def _mk_persist(sid):
-                        def _p(role, content, **extras):
-                            self.session_store.add_message(
-                                session_key, role, content, session_id=sid, **extras,
-                            )
-                        return _p
-                    await self._ensure_session_agent(
-                        session_key, session, adapter, chat_id,
-                        _mk_persist(_persist_sid),
-                    )
-                    logger.info(
-                        "Triggered agent for session %s (collected terminal result)",
-                        session_key,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to trigger agent for session %s", session_key,
-                    )
+        # Initialize agents for all sessions with message history.
+        # If _collect_orphan_terminal_results wrote a tool response at the end
+        # of the chain, _agent_loop auto-processes it. Otherwise the agent
+        # starts and waits for inbox messages as usual.
+        await self._init_agents_on_startup()
 
         # Wait for shutdown signal
         await self._shutdown_event.wait()
