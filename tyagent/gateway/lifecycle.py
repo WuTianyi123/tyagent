@@ -248,19 +248,9 @@ class GatewaySupervisor:
 
         If the marker is absent, sessions continue normally from persisted
         data — SQLite guarantees data consistency across crashes.
-
-        Also cleans up any stale .gateway_interrupt/ markers.  These are
-        one-shot markers written by the terminal tool before executing
-        restart-triggering commands.  If the restart never completed
-        (crash before _do_graceful_restart), they'd otherwise accumulate.
         """
         gw = self._gateway
         gw._restart_notification_pending = None  # type: ignore[assignment]
-
-        # Clean up stale gateway_interrupt markers from any previous
-        # incomplete restart.  These are one-shot — if they weren't
-        # processed by a clean restart cycle, they're orphans.
-        self._cleanup_gateway_interrupt_dir()
 
         marker_path = gw.config.home_dir / ".clean_shutdown"
 
@@ -392,74 +382,20 @@ class GatewaySupervisor:
                 "restart aborted. Check logs above for details."
             )
 
-    def _cleanup_gateway_interrupt_dir(self) -> None:
-        """Remove all .gateway_interrupt/ marker files.
-
-        These are one-shot markers — once processed (or when no restart
-        marker is being written), they should be removed to prevent
-        disk accumulation.
-        """
-        gw = self._gateway
-        interrupt_dir = gw.config.home_dir / ".gateway_interrupt"
-        if not interrupt_dir.exists():
-            return
-        for _mf in interrupt_dir.glob("*.json"):
-            try:
-                _mf.unlink()
-            except OSError:
-                pass
-
     def _write_restart_marker(self) -> None:
-        """Write pending tool call info to a restart marker file.
+        """Write pending tool call info for in-flight tool calls during drain.
 
-        Only collects tool calls that are **related to this restart**:
+        Only collects tool calls that are currently executing when the
+        gateway drains.  These may be interrupted — we record them so
+        the new process can write an "unknown failure" response.
 
-        1.  ``.gateway_interrupt/`` markers written by the terminal tool
-            before executing commands that trigger a gateway restart
-            (e.g. ``tyagent gateway restart``).  These get a normal
-            success response — the restart IS the expected outcome.
-
-        2.  In-flight tool calls that are currently executing during
-            drain.  These may be interrupted — we record them so the
-            new process can write an "unknown failure" response.
-
-        Historical orphaned tool calls in the DB are NOT touched —
-        they are unrelated to this restart and writing synthetic
-        responses for them would break the message chain.
+        Real terminal output (including from restart-triggering commands)
+        is recovered from ``.terminal_pending/`` markers on next startup
+        — no synthetic responses are needed for those.
         """
         gw = self._gateway
-        marker = {"restarted_at": time.time(), "sessions": {}}
+        marker: Dict[str, Any] = {"restarted_at": time.time(), "sessions": {}}
         home_dir: Path = gw.config.home_dir
-
-        # ── Collect gateway_interrupt markers ──────────────────
-        interrupt_dir = home_dir / ".gateway_interrupt"
-        if interrupt_dir.exists():
-            for _mf in interrupt_dir.glob("*.json"):
-                try:
-                    data = json.loads(_mf.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    continue
-                sk = data.get("session_key", "")
-                sid = data.get("session_id", "")
-                tcid = data.get("tool_call_id", "")
-                if not sk or not sid or not tcid:
-                    continue
-                marker.setdefault("sessions", {})
-                entry = marker["sessions"].setdefault(sk, {
-                    "session_id": sid,
-                    "pending_tool_calls": [],
-                })
-                entry["pending_tool_calls"].append({
-                    "tool_call_id": tcid,
-                    "function_name": "terminal",
-                    "reason": "restart_trigger",
-                    "command": data.get("command", "")[:200],
-                })
-                logger.info(
-                    "Restart marker: restart-trigger terminal for %s/%s "
-                    "(tool_call_id=%s)",
-                    sk, sid, tcid,
-                )
 
         # ── Collect in-flight tool calls during drain ──────────
         for session_key in list(gw._sessions.keys()):
@@ -469,10 +405,6 @@ class GatewaySupervisor:
             agent = ctx.agent
             if not agent._running:
                 continue
-            # Agent is mid-tool-execution if _current_tool_call_id is set.
-            # It is only set inside _execute_tool_calls and cleared in
-            # its finally block — so a non-empty value means a tool is
-            # executing right now and will be interrupted by the restart.
             tc_id = getattr(agent, "_current_tool_call_id", "") or ""
             if not tc_id:
                 continue
@@ -483,18 +415,6 @@ class GatewaySupervisor:
                 continue
             if not session_id:
                 continue
-
-            # Skip if already captured as restart_trigger (dedup)
-            entry = marker.get("sessions", {}).get(session_key)
-            if entry:
-                already = {tc["tool_call_id"] for tc in entry["pending_tool_calls"]}
-                if tc_id in already:
-                    logger.info(
-                        "Restart marker: skipping in-flight tool call for %s/%s "
-                        "(tool_call_id=%s) — already captured as restart_trigger",
-                        session_key, tc_id,
-                    )
-                    continue
 
             entry = marker.setdefault("sessions", {}).setdefault(session_key, {
                 "session_id": session_id,
@@ -512,10 +432,7 @@ class GatewaySupervisor:
             )
 
         if not marker.get("sessions"):
-            # No restart-related tool calls — clean up gateway_interrupt
-            # markers to prevent disk accumulation.
-            self._cleanup_gateway_interrupt_dir()
-            logger.info("No restart-related tool calls — skipping restart marker")
+            logger.info("No in-flight tool calls — skipping restart marker")
             return
 
         marker_path = home_dir / ".restart_pending"
@@ -624,20 +541,15 @@ class GatewaySupervisor:
 
                 elapsed_seconds = max(0, time.time() - restarted_at)
 
-                if reason == "restart_trigger":
-                    synthetic = json.dumps({
-                        "success": True,
-                        "restart_completed": True,
-                        "duration_seconds": round(elapsed_seconds, 1),
-                        "message": f"Gateway restart completed ({elapsed_seconds:.1f}s)",
-                    })
-                else:
-                    synthetic = json.dumps({
-                        "success": False,
-                        "error": "Unknown failure — tool execution may have been interrupted by gateway restart",
-                        "interrupted": True,
-                        "duration_seconds": round(elapsed_seconds, 1),
-                    })
+                # All pending tool calls at this point are unknown_failure.
+                # Real terminal output (including from restart commands) was
+                # already collected in step 1 by _collect_orphan_terminal_results.
+                synthetic = json.dumps({
+                    "success": False,
+                    "error": "Unknown failure — tool execution may have been interrupted by gateway restart",
+                    "interrupted": True,
+                    "duration_seconds": round(elapsed_seconds, 1),
+                })
 
                 try:
                     gw.session_store.add_message(
@@ -663,9 +575,6 @@ class GatewaySupervisor:
             logger.debug("Removed restart marker (%d synthetic responses written)", written)
         except OSError as exc:
             logger.warning("Failed to remove restart marker: %s", exc)
-
-        # Clean up gateway_interrupt markers (they are now processed)
-        self._cleanup_gateway_interrupt_dir()
 
     def _collect_orphan_terminal_results(self) -> set[str]:
         """Collect completed terminal command results after restart.

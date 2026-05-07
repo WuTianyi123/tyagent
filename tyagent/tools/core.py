@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -685,54 +684,6 @@ TERMINAL_SCHEMA = {
 }
 
 
-def _write_gateway_interrupt_marker(
-    home_dir: Path,
-    tool_call_id: str,
-    session_key: str,
-    session_id: str,
-    command: str,
-) -> Optional[Path]:
-    """Write a marker for a terminal command that will trigger a gateway restart.
-
-    The marker lives in ``.gateway_interrupt/`` under the home directory.
-    When the gateway restarts, ``_handle_restart_marker_on_startup`` reads
-    these markers and writes a normal success tool response (the command
-    succeeded — the restart is expected).
-
-    This function is a best-effort notification — failures to write the
-    marker must not prevent the terminal command from executing.
-
-    Returns the marker file path if written, None if the write failed.
-    """
-    try:
-        marker_dir = home_dir / ".gateway_interrupt"
-        marker_dir.mkdir(parents=True, exist_ok=True)
-        marker_path = marker_dir / f"{uuid.uuid4().hex[:16]}.json"
-        marker_data = {
-            "tool_call_id": tool_call_id,
-            "session_key": session_key,
-            "session_id": session_id,
-            "command": command,
-            "started_at": time.time(),
-            "reason": "restart_trigger",
-        }
-        with open(marker_path, "w", encoding="utf-8") as f:
-            json.dump(marker_data, f, ensure_ascii=False)
-        logger.info(
-            "Gateway interrupt marker written for tool_call_id=%s (command: %.60s)",
-            tool_call_id, command,
-        )
-        return marker_path
-    except Exception as exc:
-        # Best-effort — catch anything that could prevent the command from
-        # running (disk full, permission denied, non-serializable data, etc.)
-        logger.warning(
-            "Failed to write gateway interrupt marker for tool_call_id=%s: %s",
-            tool_call_id, exc,
-        )
-        return None
-
-
 def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     """Execute a shell command.
 
@@ -740,6 +691,10 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     from the parent process group. stdout/stderr are written to a temp file.
     A .terminal_pending marker is created so the result can be collected even
     if the gateway restarts before the command completes.
+
+    If the command triggers a gateway restart (e.g. ``tyagent gateway restart``),
+    the real command output is recovered from the .terminal_pending marker on
+    the next startup — no synthetic responses are needed.
     """
     command = args.get("command", "")
     timeout = int(args.get("timeout", 180))
@@ -773,30 +728,6 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     session_key = getattr(parent_agent, "session_key", "") if parent_agent else ""
     session_id = getattr(parent_agent, "current_session_id", "") if parent_agent else ""
     tool_call_id = getattr(parent_agent, "_current_tool_call_id", "") if parent_agent else ""
-
-    # Detect commands that will trigger a gateway restart.
-    # These need a special marker so the restart machinery can fill in
-    # a normal success tool response (the command succeeded — the restart
-    # is the expected outcome).  Otherwise the tool would have no response
-    # and the message chain would be broken.
-    _RESTART_TRIGGERS = (
-        # Direct CLI or wrapper calls — anchored to avoid matching echo/printf.
-        r"^tyagent\s+gateway\s+restart",
-        r"^(?:sudo\s+)?systemctl\s+(--user\s+)?restart\s+tyagent-gateway",
-        r"^uv\s+run\s+python3(?:\.\d+)?\s+tyagent_cli\.py\s+gateway\s+restart",
-        r"^python3(?:\.\d+)?\s+tyagent_cli\.py\s+gateway\s+restart",
-        r"^uv\s+run\s+tyagent\s+gateway\s+restart",
-        # kill — unanchored to support pipelines (pgrep … | xargs kill …).
-        # \S+ matches PIDs, $(…), and `…`.
-        r"kill\s+-SIGUSR1\s+\S+",
-    )
-    will_restart = any(re.search(p, command) for p in _RESTART_TRIGGERS)
-
-    gw_interrupt_path: Optional[Path] = None
-    if will_restart and home_dir is not None and tool_call_id:
-        gw_interrupt_path = _write_gateway_interrupt_marker(
-            home_dir, tool_call_id, session_key, session_id, command[:200],
-        )
 
     # Create a temp output file and pending marker
     output_dir = Path(tempfile.gettempdir())
@@ -879,15 +810,6 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     except Exception as exc:
         # On exception (e.g., gateway crash), the marker and output file remain
         # so the next gateway startup can collect the result.
-        # But if this was a restart-trigger command that never actually ran
-        # (Popen raised before the subprocess started), clean up the
-        # gateway_interrupt marker to avoid a spurious "restart success"
-        # on the next restart.
-        if will_restart and gw_interrupt_path is not None:
-            try:
-                gw_interrupt_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         return tool_error(f"Command execution failed: {type(exc).__name__}: {exc}")
 
 
