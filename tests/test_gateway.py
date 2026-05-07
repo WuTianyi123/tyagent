@@ -710,7 +710,7 @@ class TestRestartMarker:
                     "session_id": session_id,
                     "pending_tool_calls": [
                         {"tool_call_id": "call_orphan_1", "function_name": "?",
-                         "reason": "unknown_failure"},
+                         "reason": "planned_restart"},
                     ],
                 }
             },
@@ -732,7 +732,7 @@ class TestRestartMarker:
         parsed = json.loads(tool_msgs[0]["content"])
         assert parsed.get("interrupted") is True
         assert parsed.get("success") is False
-        assert "Unknown failure" in parsed.get("error", "")
+        assert "planned gateway restart" in parsed.get("error", "")
         gw.session_store.close()
 
     def test_handle_marker_no_file(self, tmp_path):
@@ -775,7 +775,7 @@ class TestRestartMarker:
                     "session_id": session_id,
                     "pending_tool_calls": [
                         {"tool_call_id": "call_orphan_1", "function_name": "?",
-                         "reason": "unknown_failure"},
+                         "reason": "planned_restart"},
                     ],
                 }
             },
@@ -798,8 +798,8 @@ class TestRestartMarker:
         )
         gw.session_store.close()
 
-    def test_handle_marker_unknown_failure(self, tmp_path):
-        """Marker with reason='unknown_failure' → synthetic 'unknown failure' response."""
+    def test_handle_marker_planned_restart(self, tmp_path):
+        """Marker with reason='planned_restart' → synthetic 'planned restart' response."""
         import json, time
         config = _make_config(sessions_dir=tmp_path / "sessions")
         gw = Gateway(config)
@@ -813,7 +813,7 @@ class TestRestartMarker:
                     "session_id": session_id,
                     "pending_tool_calls": [
                         {"tool_call_id": "call_orphan_1", "function_name": "?",
-                         "reason": "unknown_failure"},
+                         "reason": "planned_restart"},
                     ],
                 }
             },
@@ -833,11 +833,11 @@ class TestRestartMarker:
         parsed = json.loads(tool_msgs[0]["content"])
         assert parsed.get("success") is False
         assert parsed.get("interrupted") is True
-        assert "Unknown failure" in parsed.get("error", "")
+        assert "planned gateway restart" in parsed.get("error", "")
         gw.session_store.close()
 
     def test_write_marker_with_in_flight_tool(self, tmp_path):
-        """Agent with _current_tool_call_id set → captured as unknown_failure."""
+        """Agent with _current_tool_call_id set → captured as planned_restart."""
         import json
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
@@ -857,7 +857,7 @@ class TestRestartMarker:
         assert len(sdata["pending_tool_calls"]) == 1
         tc = sdata["pending_tool_calls"][0]
         assert tc["tool_call_id"] == "call_in_flight_1"
-        assert tc["reason"] == "unknown_failure"
+        assert tc["reason"] == "planned_restart"
         # Verify session_id in marker matches the actual session
         assert sdata["session_id"] == session_id
         gw.session_store.close()
@@ -904,7 +904,7 @@ class TestRestartMarker:
                     "session_id": session_id,
                     "pending_tool_calls": [
                         {"tool_call_id": "call_orphan_1", "function_name": "?",
-                         "reason": "unknown_failure"},
+                         "reason": "planned_restart"},
                     ],
                 }
             },

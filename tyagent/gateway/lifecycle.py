@@ -422,7 +422,7 @@ class GatewaySupervisor:
             entry["pending_tool_calls"].append({
                 "tool_call_id": tc_id,
                 "function_name": "?",
-                "reason": "unknown_failure",
+                "reason": "planned_restart",
             })
             logger.info(
                 "Restart marker: in-flight tool call for %s/%s "
@@ -540,12 +540,13 @@ class GatewaySupervisor:
 
                 elapsed_seconds = max(0, time.time() - restarted_at)
 
-                # All pending tool calls at this point are unknown_failure.
-                # Real terminal output (including from restart commands) was
-                # already collected in step 1 by _collect_orphan_terminal_results.
+                # Pending tool calls from the restart marker represent
+                # planned gateway restarts (drain wrote this marker).
+                # The model should be told this was intentional so it
+                # can retry without assuming system instability.
                 synthetic = json.dumps({
                     "success": False,
-                    "error": "Unknown failure — tool execution may have been interrupted by gateway restart",
+                    "error": "Tool call interrupted by planned gateway restart. System has recovered. Please retry.",
                     "interrupted": True,
                     "duration_seconds": round(elapsed_seconds, 1),
                 })

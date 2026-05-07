@@ -115,7 +115,7 @@ def _sanitize_message_chain(
                                 "role": "tool",
                                 "tool_call_id": tc_id,
                                 "content": json.dumps({
-                                    "error": f"Gateway restarted before tool '{fn_name}' completed",
+                                    "error": f"Tool call interrupted by unexpected gateway termination. Please retry if needed.",
                                     "interrupted": True,
                                 }),
                             }
