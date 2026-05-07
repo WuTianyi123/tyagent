@@ -698,24 +698,33 @@ def _write_gateway_interrupt_marker(
     When the gateway restarts, ``_handle_restart_marker_on_startup`` reads
     these markers and writes a normal success tool response (the command
     succeeded — the restart is expected).
+
+    This function is a best-effort notification — failures to write the
+    marker must not prevent the terminal command from executing.
     """
-    marker_dir = home_dir / ".gateway_interrupt"
-    marker_dir.mkdir(parents=True, exist_ok=True)
-    marker_path = marker_dir / f"{uuid.uuid4().hex[:16]}.json"
-    marker_data = {
-        "tool_call_id": tool_call_id,
-        "session_key": session_key,
-        "session_id": session_id,
-        "command": command,
-        "started_at": time.time(),
-        "reason": "restart_trigger",
-    }
-    with open(marker_path, "w") as f:
-        json.dump(marker_data, f, ensure_ascii=False)
-    logger.info(
-        "Gateway interrupt marker written for tool_call_id=%s (command: %.60s)",
-        tool_call_id, command,
-    )
+    try:
+        marker_dir = home_dir / ".gateway_interrupt"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = marker_dir / f"{uuid.uuid4().hex[:16]}.json"
+        marker_data = {
+            "tool_call_id": tool_call_id,
+            "session_key": session_key,
+            "session_id": session_id,
+            "command": command,
+            "started_at": time.time(),
+            "reason": "restart_trigger",
+        }
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump(marker_data, f, ensure_ascii=False)
+        logger.info(
+            "Gateway interrupt marker written for tool_call_id=%s (command: %.60s)",
+            tool_call_id, command,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Failed to write gateway interrupt marker for tool_call_id=%s: %s",
+            tool_call_id, exc,
+        )
 
 
 def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
@@ -765,11 +774,12 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
     # is the expected outcome).  Otherwise the tool would have no response
     # and the message chain would be broken.
     _RESTART_TRIGGERS = (
-        r"tyagent\s+gateway\s+restart",
+        r"^tyagent\s+gateway\s+restart",
         r"systemctl\s+(--user\s+)?restart\s+tyagent-gateway",
-        r"kill\s+-SIGUSR1\s+",
-        r"uv\s+run\s+python\s+tyagent_cli\.py\s+gateway\s+restart",
-        r"python\s+tyagent_cli\.py\s+gateway\s+restart",
+        r"kill\s+-SIGUSR1\s+\d+",
+        r"^uv\s+run\s+python3?\s+tyagent_cli\.py\s+gateway\s+restart",
+        r"^python3?\s+tyagent_cli\.py\s+gateway\s+restart",
+        r"^uv\s+run\s+tyagent\s+gateway\s+restart",
     )
     will_restart = any(re.search(p, command) for p in _RESTART_TRIGGERS)
 

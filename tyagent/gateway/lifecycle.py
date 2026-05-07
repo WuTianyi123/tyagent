@@ -381,6 +381,23 @@ class GatewaySupervisor:
                 "restart aborted. Check logs above for details."
             )
 
+    def _cleanup_gateway_interrupt_dir(self) -> None:
+        """Remove all .gateway_interrupt/ marker files.
+
+        These are one-shot markers — once processed (or when no restart
+        marker is being written), they should be removed to prevent
+        disk accumulation.
+        """
+        gw = self._gateway
+        interrupt_dir = gw.config.home_dir / ".gateway_interrupt"
+        if not interrupt_dir.exists():
+            return
+        for _mf in interrupt_dir.glob("*.json"):
+            try:
+                _mf.unlink()
+            except OSError:
+                pass
+
     def _write_restart_marker(self) -> None:
         """Write pending tool call info to a restart marker file.
 
@@ -439,13 +456,12 @@ class GatewaySupervisor:
             if ctx is None:
                 continue
             agent = ctx.agent
-            # Check if agent is running a turn right now
             if not agent._running:
                 continue
-            # Agents with non-empty inbox are mid-turn
-            if agent._inbox.empty():
-                continue
-            # Get the current tool_call_id (set by _execute_tool_calls)
+            # Agent is mid-tool-execution if _current_tool_call_id is set.
+            # It is only set inside _execute_tool_calls and cleared in
+            # its finally block — so a non-empty value means a tool is
+            # executing right now and will be interrupted by the restart.
             tc_id = getattr(agent, "_current_tool_call_id", "") or ""
             if not tc_id:
                 continue
@@ -456,6 +472,19 @@ class GatewaySupervisor:
                 continue
             if not session_id:
                 continue
+
+            # Skip if already captured as restart_trigger (dedup)
+            entry = marker.get("sessions", {}).get(session_key)
+            if entry:
+                already = {tc["tool_call_id"] for tc in entry["pending_tool_calls"]}
+                if tc_id in already:
+                    logger.info(
+                        "Restart marker: skipping in-flight tool call for %s/%s "
+                        "(tool_call_id=%s) — already captured as restart_trigger",
+                        session_key, tc_id,
+                    )
+                    continue
+
             entry = marker.setdefault("sessions", {}).setdefault(session_key, {
                 "session_id": session_id,
                 "pending_tool_calls": [],
@@ -472,6 +501,9 @@ class GatewaySupervisor:
             )
 
         if not marker.get("sessions"):
+            # No restart-related tool calls — clean up gateway_interrupt
+            # markers to prevent disk accumulation.
+            self._cleanup_gateway_interrupt_dir()
             logger.info("No restart-related tool calls — skipping restart marker")
             return
 
@@ -601,13 +633,7 @@ class GatewaySupervisor:
             logger.warning("Failed to remove restart marker: %s", exc)
 
         # Clean up gateway_interrupt markers (they are now processed)
-        interrupt_dir = gw.config.home_dir / ".gateway_interrupt"
-        if interrupt_dir.exists():
-            for _mf in interrupt_dir.glob("*.json"):
-                try:
-                    _mf.unlink()
-                except OSError:
-                    pass
+        self._cleanup_gateway_interrupt_dir()
 
         # Collect completed terminal command results from detached subprocesses.
         # This captures real tool output that completed after the gateway exited.
@@ -696,6 +722,33 @@ class GatewaySupervisor:
                     "Terminal marker %s missing session info — removing",
                     marker_path.name,
                 )
+                marker_path.unlink(missing_ok=True)
+                output_path.unlink(missing_ok=True)
+                continue
+
+            # Check if a tool response already exists for this tool_call_id.
+            # _handle_restart_marker_on_startup may have already written a
+            # synthetic response — skip to avoid duplicate tool messages.
+            skip_response = False
+            if tool_call_id:
+                try:
+                    existing = gw.session_store.get_messages(
+                        session_key, session_id=session_id,
+                    )
+                except Exception:
+                    existing = []
+                for m in existing:
+                    if (m.get("role") == "tool"
+                            and m.get("tool_call_id") == tool_call_id):
+                        logger.info(
+                            "Skipping terminal result for %s/%s "
+                            "(tool_call_id=%s) — response already exists in DB",
+                            session_key, marker_path.name, tool_call_id,
+                        )
+                        skip_response = True
+                        break
+
+            if skip_response:
                 marker_path.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
                 continue

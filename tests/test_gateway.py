@@ -73,6 +73,10 @@ def _make_config(**overrides):
         "reset_triggers": ["new"],
     }
     defaults.update(overrides)
+    # Derive home_dir from sessions_dir if not explicitly set, so tests
+    # never write to the real ~/.tyagent directory.
+    if "home_dir" not in defaults and "sessions_dir" in defaults:
+        defaults["home_dir"] = defaults["sessions_dir"].parent
     return TyAgentConfig(**defaults)
 
 
@@ -858,6 +862,134 @@ class TestRestartMarker:
         assert len(sanitized) == len(messages), (
             f"_sanitize_message_chain should not add new messages "
             f"({len(sanitized)} vs {len(messages)})"
+        )
+        gw.session_store.close()
+
+    def test_handle_marker_unknown_failure(self, tmp_path):
+        """Marker with reason='unknown_failure' → synthetic 'unknown failure' response."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
+        session_id = session.metadata.get("current_session_id", "")
+
+        marker = {
+            "restarted_at": time.time(),
+            "sessions": {
+                "test:key": {
+                    "session_id": session_id,
+                    "pending_tool_calls": [
+                        {"tool_call_id": "call_orphan_1", "function_name": "?",
+                         "reason": "unknown_failure"},
+                    ],
+                }
+            },
+        }
+        marker_path = config.home_dir / ".restart_pending"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        assert not marker_path.exists()
+
+        messages = gw.session_store.get_messages("test:key", session_id=session_id)
+        tool_msgs = [m for m in messages if m.get("role") == "tool"
+                     and m.get("tool_call_id") == "call_orphan_1"]
+        assert len(tool_msgs) == 1
+        parsed = json.loads(tool_msgs[0]["content"])
+        assert parsed.get("success") is False
+        assert parsed.get("interrupted") is True
+        assert "Unknown failure" in parsed.get("error", "")
+        gw.session_store.close()
+
+    def test_write_marker_with_in_flight_tool(self, tmp_path):
+        """Agent with _current_tool_call_id set → captured as unknown_failure."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        session_id = session.metadata.get("current_session_id", "")
+        self._add_active_session(gw, "test:key", session)
+        agent = gw._sessions["test:key"].agent
+        agent._running = True
+        agent._current_tool_call_id = "call_in_flight_1"
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert marker_path.exists()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        sdata = marker["sessions"]["test:key"]
+        assert len(sdata["pending_tool_calls"]) == 1
+        tc = sdata["pending_tool_calls"][0]
+        assert tc["tool_call_id"] == "call_in_flight_1"
+        assert tc["reason"] == "unknown_failure"
+        gw.session_store.close()
+        marker_path.unlink(missing_ok=True)
+
+    def test_write_marker_dedup_in_flight_and_restart_trigger(self, tmp_path):
+        """Same tool_call in both gateway_interrupt AND in-flight → only once."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+
+        interrupt_dir = config.home_dir / ".gateway_interrupt"
+        interrupt_dir.mkdir(parents=True, exist_ok=True)
+        marker_data = {
+            "tool_call_id": "call_shared_1",
+            "session_key": "test:key",
+            "session_id": "sid_shared",
+            "command": "tyagent gateway restart",
+            "started_at": time.time(),
+            "reason": "restart_trigger",
+        }
+        (interrupt_dir / "shared.json").write_text(json.dumps(marker_data), encoding="utf-8")
+
+        session = gw.session_store.get("test:key")
+        self._add_active_session(gw, "test:key", session)
+        agent = gw._sessions["test:key"].agent
+        agent._running = True
+        agent._current_tool_call_id = "call_shared_1"
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert marker_path.exists()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        sdata = marker["sessions"]["test:key"]
+        assert len(sdata["pending_tool_calls"]) == 1
+        tc = sdata["pending_tool_calls"][0]
+        assert tc["tool_call_id"] == "call_shared_1"
+        assert tc["reason"] == "restart_trigger", (
+            "restart_trigger should take precedence over unknown_failure"
+        )
+        gw.session_store.close()
+        marker_path.unlink(missing_ok=True)
+
+    def test_write_marker_cleans_interrupt_dir_when_no_sessions(self, tmp_path):
+        """gateway_interrupt markers cleaned up when no .restart_pending written."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+
+        interrupt_dir = config.home_dir / ".gateway_interrupt"
+        interrupt_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            (interrupt_dir / f"stale_{i}.json").write_text(
+                json.dumps({"tool_call_id": f"stale_{i}", "session_key": "nonexistent"}),
+                encoding="utf-8",
+            )
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert not marker_path.exists(), "Should not write .restart_pending"
+
+        remaining = list(interrupt_dir.glob("*.json"))
+        assert len(remaining) == 0, (
+            f"gateway_interrupt markers should be cleaned up even when no restart_pending; "
+            f"found {len(remaining)}"
         )
         gw.session_store.close()
 
