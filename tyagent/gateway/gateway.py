@@ -626,10 +626,27 @@ class Gateway:
                             session_key, role, content, session_id=sid, **extras,
                         )
                     return _p
+                # Create a ProgressSender for the auto-processing turn so
+                # tool progress is visible after restart (separate message
+                # from any pre-restart progress messages).
+                progress_sender = ProgressSender(
+                    adapter, chat_id,
+                    reply_to_message_id=None,
+                    enabled=True,
+                )
+                progress_task = asyncio.create_task(progress_sender.run())
+                # Set the progress callback on the agent before the loop starts
+                agent = self._get_or_create_agent(session_key)
+                agent._tool_progress_callback = progress_sender.on_tool_started
                 await self._ensure_session_agent(
                     session_key, session, adapter, chat_id,
                     _mk_persist(_persist_sid),
                 )
+                # Register for cleanup — finish will be called when user sends
+                # a message and a new ProgressSender replaces this one.
+                ctx = self._sessions.get(session_key)
+                if ctx:
+                    ctx.progress_tasks.append(progress_task)
                 logger.info("Initialized agent for session %s", session_key)
             except Exception:
                 logger.exception("Failed to init agent for %s", session_key)
