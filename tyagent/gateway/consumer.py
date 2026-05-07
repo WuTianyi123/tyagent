@@ -149,13 +149,21 @@ class StreamConsumer:
                                 # Only create new message if edit failure was transient (flood).
                                 # For permanent failures (e.g., platform doesn't support editing),
                                 # let content accumulate until got_done/got_segment_break.
+                                # Use _fallback_prefix to send only the delta (content after
+                                # the last successful edit) to avoid duplicating already-shown
+                                # content in the new message.
                                 if not self._edit_permanently_disabled:
-                                    display_with_cursor = display + (" ▉" if not got_done else "")
-                                    result = await self.adapter.send_message(self.chat_id, display_with_cursor, reply_to_message_id=self._reply_to_message_id)
+                                    fallback_text = display
+                                    if self._fallback_prefix and display.startswith(self._fallback_prefix):
+                                        tail = display[len(self._fallback_prefix):].lstrip()
+                                        if tail:
+                                            fallback_text = tail
+                                    fallback_text += " ▉" if not got_done else ""
+                                    result = await self.adapter.send_message(self.chat_id, fallback_text, reply_to_message_id=self._reply_to_message_id)
                                     if result.success:
                                         self._message_id = result.message_id
                                         self._already_sent = True
-                                        self._last_sent_text = display_with_cursor
+                                        self._last_sent_text = fallback_text
                                         self._edit_supported = True
                                         self._flood_strikes = 0
                                         if hasattr(result, "msg_type") and result.msg_type:
@@ -164,15 +172,20 @@ class StreamConsumer:
                             logger.exception("Edit failed with exception, content: %d chars", len(display))
                             if not self._edit_permanently_disabled:
                                 try:
-                                    display_with_cursor = display + (" ▉" if not got_done else "")
+                                    fallback_text = display
+                                    if self._fallback_prefix and display.startswith(self._fallback_prefix):
+                                        tail = display[len(self._fallback_prefix):].lstrip()
+                                        if tail:
+                                            fallback_text = tail
+                                    fallback_text += " ▉" if not got_done else ""
                                     result = await self.adapter.send_message(
-                                        self.chat_id, display_with_cursor,
+                                        self.chat_id, fallback_text,
                                         reply_to_message_id=self._reply_to_message_id,
                                     )
                                     if result.success:
                                         self._message_id = result.message_id
                                         self._already_sent = True
-                                        self._last_sent_text = display_with_cursor
+                                        self._last_sent_text = fallback_text
                                         self._edit_supported = True
                                         self._flood_strikes = 0
                                 except Exception:

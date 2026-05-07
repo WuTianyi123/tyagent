@@ -279,8 +279,11 @@ class ProgressSender:
                             progress_msg_id = fallback.message_id
                             can_edit = True
                             self._progress_msg_type = getattr(fallback, "msg_type", None)
+                            # Trim progress_lines to only the undelivered portion so
+                            # subsequent edits don't re-add old content to the new message.
+                            progress_lines = delta_lines[:]
+                            last_delivered_count = 0
                             last_edit_ts = time.monotonic()
-                            last_delivered_count = len(progress_lines)
                 elif progress_msg_id is None:
                     result = await self.adapter.send_message(
                         self.chat_id, text,
@@ -311,8 +314,10 @@ class ProgressSender:
                         progress_msg_id = retry.message_id
                         can_edit = True
                         self._progress_msg_type = getattr(retry, "msg_type", None)
+                        # Trim progress_lines to only the undelivered portion.
+                        progress_lines = delta_lines[:]
+                        last_delivered_count = 0
                         last_edit_ts = time.monotonic()
-                        last_delivered_count = len(progress_lines)
 
                 if self._done:
                     return
