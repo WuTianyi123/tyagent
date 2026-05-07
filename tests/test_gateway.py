@@ -905,7 +905,7 @@ class TestRestartMarker:
 
     def test_write_marker_with_in_flight_tool(self, tmp_path):
         """Agent with _current_tool_call_id set → captured as unknown_failure."""
-        import json, time
+        import json
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
         session = gw.session_store.get("test:key")
@@ -925,8 +925,28 @@ class TestRestartMarker:
         tc = sdata["pending_tool_calls"][0]
         assert tc["tool_call_id"] == "call_in_flight_1"
         assert tc["reason"] == "unknown_failure"
+        # Verify session_id in marker matches the actual session
+        assert sdata["session_id"] == session_id
         gw.session_store.close()
         marker_path.unlink(missing_ok=True)
+
+    def test_write_marker_in_flight_not_running_skipped(self, tmp_path):
+        """Agent with _current_tool_call_id set but _running=False → skipped."""
+        config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
+        gw = Gateway(config)
+        session = gw.session_store.get("test:key")
+        self._add_active_session(gw, "test:key", session)
+        agent = gw._sessions["test:key"].agent
+        agent._running = False  # Agent is stopped
+        agent._current_tool_call_id = "call_in_flight_1"
+
+        gw.supervisor._write_restart_marker()
+
+        marker_path = config.home_dir / ".restart_pending"
+        assert not marker_path.exists(), (
+            "Should not write marker when agent is not running"
+        )
+        gw.session_store.close()
 
     def test_write_marker_dedup_in_flight_and_restart_trigger(self, tmp_path):
         """Same tool_call in both gateway_interrupt AND in-flight → only once."""
@@ -934,19 +954,21 @@ class TestRestartMarker:
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
 
+        session = gw.session_store.get("test:key")
+        session_id = session.metadata.get("current_session_id", "")
+
         interrupt_dir = config.home_dir / ".gateway_interrupt"
         interrupt_dir.mkdir(parents=True, exist_ok=True)
         marker_data = {
             "tool_call_id": "call_shared_1",
             "session_key": "test:key",
-            "session_id": "sid_shared",
+            "session_id": session_id,  # Use real session_id, not a fake one
             "command": "tyagent gateway restart",
             "started_at": time.time(),
             "reason": "restart_trigger",
         }
         (interrupt_dir / "shared.json").write_text(json.dumps(marker_data), encoding="utf-8")
 
-        session = gw.session_store.get("test:key")
         self._add_active_session(gw, "test:key", session)
         agent = gw._sessions["test:key"].agent
         agent._running = True
@@ -968,28 +990,119 @@ class TestRestartMarker:
         marker_path.unlink(missing_ok=True)
 
     def test_write_marker_cleans_interrupt_dir_when_no_sessions(self, tmp_path):
-        """gateway_interrupt markers cleaned up when no .restart_pending written."""
-        import json, time
+        """gateway_interrupt markers cleaned up by handler even from dormant sessions."""
+        import json
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
+
+        # Create a valid session in DB but do NOT register it as active
+        session = gw.session_store.get("dormant:key")
+        session_id = session.metadata.get("current_session_id", "")
+
+        # Add a minimal message chain so the handler can write synthetics
+        session.add_message("user", "restart trigger test")
+        session.add_message("assistant", "", tool_calls=[{
+            "id": "call_dormant_1",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": '{"command": "tyagent gateway restart"}'},
+        }])
 
         interrupt_dir = config.home_dir / ".gateway_interrupt"
         interrupt_dir.mkdir(parents=True, exist_ok=True)
         for i in range(3):
             (interrupt_dir / f"stale_{i}.json").write_text(
-                json.dumps({"tool_call_id": f"stale_{i}", "session_key": "nonexistent"}),
+                json.dumps({
+                    "tool_call_id": f"call_dormant_1",
+                    "session_key": "dormant:key",
+                    "session_id": session_id,
+                    "command": "tyagent gateway restart",
+                    "reason": "restart_trigger",
+                }),
                 encoding="utf-8",
             )
 
+        # _write_restart_marker should collect valid interrupt markers
+        # even if the session isn't active in gw._sessions
         gw.supervisor._write_restart_marker()
 
         marker_path = config.home_dir / ".restart_pending"
-        assert not marker_path.exists(), "Should not write .restart_pending"
+        assert marker_path.exists(), (
+            "Should write .restart_pending when valid gateway_interrupt markers exist, "
+            "even for dormant sessions"
+        )
 
-        remaining = list(interrupt_dir.glob("*.json"))
-        assert len(remaining) == 0, (
-            f"gateway_interrupt markers should be cleaned up even when no restart_pending; "
-            f"found {len(remaining)}"
+        # gateway_interrupt markers should NOT be cleaned up by _write_restart_marker
+        # (cleanup happens in _handle_restart_marker_on_startup after processing)
+        remaining_before = list(interrupt_dir.glob("*.json"))
+        assert len(remaining_before) == 3, (
+            "_write_restart_marker should NOT clean up when sessions exist; "
+            f"found {len(remaining_before)}"
+        )
+
+        # Now simulate the handler processing
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        # After handler, markers should be cleaned up
+        assert not marker_path.exists(), "Handler should clean up .restart_pending"
+        remaining_after = list(interrupt_dir.glob("*.json"))
+        assert len(remaining_after) == 0, (
+            f"Handler should clean up gateway_interrupt markers; found {len(remaining_after)}"
+        )
+        gw.session_store.close()
+
+    def test_handle_marker_skips_when_response_exists(self, tmp_path):
+        """Handler skips synthetic when a real tool response already in DB."""
+        import json, time
+        config = _make_config(sessions_dir=tmp_path / "sessions")
+        gw = Gateway(config)
+        session = self._add_orphaned_tool_call(gw.session_store, "test:key")
+        session_id = session.metadata.get("current_session_id", "")
+
+        # Pre-populate a real tool response for the same tool_call_id
+        session.add_message(
+            "tool",
+            json.dumps({"output": "real output", "exit_code": 0}),
+            tool_call_id="call_orphan_1",
+        )
+
+        # Write a restart marker (simulate the old process)
+        marker = {
+            "restarted_at": time.time(),
+            "sessions": {
+                "test:key": {
+                    "session_id": session_id,
+                    "pending_tool_calls": [
+                        {"tool_call_id": "call_orphan_1", "function_name": "terminal",
+                         "reason": "restart_trigger"},
+                    ],
+                }
+            },
+        }
+        marker_path = config.home_dir / ".restart_pending"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        # Handler should see the real response and skip synthetics
+        gw.supervisor._handle_restart_marker_on_startup()
+
+        assert not marker_path.exists()
+
+        # Verify only ONE tool response exists for call_orphan_1
+        # (the real one, not a synthetic duplicate)
+        messages = gw.session_store.get_messages("test:key", session_id=session_id)
+        tool_msgs = [m for m in messages if m.get("role") == "tool"
+                     and m.get("tool_call_id") == "call_orphan_1"]
+        assert len(tool_msgs) == 1, (
+            f"Should have exactly 1 response for call_orphan_1; "
+            f"found {len(tool_msgs)}"
+        )
+        # The existing response should be the real one (not synthetic)
+        parsed = json.loads(tool_msgs[0]["content"])
+        assert parsed.get("output") == "real output", (
+            "Real output should not be replaced by synthetics"
+        )
+        assert "restart_completed" not in parsed, (
+            "Real response should not have synthetic markers"
         )
         gw.session_store.close()
 
@@ -1299,3 +1412,65 @@ class TestAdapterHomeDir:
         """BasePlatformAdapter accepts home_dir=None (backward compat)."""
         adapter = _MinimalAdapter(config=None, platform_name="test")
         assert adapter.home_dir is None
+
+
+# ---------------------------------------------------------------------------
+# Restart trigger regex tests
+# ---------------------------------------------------------------------------
+
+
+class TestRestartTriggers:
+    """Test _RESTART_TRIGGERS regex patterns in the terminal tool."""
+
+    def _will_restart(self, command: str) -> bool:
+        """Check if command matches any restart trigger pattern."""
+        import re
+        from tyagent.tools.core import _handle_terminal
+        # Reconstruct the same patterns used in _handle_terminal
+        _RESTART_TRIGGERS = (
+            r"^tyagent\s+gateway\s+restart",
+            r"^(?:sudo\s+)?systemctl\s+(--user\s+)?restart\s+tyagent-gateway",
+            r"^uv\s+run\s+python3(?:\.\d+)?\s+tyagent_cli\.py\s+gateway\s+restart",
+            r"^python3(?:\.\d+)?\s+tyagent_cli\.py\s+gateway\s+restart",
+            r"^uv\s+run\s+tyagent\s+gateway\s+restart",
+            r"kill\s+-SIGUSR1\s+\S+",
+        )
+        return any(re.search(p, command) for p in _RESTART_TRIGGERS)
+
+    def test_direct_cli(self):
+        assert self._will_restart("tyagent gateway restart")
+        # ^ anchor prevents echo false positive
+        assert not self._will_restart('echo "tyagent gateway restart"')
+        assert not self._will_restart("echo tyagent gateway restart")
+
+    def test_systemctl(self):
+        assert self._will_restart("systemctl --user restart tyagent-gateway")
+        assert self._will_restart("sudo systemctl restart tyagent-gateway")
+        assert self._will_restart("sudo systemctl --user restart tyagent-gateway")
+        # ^ anchor prevents false positive
+        assert not self._will_restart('echo "systemctl restart tyagent-gateway"')
+
+    def test_kill(self):
+        assert self._will_restart("kill -SIGUSR1 12345")
+        # \S+ supports subcommand expansion
+        assert self._will_restart("kill -SIGUSR1 $(pgrep -f tyagent-gateway)")
+        # \S+ also matches backtick subcommands
+        assert self._will_restart("kill -SIGUSR1 `pgrep tyagent`")
+
+    def test_python_cli(self):
+        assert self._will_restart("python3 tyagent_cli.py gateway restart")
+        assert self._will_restart("python3.11 tyagent_cli.py gateway restart")
+        assert self._will_restart("python3.12 tyagent_cli.py gateway restart")
+
+    def test_uv_run(self):
+        assert self._will_restart("uv run tyagent gateway restart")
+        assert self._will_restart("uv run python3 tyagent_cli.py gateway restart")
+        assert self._will_restart("uv run python3.11 tyagent_cli.py gateway restart")
+
+    def test_non_restart_commands(self):
+        """Commands that should NOT trigger."""
+        assert not self._will_restart("ls -la")
+        assert not self._will_restart("echo hello")
+        assert not self._will_restart("cat /proc/loadavg")
+        assert not self._will_restart("tyagent gateway status")
+        assert not self._will_restart("systemctl status tyagent-gateway")
