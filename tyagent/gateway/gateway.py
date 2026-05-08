@@ -227,7 +227,6 @@ class Gateway:
         self._restart_drain_timeout: float = 60.0
         self._restart_requestor: Optional[Dict[str, str]] = None
         self._restart_notification_pending: Optional[Dict[str, str]] = None
-        self._restart_affected_sessions: set[str] = set()
         # Subsystems
         self.commands = CommandRegistry(self)
         self.supervisor = GatewaySupervisor(self)

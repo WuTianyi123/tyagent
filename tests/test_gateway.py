@@ -406,6 +406,7 @@ class TestSanitizeMessageChain:
         assert result[2]["role"] == "tool"
         assert result[2]["tool_call_id"] == "tc1"
         assert "interrupted" in result[2]["content"]
+        assert "unexpected gateway termination" in result[2]["content"]
 
     def test_orphan_tool_calls_followed_by_user(self):
         """The exact scenario from the bug report."""
@@ -427,6 +428,7 @@ class TestSanitizeMessageChain:
         assert result[4]["role"] == "tool"
         assert result[4]["tool_call_id"] == "tc2"
         assert "interrupted" in result[4]["content"]
+        assert "unexpected gateway termination" in result[4]["content"]
         # Earlier tool_calls should be preserved
         assert result[1].get("tool_calls") is not None
 

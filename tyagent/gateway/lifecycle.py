@@ -124,6 +124,8 @@ class GatewaySupervisor:
 
             # Write .clean_shutdown marker
             self._write_clean_shutdown_marker()
+        except RuntimeError:
+            raise  # validation failure should abort restart
         except Exception:
             logger.exception(
                 "Graceful restart failed unexpectedly — proceeding with restart anyway"
@@ -310,7 +312,7 @@ class GatewaySupervisor:
         gw = self._gateway
         agent_cfg = gw.config.agent
         if not agent_cfg.api_key or not agent_cfg.base_url:
-            return True  # Can't validate without API config
+            return  # Can't validate without API config
 
         headers = {
             "Authorization": f"Bearer {agent_cfg.api_key}",
@@ -467,7 +469,6 @@ class GatewaySupervisor:
         try:
             affected = self._collect_orphan_terminal_results()
             if affected:
-                gw._restart_affected_sessions = affected
                 logger.info(
                     "Collected terminal results for %d session(s): %s",
                     len(affected), affected,
@@ -598,10 +599,12 @@ class GatewaySupervisor:
 
         markers = list(pending_dir.glob("*.json"))
         if not markers:
-            return
+            return affected
 
         logger.info("Scanning %d terminal pending markers...", len(markers))
 
+        # Pre-load existing tool responses for dedup (avoid writing duplicates)
+        existing_responses: dict[str, set[str]] = {}  # session_key -> set of tool_call_ids
         for marker_path in markers:
             try:
                 data = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -674,6 +677,31 @@ class GatewaySupervisor:
                 result_data["hint"] = "Output was truncated."
 
             try:
+                # Dedup: skip if a tool response already exists for this call_id
+                # (could have been written by a previous crash+restart cycle)
+                if tool_call_id:
+                    if session_key not in existing_responses:
+                        try:
+                            msgs = gw.session_store.get_messages(
+                                session_key, session_id=session_id
+                            )
+                            existing_responses[session_key] = {
+                                m.get("tool_call_id", "")
+                                for m in msgs
+                                if m.get("role") == "tool" and m.get("tool_call_id")
+                            }
+                        except Exception:
+                            existing_responses[session_key] = set()
+                    if tool_call_id in existing_responses[session_key]:
+                        logger.info(
+                            "Skipping terminal result for %s/%s — "
+                            "tool response already exists (tool_call_id=%s)",
+                            session_key, marker_path.name, tool_call_id,
+                        )
+                        marker_path.unlink(missing_ok=True)
+                        output_path.unlink(missing_ok=True)
+                        continue
+
                 gw.session_store.add_message(
                     session_key, "tool", json.dumps(result_data, ensure_ascii=False),
                     session_id=session_id,
