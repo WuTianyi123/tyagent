@@ -222,6 +222,8 @@ class Gateway:
         self._draining = False
         # Per-session state — session_key → SessionContext
         self._sessions: Dict[str, SessionContext] = {}
+        # Per-session locks to prevent double agent creation (P0 race)
+        self._session_locks: Dict[str, asyncio.Lock] = {}
         self._restart_drain_timeout: float = 60.0
         self._restart_requestor: Optional[Dict[str, str]] = None
         self._restart_notification_pending: Optional[Dict[str, str]] = None
@@ -489,35 +491,49 @@ class Gateway:
         persist_message: Callable,
     ) -> TyAgent:
         """Get or create agent with running loop. Starts _consume_output."""
+        # Fast path: already exists
         if session_key in self._sessions:
             return self._sessions[session_key].agent
 
-        agent = self._get_or_create_agent(session_key)
-        agent.session_key = session_key
-        agent.current_session_id = session.metadata.get("current_session_id", "")
+        # Serialise per session_key to prevent double agent creation
+        # when concurrent messages for the same session arrive during
+        # the awaits inside this method.
+        if session_key not in self._session_locks:
+            self._session_locks[session_key] = asyncio.Lock()
+        lock = self._session_locks[session_key]
 
-        # Start the permanent agent loop with history and persistence
-        # Sanitize the message chain to repair orphaned tool_calls from
-        # crashes/restarts mid-tool-execution (e.g. assistant with 2 tool_calls
-        # but only 1 tool response persisted before kill).
-        await agent.start(
-            history=_sanitize_message_chain(session.messages),
-            on_message=persist_message,
-        )
+        async with lock:
+            # Double-check: another caller may have created the session
+            # while we were waiting for the lock.
+            if session_key in self._sessions:
+                return self._sessions[session_key].agent
 
-        self._sessions[session_key] = SessionContext(
-            agent, adapter,
-            platform_name=adapter.platform_name,
-            chat_id=chat_id,
-        )
+            agent = self._get_or_create_agent(session_key)
+            agent.session_key = session_key
+            agent.current_session_id = session.metadata.get("current_session_id", "")
 
-        # Start background output consumer
-        ctx = self._sessions[session_key]
-        ctx.output_task = asyncio.create_task(
-            self._consume_output(session_key)
-        )
+            # Start the permanent agent loop with history and persistence
+            # Sanitize the message chain to repair orphaned tool_calls from
+            # crashes/restarts mid-tool-execution (e.g. assistant with 2 tool_calls
+            # but only 1 tool response persisted before kill).
+            await agent.start(
+                history=_sanitize_message_chain(session.messages),
+                on_message=persist_message,
+            )
 
-        return agent
+            self._sessions[session_key] = SessionContext(
+                agent, adapter,
+                platform_name=adapter.platform_name,
+                chat_id=chat_id,
+            )
+
+            # Start background output consumer
+            ctx = self._sessions[session_key]
+            ctx.output_task = asyncio.create_task(
+                self._consume_output(session_key)
+            )
+
+            return agent
 
     async def _consume_output(self, session_key: str):
         """Long-running task: consume agent outputs and send to platform."""
@@ -528,9 +544,21 @@ class Gateway:
 
         while self._running:
             try:
-                output = await asyncio.wait_for(agent._output_queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+                # Race: wait for next output OR shutdown signal.
+                # Using wait() instead of wait_for() avoids the 1s polling
+                # latency — outputs are dispatched as soon as they arrive.
+                get_task = asyncio.ensure_future(agent._output_queue.get())
+                shutdown_task = asyncio.ensure_future(self._shutdown_event.wait())
+                done, _ = await asyncio.wait(
+                    [get_task, shutdown_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if shutdown_task in done:
+                    get_task.cancel()
+                    try: await get_task
+                    except asyncio.CancelledError: pass
+                    break
+                output = get_task.result()
             except asyncio.CancelledError:
                 break
 
@@ -544,7 +572,7 @@ class Gateway:
                 await adapter.send_message(
                     output.reply_target.chat_id,
                     output.text,
-                    reply_to=output.reply_target.message_id,
+                    reply_to_message_id=output.reply_target.message_id,
                 )
             else:
                 # Auto-reply (child completion triggered)
@@ -589,18 +617,25 @@ class Gateway:
                     enabled=True,
                 )
                 progress_task = asyncio.create_task(progress_sender.run())
-                # Set the progress callback on the agent before the loop starts
-                agent = self._get_or_create_agent(session_key)
-                agent._tool_progress_callback = progress_sender.on_tool_started
-                await self._ensure_session_agent(
-                    session_key, session, adapter, chat_id,
-                    _mk_persist(_persist_sid),
-                )
-                # Register for cleanup — finish will be called when user sends
-                # a message and a new ProgressSender replaces this one.
-                ctx = self._sessions.get(session_key)
-                if ctx:
-                    ctx.progress_tasks.append(progress_task)
+                try:
+                    # Set the progress callback on the agent before the loop starts
+                    agent = self._get_or_create_agent(session_key)
+                    agent._tool_progress_callback = progress_sender.on_tool_started
+                    await self._ensure_session_agent(
+                        session_key, session, adapter, chat_id,
+                        _mk_persist(_persist_sid),
+                    )
+                finally:
+                    # Finish the startup progress sender so it stops polling.
+                    # The agent's auto-turn (which used this sender) has completed.
+                    progress_sender.finish()
+                    # Wait for the run() loop to exit cleanly (within 100ms)
+                    try:
+                        await asyncio.wait_for(progress_task, timeout=0.1)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        progress_task.cancel()
+                        try: await progress_task
+                        except asyncio.CancelledError: pass
                 logger.info("Initialized agent for session %s", session_key)
             except Exception:
                 logger.exception("Failed to init agent for %s", session_key)

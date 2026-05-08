@@ -143,28 +143,39 @@ async def _launch_child_agent(
     # Register child in parent's child_agents dict (for send_input lookup)
     parent_agent._child_agents[task_path] = child
 
-    # Set up tool progress callback forwarding
-    parent_cb = getattr(parent_agent, "_tool_progress_callback", None)
-    if parent_cb is not None:
-        def _child_progress(tn: str, ai: dict) -> None:
-            parent_cb(tn, ai, prefix="📤 ")
-        child._tool_progress_callback = _child_progress
+    try:
+        # Set up tool progress callback forwarding
+        parent_cb = getattr(parent_agent, "_tool_progress_callback", None)
+        if parent_cb is not None:
+            def _child_progress(tn: str, ai: dict) -> None:
+                parent_cb(tn, ai, prefix="📤 ")
+            child._tool_progress_callback = _child_progress
 
-    # ── Inject initial goal and start permanent agent loop ───
-    child._running = True
-    child._stop_event.clear()
-    await child._inbox.put(InboxMessage(
-        text=goal,
-        reply_target=None,
-        tool_progress_cb=None,
-        turn_done_cb=None,
-    ))
+        # ── Inject initial goal and start permanent agent loop ───
+        child._running = True
+        child._stop_event.clear()
+        await child._inbox.put(InboxMessage(
+            text=goal,
+            reply_target=None,
+            tool_progress_cb=None,
+            turn_done_cb=None,
+        ))
 
-    loop_task = asyncio.create_task(_child_agent_loop(
-        child=child, task_path=task_path, parent_agent=parent_agent,
-    ))
-    parent_agent._bg_tasks[task_path] = loop_task
-    child._loop_task = loop_task
+        loop_task = asyncio.create_task(_child_agent_loop(
+            child=child, task_path=task_path, parent_agent=parent_agent,
+        ))
+        parent_agent._bg_tasks[task_path] = loop_task
+        child._loop_task = loop_task
+    except Exception:
+        # Clean up on failure: if any step after registration raises,
+        # the child agent would leak (orphaned in _child_agents with
+        # a live httpx client and no _loop_task to clean it up).
+        parent_agent._child_agents.pop(task_path, None)
+        try:
+            await child.close()
+        except Exception:
+            pass
+        raise
 
     logger.info(
         "spawn_task: launched %s goal=%r",
@@ -384,6 +395,15 @@ async def _handle_close_task(
             # Fallback if agent already popped but task still running
             bg_task.cancel()
             closed_count += 1
+
+    # ── Update task tree status before unregistering ─────────
+    # Set status to "shutdown" so that concurrent _child_agent_loop
+    # finally blocks (which also try set_status) don't race with
+    # unregister.  The finally block's set_status("shutdown") becomes
+    # a no-op if the node is already gone, which is fine — close_task
+    # is authoritative for shutdown propagated through close_task.
+    if previous_status in ("running", "created"):
+        tree.set_status(resolved, "shutdown")
 
     # ── Unregister from task_tree ─────────────────────────────
     tree.unregister(resolved)

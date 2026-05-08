@@ -109,6 +109,13 @@ class TaskTree:
     def _build_canonical_path(self, parent_path: str, task_name: str) -> str:
         """Derive canonical path without side-effects."""
         if task_name.startswith("/"):
+            # Absolute paths must start with the tree root to prevent
+            # path injection (e.g. "/etc/passwd" would corrupt _by_path).
+            root_prefix = f"/{self._root.name}/"
+            if not task_name.startswith(root_prefix) and task_name != f"/{self._root.name}":
+                # Not under our root — sanitise and treat as relative
+                name = self.sanitize_name(task_name.lstrip("/"))
+                return f"{parent_path.rstrip('/')}/{name}"
             return task_name.rstrip("/")
         name = self.sanitize_name(task_name)
         return f"{parent_path.rstrip('/')}/{name}"

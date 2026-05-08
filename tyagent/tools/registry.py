@@ -64,6 +64,12 @@ class ToolRegistry:
             wants_parent: If True, the handler receives a parent_agent kwarg.
         """
         with self._lock:
+            if name in self._tools:
+                logger.warning(
+                    "Tool %r registered more than once — overwriting previous entry. "
+                    "This is usually a bug (two modules registering the same name).",
+                    name,
+                )
             self._tools[name] = ToolEntry(
                 name=name,
                 schema=schema,

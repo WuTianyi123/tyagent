@@ -415,6 +415,13 @@ class GatewaySupervisor:
             if not agent._in_turn:
                 continue
             tc_id = getattr(agent, "_current_tool_call_id", "") or ""
+            # Guard against MagicMock objects (tests) that intercept getattr
+            if not isinstance(tc_id, str):
+                tc_id = ""
+            # Get function name safely — MagicMock agents in tests
+            # intercept getattr, so check isinstance.
+            _fn = getattr(agent, "_current_tool_call_name", None)
+            fn_name: str = _fn if isinstance(_fn, str) and _fn else "?"
             if not tc_id:
                 continue
             try:
@@ -431,7 +438,7 @@ class GatewaySupervisor:
             })
             entry["pending_tool_calls"].append({
                 "tool_call_id": tc_id,
-                "function_name": "?",
+                "function_name": fn_name,
                 "reason": "planned_restart",
             })
             logger.info(

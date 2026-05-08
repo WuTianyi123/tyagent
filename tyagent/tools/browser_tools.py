@@ -77,7 +77,9 @@ def _close_all_sessions() -> None:
 
     for name in names:
         try:
-            cmd = [browser_cmd, "--session-name", name, "close"]
+            # Split npx commands so subprocess can find the real executable
+            parts = shlex.split(browser_cmd) if browser_cmd.startswith("npx ") else [browser_cmd]
+            cmd = parts + ["--session-name", name, "close"]
             subprocess.run(cmd, capture_output=True, timeout=10)
         except Exception:
             pass

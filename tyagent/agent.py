@@ -126,6 +126,7 @@ class TyAgent:
         # Used by the drain loop to detect busy agents.
         self._in_turn: bool = False
         self._current_tool_call_id: str = ""
+        self._current_tool_call_name: str = ""
         self._messages: List[Dict[str, Any]] = []
         self._on_message: Optional[OnMessageCallback] = None
         self._tool_progress_callback: Optional[Callable[..., Any]] = None
@@ -271,6 +272,7 @@ class TyAgent:
             # Set current tool_call_id so tool handlers (e.g. terminal) can
             # include it in pending markers for post-restart result collection.
             self._current_tool_call_id = tc_id
+            self._current_tool_call_name = func_name
             try:
                 if entry and asyncio.iscoroutinefunction(entry.handler):
                     result = await entry.handler(func_args, parent_agent=self)
@@ -281,6 +283,7 @@ class TyAgent:
                     )
             finally:
                 self._current_tool_call_id = ""
+                self._current_tool_call_name = ""
 
             messages.append({
                 "role": "tool", "tool_call_id": tc_id, "content": result,
@@ -514,6 +517,7 @@ class TyAgent:
             if compacted is not None:
                 messages[:] = compacted
                 self._refresh_memory_and_prompt()
+                system_prompt = self._system_prompt  # refresh after compaction
 
         payload_base = self._build_payload_base(tools)
         headers = self._build_headers()
@@ -597,6 +601,7 @@ class TyAgent:
                 if compacted is not None:
                     messages[:] = compacted
                     self._refresh_memory_and_prompt()
+                    system_prompt = self._system_prompt  # refresh after compaction
                 # Continue — model sees compacted context and re-decides
                 continue
 

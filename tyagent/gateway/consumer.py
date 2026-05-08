@@ -78,10 +78,11 @@ class StreamConsumer:
 
     async def run(self) -> str:
         """Drain queue, progressively edit platform message, return final content."""
-        try:
+        # Get platform message length limit (avoid broad except that masks bugs)
+        if hasattr(self.adapter, 'MAX_MESSAGE_LENGTH'):
             _raw_limit = self.adapter.MAX_MESSAGE_LENGTH
             _safe_limit = max(500, _raw_limit - 100)
-        except (AttributeError, TypeError):
+        else:
             _raw_limit = 4096
             _safe_limit = 3500
 
@@ -298,6 +299,9 @@ class StreamConsumer:
                 self._flood_strikes += 1
                 self._current_edit_interval = min(self._current_edit_interval * 2, 10.0)
                 self._last_edit_time = time.monotonic()
+                # Save prefix so fallback sends only the delta, not the full
+                # accumulated text (same as non-flood error path below).
+                self._fallback_prefix = (self._last_sent_text or "").rstrip(" ▉")
                 if self._flood_strikes >= self._max_flood_strikes:
                     self._edit_supported = False
                     logger.warning("Flood control: progressive edit disabled after %d strikes", self._flood_strikes)

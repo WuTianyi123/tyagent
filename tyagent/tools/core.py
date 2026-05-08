@@ -275,7 +275,23 @@ def _handle_write_file(args: Dict[str, Any]) -> str:
 
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        # Atomic write via tempfile + fsync + rename (prevents partial
+        # files on disk full / crash).
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(resolved.parent), suffix=".tmp", prefix=".ty_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(resolved))
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return tool_result(
             success=True,
             path=str(resolved),
@@ -369,8 +385,23 @@ def _handle_patch(args: Dict[str, Any]) -> str:
         new_content = content.replace(old_string, new_string, 1)
         count = 1
 
+    # Atomic write via tempfile (same pattern as write_file).
     try:
-        resolved.write_text(new_content, encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(resolved.parent), suffix=".tmp", prefix=".ty_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(resolved))
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except (OSError, PermissionError) as exc:
         return tool_error(f"Failed to write '{path}': {exc}")
 
@@ -761,7 +792,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
         # Ensure isolated HOME is inherited by subprocess
         env = os.environ.copy()
         
-        with open(output_path, 'w') as out_f:
+        with open(output_path, 'w', encoding='utf-8') as out_f:
             try:
                 cmd_args = shlex.split(command)
             except ValueError as exc:
@@ -772,6 +803,8 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
                 stdout=out_f,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 cwd=cwd,
                 env=env,
                 start_new_session=True,  # Detach from parent's process group
@@ -816,7 +849,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             proc.wait()
             # Read partial output
             try:
-                with open(output_path) as f:
+                with open(output_path, encoding='utf-8', errors='replace') as f:
                     partial = f.read(max_out + 1)
             except OSError:
                 partial = ""
