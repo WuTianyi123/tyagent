@@ -355,8 +355,7 @@ class Gateway:
 
         try:
             # Define the persistence callback for tool loop messages
-            _persist_sid = session.metadata.get("current_session_id", "") if isinstance(session.metadata, dict) else getattr(session.metadata, "current_session_id", None) or \
-                           getattr(session, "current_session_id", None)
+            _persist_sid = session.metadata.get("current_session_id", "")
 
             def persist_message(role: str, content: str, **extras) -> None:
                 self.session_store.add_message(

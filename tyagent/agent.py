@@ -37,6 +37,13 @@ USER_AGENT = "tyagent/1.0"
 # threshold checks), not reactive (catch 400 then retry).  Architected to
 # match Codex CLI's compact.rs design philosophy.
 
+# Provider → base URL mapping (resolved when no explicit base_url given).
+_PROVIDER_URLS: Dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "anthropic": "https://api.anthropic.com/v1",
+}
+
 
 class TyAgent:
     """Simplified AI agent for tyagent.
@@ -71,11 +78,6 @@ class TyAgent:
             self.base_url = os.environ["OPENAI_BASE_URL"]
         else:
             # Resolve from provider, fallback to model prefix, default to OpenAI
-            _PROVIDER_URLS = {
-                "openai": "https://api.openai.com/v1",
-                "deepseek": "https://api.deepseek.com/v1",
-                "anthropic": "https://api.anthropic.com/v1",
-            }
             if provider and provider in _PROVIDER_URLS:
                 self.base_url = _PROVIDER_URLS[provider]
             elif model.lower().startswith("deepseek-"):
@@ -124,9 +126,10 @@ class TyAgent:
         # True while inside _run_turn (LLM call or tool execution).
         # Used by the drain loop to detect busy agents.
         self._in_turn: bool = False
+        self._current_tool_call_id: str = ""
         self._messages: List[Dict[str, Any]] = []
         self._on_message: Optional[OnMessageCallback] = None
-        self._tool_progress_callback: Optional[Callable] = None
+        self._tool_progress_callback: Optional[Callable[..., Any]] = None
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
         self._child_agents: Dict[str, "TyAgent"] = {}

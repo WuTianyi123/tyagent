@@ -715,7 +715,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             home_dir = parent_agent.home_dir
             state_file = home_dir / ".workspace_cwd"
             try:
-                state_file.write_text(cwd)
+                state_file.write_text(cwd, encoding="utf-8")
             except OSError:
                 pass  # best-effort; don't fail the tool call
     elif parent_agent is not None and hasattr(parent_agent, "home_dir"):
