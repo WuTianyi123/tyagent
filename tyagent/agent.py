@@ -180,7 +180,7 @@ class TyAgent:
                 home_dir=self.home_dir,
             )
         except Exception:
-            pass
+            logger.warning("Failed to refresh memory/prompt — using cached data", exc_info=True)
 
     # ── API helpers ─────────────────────────────────────────────
 

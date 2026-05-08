@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict
 
 if TYPE_CHECKING:
@@ -173,8 +174,6 @@ def _format_status(gateway: Gateway, session_key: str) -> str:
     Lives here (not inside CommandRegistry) because it is a
     pure formatting function that does not need the command registry.
     """
-    from datetime import datetime
-
     session = gateway.session_store.get(session_key)
     connected = list(gateway.adapters.keys())
 

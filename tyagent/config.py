@@ -43,7 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "shutdown_timeout": 5.0,
     },
     "compression": {
-        "auto_compact_limit": None,  # None = use 80% of context window
+        "auto_compact_limit": None,  # None = use 90% of context window
     },
     "workspace": {
         "lock": "off",

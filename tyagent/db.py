@@ -17,8 +17,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
-import threading
-
 logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 3
@@ -31,7 +29,7 @@ _MAX_SEARCH_RESULTS = 50         # Cap on FTS5 search row count
 # ---------------------------------------------------------------------------
 
 _DICT_LOADED: bool = False
-_dict_lock = threading.Lock()
+_dict_lock = Lock()
 
 
 def load_jieba_dict(dict_path: str | Path | None = None) -> None:
@@ -78,6 +76,8 @@ def _fts_escape(segmented: str) -> str:
     terms = segmented.split()
     quoted: List[str] = []
     for t in terms:
+        # Strip trailing * to prevent FTS5 prefix-query injection
+        t = t.rstrip("*")
         t_upper = t.upper()
         if t_upper in _FTS_SPECIAL:
             # Lower-case FTS operators so they are treated as literal terms

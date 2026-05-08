@@ -36,16 +36,10 @@ logger = logging.getLogger(__name__)
 
 # ── Prompt file loader ─────────────────────────────────────────────────────
 
+from tyagent.prompt_builder import _load_prompt
+
+# _PROMPTS_DIR is defined in prompt_builder, re-exported here for local use.
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
-
-
-def _load_prompt(*parts: str) -> str:
-    """Load a prompt text file from ``tyagent/prompts/``."""
-    path = _PROMPTS_DIR.joinpath(*parts)
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RuntimeError(f"Failed to load prompt file: {path}") from exc
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
