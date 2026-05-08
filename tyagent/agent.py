@@ -685,6 +685,34 @@ class TyAgent:
             if content.strip():
                 await self._output_queue.put(AgentOutput(text=content))
 
+        # ── Auto-process pre-existing child completions ──────────
+        # Mailbox may already contain FinalNotifications from children
+        # that completed before the agent started (e.g. during a
+        # gateway restart, or injected in tests).  Drain them and
+        # run a turn proactively — otherwise the root agent would
+        # hang in asyncio.wait() with no wakeup source.
+        if not self._child_mode:
+            startup_finals = self._mailbox.drain_final_notifications()
+            if startup_finals:
+                for fn in startup_finals:
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            f"（子代理完成）{fn.task_path} "
+                            f"({fn.duration_seconds:.1f}s):\n\n"
+                            f"{fn.summary or '已完成'}"
+                        ) if fn.success else (
+                            f"（子代理失败）{fn.task_path} "
+                            f"({fn.duration_seconds:.1f}s): "
+                            f"{fn.error or '未知错误'}"
+                        ),
+                    })
+                tools = registry.get_definitions()
+                self._inject_child_status()
+                content = await self._run_turn(tools=tools)
+                if content.strip():
+                    await self._output_queue.put(AgentOutput(text=content))
+
         while self._running:
             inbox_task = loop.create_task(self._inbox.get())
             stop_task = loop.create_task(self._stop_event.wait())
