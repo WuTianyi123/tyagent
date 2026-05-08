@@ -455,49 +455,58 @@ class Database:
         with self._lock:
             now = time.time()
 
-            # Ensure session exists (avoid foreign key IntegrityError)
-            self._conn.execute(
-                "INSERT OR IGNORE INTO sessions "
-                "(session_key, created_at, updated_at, metadata) "
-                "VALUES (?, ?, ?, '{}')",
-                (session_key, now, now),
-            )
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
 
-            tool_calls_json = (
-                json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
-            )
-            self._conn.execute(
-                "INSERT INTO messages "
-                "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    session_key,
-                    role,
-                    content,
-                    tool_calls_json,
-                    tool_call_id,
-                    reasoning,
-                    now,
-                    session_id,
-                ),
-            )
-            cur = self._conn.execute("SELECT last_insert_rowid()")
-            rowid = cur.fetchone()[0]
+                # Ensure session exists (avoid foreign key IntegrityError)
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO sessions "
+                    "(session_key, created_at, updated_at, metadata) "
+                    "VALUES (?, ?, ?, '{}')",
+                    (session_key, now, now),
+                )
 
-            # Index into FTS5
-            seg_content = jieba_segment(content)
-            seg_reasoning = jieba_segment(reasoning)
-            self._conn.execute(
-                "INSERT INTO messages_fts (rowid, content, reasoning) VALUES (?, ?, ?)",
-                (rowid, seg_content, seg_reasoning),
-            )
+                tool_calls_json = (
+                    json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+                )
+                self._conn.execute(
+                    "INSERT INTO messages "
+                    "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_key,
+                        role,
+                        content,
+                        tool_calls_json,
+                        tool_call_id,
+                        reasoning,
+                        now,
+                        session_id,
+                    ),
+                )
+                cur = self._conn.execute("SELECT last_insert_rowid()")
+                rowid = cur.fetchone()[0]
 
-            self._conn.execute(
-                "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
-                (now, session_key),
-            )
-            self._conn.commit()
-            return rowid
+                # Index into FTS5
+                seg_content = jieba_segment(content)
+                seg_reasoning = jieba_segment(reasoning)
+                self._conn.execute(
+                    "INSERT INTO messages_fts (rowid, content, reasoning) VALUES (?, ?, ?)",
+                    (rowid, seg_content, seg_reasoning),
+                )
+
+                self._conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                    (now, session_key),
+                )
+                self._conn.commit()
+                return rowid
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     def get_messages(
         self, session_key: str, session_id: str = ""
@@ -613,68 +622,74 @@ class Database:
         base_ts = created_at if created_at is not None else time.time()
 
         with self._lock:
-            # Create or get session
-            cur = self._conn.execute(
-                "SELECT session_key FROM sessions WHERE session_key = ?",
-                (session_key,),
-            )
-            if cur.fetchone() is None:
-                self._conn.execute(
-                    "INSERT INTO sessions (session_key, created_at, updated_at, metadata) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        session_key,
-                        base_ts,
-                        base_ts,
-                        json.dumps(metadata or {}, ensure_ascii=False),
-                    ),
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+
+                # Create or get session
+                cur = self._conn.execute(
+                    "SELECT session_key FROM sessions WHERE session_key = ?",
+                    (session_key,),
                 )
+                if cur.fetchone() is None:
+                    self._conn.execute(
+                        "INSERT INTO sessions (session_key, created_at, updated_at, metadata) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_key,
+                            base_ts,
+                            base_ts,
+                            json.dumps(metadata or {}, ensure_ascii=False),
+                        ),
+                    )
 
-            count = 0
-            for i, msg in enumerate(messages):
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                tool_calls = msg.get("tool_calls")
-                tc_id = msg.get("tool_call_id")
-                reasoning = msg.get("reasoning_content")
+                count = 0
+                for i, msg in enumerate(messages):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    tool_calls = msg.get("tool_calls")
+                    tc_id = msg.get("tool_call_id")
+                    reasoning = msg.get("reasoning_content")
 
-                tool_calls_json = (
-                    json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
-                )
+                    tool_calls_json = (
+                        json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+                    )
 
-                # Stagger timestamps by 1ms per message to preserve insertion order.
-                # float64 has ~15 sigfigs; at epoch ~1.7e9, 1ms steps are safe for
-                # batches up to ~10,000 messages.
-                msg_ts = base_ts + (i * 0.001)
+                    # Stagger timestamps by 1ms per message to preserve insertion order.
+                    msg_ts = base_ts + (i * 0.001)
 
-                self._conn.execute(
-                    "INSERT INTO messages "
-                    "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (session_key, role, content, tool_calls_json, tc_id, reasoning, msg_ts, f"v0_{session_key}"),
-                )
+                    self._conn.execute(
+                        "INSERT INTO messages "
+                        "(session_key, role, content, tool_calls, tool_call_id, reasoning, created_at, session_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (session_key, role, content, tool_calls_json, tc_id, reasoning, msg_ts, f"v0_{session_key}"),
+                    )
 
-                # Index into FTS5
-                seg_content = jieba_segment(content)
-                seg_reasoning = jieba_segment(reasoning)
-                # last_insert_rowid() is connection-scoped, safe in this loop
-                rowid_cur = self._conn.execute("SELECT last_insert_rowid()")
-                msg_rowid = rowid_cur.fetchone()[0]
-                self._conn.execute(
-                    "INSERT INTO messages_fts (rowid, content, reasoning) VALUES (?, ?, ?)",
-                    (msg_rowid, seg_content, seg_reasoning),
-                )
+                    # Index into FTS5
+                    seg_content = jieba_segment(content)
+                    seg_reasoning = jieba_segment(reasoning)
+                    rowid_cur = self._conn.execute("SELECT last_insert_rowid()")
+                    msg_rowid = rowid_cur.fetchone()[0]
+                    self._conn.execute(
+                        "INSERT INTO messages_fts (rowid, content, reasoning) VALUES (?, ?, ?)",
+                        (msg_rowid, seg_content, seg_reasoning),
+                    )
 
-                count += 1
+                    count += 1
 
-            # Update session updated_at to reflect the import
-            if count > 0:
-                self._conn.execute(
-                    "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
-                    (base_ts + (count * 0.001), session_key),
-                )
+                # Update session updated_at to reflect the import
+                if count > 0:
+                    self._conn.execute(
+                        "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+                        (base_ts + (count * 0.001), session_key),
+                    )
 
-            self._conn.commit()
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
             return count
 
     def integrity_check(self) -> List[str]:

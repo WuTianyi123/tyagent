@@ -410,7 +410,7 @@ class Gateway:
             if not final_text.strip():
                 progress_sender.finish()
                 try: await progress_task
-                except: pass
+                except Exception: pass
                 return None
 
             # Send message to agent loop (fire-and-forget), with per-message

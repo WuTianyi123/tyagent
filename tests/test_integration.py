@@ -9,7 +9,6 @@ import pytest
 
 from tyagent.agent import TyAgent, AgentError
 from tyagent.types import ReplyTarget, AgentOutput, InboxMessage
-from tyagent.events import EventCollector
 
 pytestmark = pytest.mark.asyncio
 
@@ -253,43 +252,24 @@ class TestChildAutoInjection:
 
     async def test_child_completion_triggers_new_turn(self):
         """Child completion → injected as user message → _run_turn called again."""
-        agent = TyAgent(model="test", api_key="k", base_url="http://x")
-        agent._event_collector = EventCollector()
+        from tyagent.subagent.mailbox import FinalNotification
 
-        # First response: model finishes (no tool calls)
+        agent = TyAgent(model="test", api_key="k", base_url="http://x")
+        agent._mailbox.send(FinalNotification(
+            task_path="/root/research",
+            success=True, summary="Found 3 papers about climate change",
+            error=None, duration_seconds=2.0,
+        ))
+
         r1 = MagicMock(); r1.status_code = 200
         r1.json.return_value = {
-            "choices": [{"message": {"content": "Waiting for research..."}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
-        }
-        # Second response: model produces final answer (after child completes)
-        r2 = MagicMock(); r2.status_code = 200
-        r2.json.return_value = {
             "choices": [{"message": {"content": "Research complete! Found 3 papers."}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
 
-        with patch.object(agent._client, "post", AsyncMock(side_effect=[r1, r2])):
+        with patch.object(agent._client, "post", AsyncMock(return_value=r1)):
             await agent.start()
-            # Simulate child completing after a brief delay
-            async def child_completes():
-                await asyncio.sleep(0.05)
-                agent._event_collector.notify_child_done("c1", {
-                    "success": True, "summary": "Found 3 papers about climate change",
-                    "error": None, "duration": 2.0,
-                })
-
-            asyncio.ensure_future(child_completes())
-
-            # First send_message should get the initial response,
-            # then child completion triggers another turn whose output
-            # goes to _output_queue as a second message
-            await agent.send_message("research climate change")
             r1_output = await agent._output_queue.get()
-            assert r1_output.text == "Waiting for research..."
-
-            # Second output from child completion
-            r2_output = await agent._output_queue.get()
-            assert r2_output.text == "Research complete! Found 3 papers."
+            assert r1_output.text == "Research complete! Found 3 papers."
 
         await agent.stop()

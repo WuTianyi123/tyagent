@@ -20,7 +20,6 @@ import httpx
 
 from tyagent.compaction import run_compact, total_token_estimate
 from tyagent.config import CompressionConfig
-from tyagent.events import EventCollector
 from tyagent.model_metadata import get_model_context_length
 from tyagent.prompt_builder import build_system_prompt
 from tyagent.subagent.mailbox import Mailbox
@@ -134,8 +133,7 @@ class TyAgent:
         self._bg_tasks: Dict[str, asyncio.Task] = {}
         self._child_agents: Dict[str, "TyAgent"] = {}
         """Running child agents keyed by task_path (for send_input lookup)."""
-        self._event_collector: Optional[EventCollector] = None
-        # ── v2 Sub-agent infrastructure ──────────────────────────
+        # v2 Sub-agent infrastructure
         self._task_path: str = "/root"
         """Canonical task path of THIS agent in the tree."""
         self._child_mode: bool = False
@@ -632,7 +630,13 @@ class TyAgent:
             if not task.done():
                 task.cancel()
         if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks.values(), return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._bg_tasks.values(), return_exceptions=True),
+                    timeout=self._shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                pass  # child tasks didn't finish in time; proceed with cleanup
         self._bg_tasks.clear()
         # Wait for loop to finish
         if self._loop_task is not None:
@@ -936,7 +940,6 @@ class TyAgent:
         if self._running:
             await self.stop()
         self._bg_tasks.clear()
-        self._event_collector = None
         self._task_tree = None
         self._child_agents.clear()
         await self._client.aclose()

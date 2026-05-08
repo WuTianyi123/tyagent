@@ -26,21 +26,3 @@ class InboxMessage:
     reply_target: Optional[ReplyTarget] = None
     tool_progress_cb: Optional[Any] = None
     turn_done_cb: Optional[Any] = None
-
-
-@dataclass
-class InterAgentNotification:
-    """A notification from a sub-agent injected into the parent's conversation.
-
-    ``role: user`` because sub-agent messages come from outside the model.
-    ``[author]:`` prefix so the LLM can distinguish sub-agent reports
-    from user instructions.
-    """
-    author: str       # canonical task_path of the sender
-    content: str      # notification body
-
-    def to_message(self) -> dict:
-        return {
-            "role": "user",
-            "content": f"[{self.author}]\n{self.content}",
-        }
