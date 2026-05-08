@@ -127,6 +127,7 @@ class TyAgent:
         self._in_turn: bool = False
         self._current_tool_call_id: str = ""
         self._current_tool_call_name: str = ""
+        self._completed_normally: bool = False  # True when last turn finished without tool calls
         self._messages: List[Dict[str, Any]] = []
         self._on_message: Optional[OnMessageCallback] = None
         self._tool_progress_callback: Optional[Callable[..., Any]] = None
@@ -526,6 +527,7 @@ class TyAgent:
         content: Optional[str] = None
         reasoning_content: Optional[str] = None
         tool_calls = None
+        mid_turn_compactions = 0  # guard against infinite compaction loop
 
         while True:
             if self.max_tool_turns is not None and self.max_tool_turns > 0 and tool_turn >= self.max_tool_turns:
@@ -586,6 +588,14 @@ class TyAgent:
             else:
                 est = total_token_estimate(messages, system_prompt=system_prompt)
             if est >= self.auto_compact_limit:
+                mid_turn_compactions += 1
+                if mid_turn_compactions > 3:
+                    logger.warning(
+                        "Mid-turn compaction loop detected (%d compactions in one turn) "
+                        "— breaking out to prevent infinite loop",
+                        mid_turn_compactions,
+                    )
+                    break
                 logger.info(
                     "Mid-turn compaction (pre-exec): %d prompt_tokens >= %d limit",
                     est,
@@ -693,7 +703,14 @@ class TyAgent:
             )
             tools = registry.get_definitions()
             self._inject_child_status()
-            content = await self._run_turn(tools=tools)
+            try:
+                content = await self._run_turn(tools=tools)
+            except AgentError as exc:
+                logger.error("Startup auto-process (chain tail) error: %s", exc)
+                content = f"❌ 错误: {exc}"
+            except Exception as exc:
+                logger.exception("Unexpected error in startup auto-process (chain tail)")
+                content = f"❌ 内部错误: {exc}"
             if content.strip():
                 await self._output_queue.put(AgentOutput(text=content))
 
@@ -721,7 +738,14 @@ class TyAgent:
                     })
                 tools = registry.get_definitions()
                 self._inject_child_status()
-                content = await self._run_turn(tools=tools)
+                try:
+                    content = await self._run_turn(tools=tools)
+                except AgentError as exc:
+                    logger.error("Startup auto-process (child completions) error: %s", exc)
+                    content = f"❌ 错误: {exc}"
+                except Exception as exc:
+                    logger.exception("Unexpected error in startup auto-process (child completions)")
+                    content = f"❌ 内部错误: {exc}"
                 if content.strip():
                     await self._output_queue.put(AgentOutput(text=content))
 
@@ -869,6 +893,9 @@ class TyAgent:
         Only the topmost non-root nodes are shown (not the full tree).
 
         Skipped when ``_task_tree`` is None or has no children.
+
+        Previous status messages are removed before appending to
+        avoid accumulating duplicates (N turns = N status messages).
         """
         tree = self._task_tree
         if tree is None:
@@ -891,6 +918,16 @@ class TyAgent:
             entries += f", ... ({len(agents)} total)"
 
         text = f"Active sub-agents: {entries}"
+
+        # Remove any previous status message to avoid bloat.
+        # Scan backwards (status messages are typically at the end).
+        for i in range(len(self._messages) - 1, -1, -1):
+            msg = self._messages[i]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                if msg["content"].startswith("Active sub-agents:"):
+                    self._messages.pop(i)
+                    break  # at most one stale status message
+
         self._messages.append({"role": "user", "content": text})
 
     def _notify_parent_of_turn(
@@ -927,6 +964,9 @@ class TyAgent:
         """Send FinalNotification to parent when child's agent loop exits.
 
         Called from ``_agent_loop`` just before ``break`` on stop.
+        The *success* field reflects whether the agent's task completed
+        normally (no unhandled error), not whether the overall mission
+        succeeded — use the task tree status for that.
         """
         if self._parent_mailbox is None:
             return
@@ -934,8 +974,8 @@ class TyAgent:
         from tyagent.subagent.mailbox import FinalNotification
         self._parent_mailbox.send(FinalNotification(
             task_path=task_path,
-            success=True,
-            summary=f"Agent {task_path} shut down",
+            success=self._completed_normally,
+            summary=f"Agent {task_path} {'completed normally' if self._completed_normally else 'stopped'}",
             error=None,
             duration_seconds=0.0,
         ))

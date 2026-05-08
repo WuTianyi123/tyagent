@@ -137,7 +137,12 @@ async def _launch_child_agent(
     child._parent_mailbox = parent_agent._mailbox
     child._child_mode = True
     child._check_inbox_between_turns = True  # receive send_input
-    child._task_tree = TaskTree("root")
+    # Use the child's task name (last component of task_path) as the task
+    # tree root so grandchild paths are namespaced under the child (e.g.
+    # /db_query/grandchild) instead of colliding under /root with other
+    # children's subtrees.
+    _tree_root = task_path.rstrip("/").rsplit("/", 1)[-1]
+    child._task_tree = TaskTree(_tree_root if _tree_root and _tree_root != "root" else task_path.strip("/"))
     child._allowed_tool_names = _child_tool_names(toolsets)
 
     # Register child in parent's child_agents dict (for send_input lookup)
@@ -194,7 +199,19 @@ async def _child_agent_loop(
     and final notification.  This wrapper handles cleanup (close, unregister).
     """
     try:
-        await child._agent_loop()
+        await asyncio.wait_for(
+            child._agent_loop(),
+            timeout=DEFAULT_CHILD_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Child agent %s timed out after %.0fs",
+            task_path, DEFAULT_CHILD_TIMEOUT,
+        )
+        try:
+            await child.stop()
+        except Exception:
+            pass
     finally:
         try:
             await child.close()

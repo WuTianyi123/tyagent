@@ -644,6 +644,10 @@ def _search_content_python(
     except re.error as exc:
         return tool_error(f"Invalid regex pattern: {exc}")
 
+    # Basic ReDoS guard: cap per-line length to prevent catastrophic
+    # backtracking on malicious patterns like (a+)+b.
+    _MAX_LINE_LEN = 4096
+
     matches: List[Dict[str, Any]] = []
     files_with_matches: set = set()
     match_counts: Dict[str, int] = {}
@@ -662,6 +666,8 @@ def _search_content_python(
         except (OSError, UnicodeDecodeError):
             continue
         for i, line in enumerate(text.splitlines(), start=1):
+            if len(line) > _MAX_LINE_LEN:
+                line = line[:_MAX_LINE_LEN]  # truncate for ReDoS safety
             if regex.search(line):
                 files_with_matches.add(str(file_path))
                 match_counts[str(file_path)] = match_counts.get(str(file_path), 0) + 1
