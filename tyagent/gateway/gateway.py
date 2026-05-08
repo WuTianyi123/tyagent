@@ -411,6 +411,12 @@ class Gateway:
                 progress_sender.finish()
                 try: await progress_task
                 except Exception: pass
+                # Clean up the ⌨️ reaction for empty messages
+                if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
+                    try:
+                        adapter.remove_pending_reaction(event.message_id)
+                    except Exception:
+                        pass
                 return None
 
             # Send message to agent loop (fire-and-forget), with per-message
@@ -563,12 +569,15 @@ class Gateway:
                 adapter = self.adapters.get(platform)
                 if adapter is None:
                     continue
-                chat_id = session_key.split(":", 1)[1] if ":" in session_key else ""
+                # session_key format: "platform:chat_id" or "platform:chat_id:sender_id"
+                # Extract just the chat_id (always the second part).
+                key_parts = session_key.split(":")
+                chat_id = key_parts[1] if len(key_parts) >= 2 else ""
                 _persist_sid = session.metadata.get("current_session_id", "")
-                def _mk_persist(sid):
+                def _mk_persist(sid, sk=session_key):
                     def _p(role, content, **extras):
                         self.session_store.add_message(
-                            session_key, role, content, session_id=sid, **extras,
+                            sk, role, content, session_id=sid, **extras,
                         )
                     return _p
                 # Create a ProgressSender for the auto-processing turn so

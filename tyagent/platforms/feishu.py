@@ -1241,6 +1241,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Client not initialized")
 
+        # Truncate to Feishu's max message length to avoid API rejection
+        text = text[:self.MAX_MESSAGE_LENGTH] if len(text) > self.MAX_MESSAGE_LENGTH else text
+
         msg_type, payload = _build_outbound_payload(text)
         result = await self._sync_send(chat_id, msg_type, payload, reply_to_message_id)
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,16 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     "/dev/stdin", "/dev/tty", "/dev/console",
     "/dev/stdout", "/dev/stderr",
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
+})
+
+# Sensitive paths that tools should never access (read or write).
+# This is a pragmatic defense-in-depth measure — a proper sandbox
+# would use workspace root directories.
+_SENSITIVE_PATH_PREFIXES = frozenset({
+    "/etc/shadow", "/etc/passwd", "/etc/sudoers",
+    "/root/.ssh", "/home/",  # blocks read of any /home/*/.ssh, etc.
+    "/proc/", "/sys/",
+    ".env", ".git/config", "id_rsa", "id_ed25519",
 })
 
 _BINARY_EXTENSIONS = frozenset({
@@ -64,6 +75,15 @@ def _is_blocked_device(filepath: str) -> bool:
         return True
     if normalized.startswith("/proc/") and normalized.endswith(("/fd/0", "/fd/1", "/fd/2")):
         return True
+    return False
+
+
+def _is_sensitive_path(filepath: str) -> bool:
+    """Return True for paths that contain sensitive system/user data."""
+    resolved = str(Path(filepath).expanduser().resolve())
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if prefix in resolved:
+            return True
     return False
 
 
@@ -127,6 +147,12 @@ def _handle_read_file(args: Dict[str, Any]) -> str:
     if _is_blocked_device(path):
         return tool_error(
             f"Cannot read '{path}': this is a device file that would block or produce infinite output."
+        )
+
+    # Block sensitive system/user paths
+    if _is_sensitive_path(path):
+        return tool_error(
+            f"Cannot read '{path}': access to sensitive paths is restricted."
         )
 
     try:
@@ -736,15 +762,19 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
         env = os.environ.copy()
         
         with open(output_path, 'w') as out_f:
+            try:
+                cmd_args = shlex.split(command)
+            except ValueError as exc:
+                return tool_error(f"Invalid command (unbalanced quotes): {exc}")
             proc = subprocess.Popen(
-                command,
-                shell=True,
+                cmd_args,
+                shell=False,
                 stdout=out_f,
                 stderr=subprocess.STDOUT,
                 text=True,
                 cwd=cwd,
                 env=env,
-                preexec_fn=os.setpgrp,  # Detach from parent's process group
+                start_new_session=True,  # Detach from parent's process group
             )
         
         # Write a pending marker so the result can be collected after restart
@@ -762,6 +792,9 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
                 "pid": proc.pid,
             }
             marker.write_text(json.dumps(marker_data, ensure_ascii=False), encoding="utf-8")
+
+        # Maximum output size to prevent OOM from runaway commands
+        max_out = 50_000
 
         # Wait for completion
         try:
@@ -782,8 +815,11 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
             proc.kill()
             proc.wait()
             # Read partial output
-            with open(output_path) as f:
-                partial = f.read()
+            try:
+                with open(output_path) as f:
+                    partial = f.read(max_out + 1)
+            except OSError:
+                partial = ""
             _cleanup_terminal_marker(marker, output_path)
             return tool_error(
                 f"Command timed out after {timeout} seconds. "
@@ -791,12 +827,15 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
                 "For long-running tasks, consider running in background or increasing timeout."
             )
 
-        # Read full output from file
-        with open(output_path) as f:
-            output = f.read()
+        # Read full output from file (with size limit to prevent OOM)
+        try:
+            with open(output_path) as f:
+                output = f.read(max_out + 1)
+        except OSError as exc:
+            _cleanup_terminal_marker(marker, output_path)
+            return tool_error(f"Failed to read command output: {exc}")
 
         # Truncate very large output
-        max_out = 50_000
         was_truncated = False
         if len(output) > max_out:
             output = output[:max_out]

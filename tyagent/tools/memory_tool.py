@@ -272,6 +272,12 @@ class MemoryStore:
             raw = path.read_text(encoding="utf-8")
         except (OSError, IOError):
             return []
+        except UnicodeDecodeError:
+            # Corrupted or non-UTF-8 file — attempt latin-1 fallback
+            try:
+                raw = path.read_text(encoding="latin-1")
+            except (OSError, IOError):
+                return []
         if not raw.strip():
             return []
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
