@@ -12,20 +12,17 @@ import logging
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, Optional, Type
 
 from tyagent.agent import AgentError, TyAgent
 from tyagent.types import ReplyTarget
-from tyagent.config import PlatformConfig, TyAgentConfig
+from tyagent.config import TyAgentConfig
 from tyagent.gateway.commands import CommandRegistry
-from tyagent.gateway.consumer import StreamConsumer
 from tyagent.gateway.lifecycle import GatewaySupervisor
 from tyagent.gateway.progress import ProgressSender
 from tyagent.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
-    MessageType,
-    SendResult,
 )
 from tyagent.session import SessionStore
 from tyagent.tools import memory_tool
@@ -115,7 +112,8 @@ def _sanitize_message_chain(
                                 "role": "tool",
                                 "tool_call_id": tc_id,
                                 "content": json.dumps({
-                                    "error": f"Tool call interrupted by unexpected gateway termination. Please retry if needed.",
+                                    "success": False,
+                                    "error": "Tool call interrupted by unexpected gateway termination. Please retry if needed.",
                                     "interrupted": True,
                                 }),
                             }

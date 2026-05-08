@@ -10,7 +10,7 @@ import httpx
 import signal
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tyagent.gateway.gateway import Gateway
@@ -125,7 +125,14 @@ class GatewaySupervisor:
             # Write .clean_shutdown marker
             self._write_clean_shutdown_marker()
         except RuntimeError:
-            raise  # validation failure should abort restart
+            # Validation failure: abort restart and reset gateway state
+            # so the process stays responsive (not a zombie).
+            logger.error(
+                "Graceful restart ABORTED — message chain validation failed"
+            )
+            gw._draining = False
+            gw._restart_requested = False
+            raise
         except Exception:
             logger.exception(
                 "Graceful restart failed unexpectedly — proceeding with restart anyway"
@@ -404,7 +411,7 @@ class GatewaySupervisor:
             if ctx is None:
                 continue
             agent = ctx.agent
-            if not agent._running:
+            if not agent._in_turn:
                 continue
             tc_id = getattr(agent, "_current_tool_call_id", "") or ""
             if not tc_id:
@@ -663,8 +670,8 @@ class GatewaySupervisor:
                 output_text = output_text[:max_out]
                 was_truncated = True
 
-            # Try to get exit code; if not available, assume success
-            exit_code = 0
+            # Use saved exit code from marker if available, default to 0
+            exit_code = data.get("exit_code", 0)
             elapsed = time.time() - started_at if started_at > 0 else 0
             result_data: dict = {
                 "output": output_text,

@@ -769,6 +769,18 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
         # Wait for completion
         try:
             stdout_data, _ = proc.communicate(timeout=timeout)
+
+            # Save the real exit code back to the marker so recovery
+            # after a crash can report it accurately.
+            if home_dir is not None and proc.returncode is not None:
+                try:
+                    marker_data["exit_code"] = proc.returncode
+                    marker.write_text(
+                        json.dumps(marker_data, ensure_ascii=False), encoding="utf-8"
+                    )
+                except OSError:
+                    pass  # marker already cleaned up, which is fine
+
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()

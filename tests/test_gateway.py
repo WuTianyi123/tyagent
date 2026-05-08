@@ -677,6 +677,8 @@ class TestRestartMarker:
         from unittest.mock import MagicMock
         agent = MagicMock()
         agent._messages = []
+        agent._in_turn = False
+        agent._bg_tasks = {}
         gw._sessions[session_key] = SessionContext(
             agent, MagicMock(), platform_name="test", chat_id="chat1",
         )
@@ -847,7 +849,7 @@ class TestRestartMarker:
         session_id = session.metadata.get("current_session_id", "")
         self._add_active_session(gw, "test:key", session)
         agent = gw._sessions["test:key"].agent
-        agent._running = True
+        agent._in_turn = True
         agent._current_tool_call_id = "call_in_flight_1"
 
         gw.supervisor._write_restart_marker()
@@ -865,14 +867,14 @@ class TestRestartMarker:
         gw.session_store.close()
         marker_path.unlink(missing_ok=True)
 
-    def test_write_marker_in_flight_not_running_skipped(self, tmp_path):
-        """Agent with _current_tool_call_id set but _running=False → skipped."""
+    def test_write_marker_in_flight_idle_skipped(self, tmp_path):
+        """Agent with _current_tool_call_id set but _in_turn=False → skipped."""
         config = _make_config(sessions_dir=tmp_path / "sessions", home_dir=tmp_path)
         gw = Gateway(config)
         session = gw.session_store.get("test:key")
         self._add_active_session(gw, "test:key", session)
         agent = gw._sessions["test:key"].agent
-        agent._running = False  # Agent is stopped
+        agent._in_turn = False  # Agent is idle
         agent._current_tool_call_id = "call_in_flight_1"
 
         gw.supervisor._write_restart_marker()
