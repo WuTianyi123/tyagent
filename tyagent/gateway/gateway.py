@@ -478,57 +478,6 @@ class Gateway:
     # Actor-model session agent management
     # ------------------------------------------------------------------
 
-    def _find_adapter_for_session_key(self, session_key: str):
-        """Find the adapter for a session key (e.g. 'feishu:oc_xxx' → feishu adapter)."""
-        platform = session_key.split(":", 1)[0] if ":" in session_key else ""
-        return self.adapters.get(platform)
-
-    async def _init_active_sessions(self) -> None:
-        """Eagerly initialize sessions and trigger a proactive agent turn.
-
-        After gateway startup, scans the session store for sessions with
-        message history and starts their agent loops. Sends a startup
-        trigger so the agent can proactively respond (check status,
-        continue interrupted work, send a greeting) without waiting for
-        the first user message.
-        """
-        for session_key in self.session_store.all_session_keys():
-            if session_key in self._sessions:
-                continue
-            try:
-                session = self.session_store.get(session_key)
-                if not session or not session.messages:
-                    continue
-                # Find the adapter for this session based on session_key prefix
-                adapter = self._find_adapter_for_session_key(session_key)
-                if adapter is None:
-                    continue
-                chat_id = session_key.split(":", 1)[1] if ":" in session_key else ""
-                # Build persist_message callback
-                _persist_sid = session.metadata.get("current_session_id", "")
-                def _make_persist(sid):
-                    def persist_message(role, content, **extras):
-                        self.session_store.add_message(
-                            session_key, role, content,
-                            session_id=sid, **extras,
-                        )
-                    return persist_message
-                agent = await self._ensure_session_agent(
-                    session_key, session, adapter, chat_id,
-                    _make_persist(_persist_sid),
-                )
-                # Send startup trigger: the agent runs a turn proactively.
-                # No reply_target — output is sent as auto-reply.
-                await agent.send_message(
-                    "[系统通知: Gateway 已启动。请检查上下文并根据情况主动回复用户或继续未完成的工作。]",
-                )
-                logger.info(
-                    "Sent startup trigger to session %s (%d messages in history)",
-                    session_key, len(session.messages),
-                )
-            except Exception:
-                logger.exception("Failed to init session %s on startup", session_key)
-
     async def _ensure_session_agent(
         self, session_key: str, session,
         adapter, chat_id: str,

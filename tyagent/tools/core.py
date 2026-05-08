@@ -11,7 +11,6 @@ execute_code — Run Python code in a subprocess sandbox.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -22,8 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tyagent.tools.registry import registry, tool_error, tool_result
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared helpers

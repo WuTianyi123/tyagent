@@ -132,7 +132,7 @@ class GatewaySupervisor:
             )
             gw._draining = False
             gw._restart_requested = False
-            raise
+            return  # task is fire-and-forget; don't re-raise
         except Exception:
             logger.exception(
                 "Graceful restart failed unexpectedly — proceeding with restart anyway"
@@ -383,6 +383,7 @@ class GatewaySupervisor:
                     "Session %s validation request failed: %s — skipping",
                     session_key, exc,
                 )
+                all_ok = False
 
         if not all_ok:
             raise RuntimeError(
@@ -647,7 +648,7 @@ class GatewaySupervisor:
 
             # Read the output
             try:
-                with open(output_path) as f:
+                with open(output_path, encoding="utf-8") as f:
                     output_text = f.read()
             except OSError as exc:
                 logger.warning("Failed to read output for %s: %s", marker_path.name, exc)

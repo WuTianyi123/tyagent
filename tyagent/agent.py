@@ -52,7 +52,7 @@ class TyAgent:
         provider: Optional[str] = None,
         max_tool_turns: Optional[int] = 200,
         system_prompt: str = "You are a helpful assistant.",
-        reasoning_effort: Optional[str] = "high",
+        reasoning_effort: Optional[str] = None,
         compression: Optional[CompressionConfig] = None,
         home_dir: Optional[Path] = None,
         context_length: Optional[int] = None,
@@ -334,68 +334,68 @@ class TyAgent:
                     body_str = error_body.decode("utf-8", errors="replace")[:2000]
                     raise AgentError(f"LLM API returned {resp.status_code}: {body_str}")
 
-            content_parts: List[str] = []
-            tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-            reasoning_parts: List[str] = []
-            usage_obj = None
+                content_parts: List[str] = []
+                tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+                reasoning_parts: List[str] = []
+                usage_obj = None
 
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                if not data_str:
-                    continue
-                chunk = json.loads(data_str)
-                if not chunk.get("choices"):
-                    if chunk.get("usage"):
-                        usage_obj = chunk["usage"]
-                    continue
-                delta = chunk["choices"][0].get("delta", {})
-                if delta.get("content"):
-                    content_parts.append(delta["content"])
-                    if not tool_calls_acc and stream_delta_callback:
-                        stream_delta_callback(delta["content"])
-                if delta.get("tool_calls"):
-                    for tc_delta in delta["tool_calls"]:
-                        idx = tc_delta.get("index", 0)
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": tc_delta.get("id", ""),
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        acc = tool_calls_acc[idx]
-                        if tc_delta.get("id"):
-                            acc["id"] = tc_delta["id"]
-                        if tc_delta.get("function", {}).get("name"):
-                            acc["function"]["name"] = tc_delta["function"]["name"]
-                        if tc_delta.get("function", {}).get("arguments"):
-                            acc["function"]["arguments"] += tc_delta["function"]["arguments"]
-                if delta.get("reasoning_content"):
-                    reasoning_parts.append(delta["reasoning_content"])
-                    if reasoning_callback:
-                        reasoning_callback(delta["reasoning_content"])
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    if not data_str:
+                        continue
+                    chunk = json.loads(data_str)
+                    if not chunk.get("choices"):
+                        if chunk.get("usage"):
+                            usage_obj = chunk["usage"]
+                        continue
+                    delta = chunk["choices"][0].get("delta", {})
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                        if not tool_calls_acc and stream_delta_callback:
+                            stream_delta_callback(delta["content"])
+                    if delta.get("tool_calls"):
+                        for tc_delta in delta["tool_calls"]:
+                            idx = tc_delta.get("index", 0)
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.get("id", ""),
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            acc = tool_calls_acc[idx]
+                            if tc_delta.get("id"):
+                                acc["id"] = tc_delta["id"]
+                            if tc_delta.get("function", {}).get("name"):
+                                acc["function"]["name"] = tc_delta["function"]["name"]
+                            if tc_delta.get("function", {}).get("arguments"):
+                                acc["function"]["arguments"] += tc_delta["function"]["arguments"]
+                    if delta.get("reasoning_content"):
+                        reasoning_parts.append(delta["reasoning_content"])
+                        if reasoning_callback:
+                            reasoning_callback(delta["reasoning_content"])
 
-            content = "".join(content_parts) if content_parts else None
-            reasoning = "".join(reasoning_parts) if reasoning_parts else None
-            tc_list = list(tool_calls_acc.values()) if tool_calls_acc else None
+                content = "".join(content_parts) if content_parts else None
+                reasoning = "".join(reasoning_parts) if reasoning_parts else None
+                tc_list = list(tool_calls_acc.values()) if tool_calls_acc else None
 
-            if usage_obj:
-                self.last_usage = {
-                    "prompt_tokens": usage_obj.get("prompt_tokens", 0)
-                    if isinstance(usage_obj, dict)
-                    else getattr(usage_obj, "prompt_tokens", 0),
-                    "completion_tokens": usage_obj.get("completion_tokens", 0)
-                    if isinstance(usage_obj, dict)
-                    else getattr(usage_obj, "completion_tokens", 0),
-                    "total_tokens": usage_obj.get("total_tokens", 0)
-                    if isinstance(usage_obj, dict)
-                    else getattr(usage_obj, "total_tokens", 0),
-                }
+                if usage_obj:
+                    self.last_usage = {
+                        "prompt_tokens": usage_obj.get("prompt_tokens", 0)
+                        if isinstance(usage_obj, dict)
+                        else getattr(usage_obj, "prompt_tokens", 0),
+                        "completion_tokens": usage_obj.get("completion_tokens", 0)
+                        if isinstance(usage_obj, dict)
+                        else getattr(usage_obj, "completion_tokens", 0),
+                        "total_tokens": usage_obj.get("total_tokens", 0)
+                        if isinstance(usage_obj, dict)
+                        else getattr(usage_obj, "total_tokens", 0),
+                    }
 
-            return content, reasoning, tc_list
+                return content, reasoning, tc_list
         except AgentError:
             raise
         except Exception as exc:
@@ -921,7 +921,7 @@ class TyAgent:
             provider=getattr(config, "provider", None),
             max_tool_turns=getattr(config, "max_tool_turns", 200),
             system_prompt=config.system_prompt,
-            reasoning_effort=getattr(config, "reasoning_effort", "high"),
+            reasoning_effort=getattr(config, "reasoning_effort", None),
             compression=compression,
             home_dir=home_dir,
             context_length=getattr(config, "context_length", None),
