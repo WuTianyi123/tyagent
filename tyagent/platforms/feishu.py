@@ -1640,31 +1640,35 @@ def _render_post_text_element(elem: dict) -> str:
     """Render a single post text element with style to markdown."""
     text = str(elem.get("text", "") or "")
     style = elem.get("style")
-    style_dict = style if isinstance(style, dict) else None
 
     # Inline code takes precedence over other styles
-    if _is_style_enabled(style_dict, "code"):
+    if _has_style(style, "code"):
         return _wrap_inline_code(text)
 
     rendered = _escape_markdown_text(text)
     if not rendered:
         return ""
-    if _is_style_enabled(style_dict, "bold"):
+    if _has_style(style, "bold"):
         rendered = f"**{rendered}**"
-    if _is_style_enabled(style_dict, "italic"):
+    if _has_style(style, "italic"):
         rendered = f"*{rendered}*"
-    if _is_style_enabled(style_dict, "underline"):
+    if _has_style(style, "underline"):
         rendered = f"<u>{rendered}</u>"
-    if _is_style_enabled(style_dict, "strikethrough"):
+    if _has_style(style, "strikethrough"):
         rendered = f"~~{rendered}~~"
     return rendered
 
 
-def _is_style_enabled(style: dict | None, key: str) -> bool:
+def _has_style(style, key: str) -> bool:
+    """Check if style is enabled, handling both dict and list formats."""
     if not style:
         return False
-    value = style.get(key)
-    return value is True or value == 1 or value == "true"
+    if isinstance(style, dict):
+        value = style.get(key)
+        return value is True or value == 1 or value == "true"
+    if isinstance(style, list):
+        return key in style or f"{key}_line" in style or f"{key}Line" in style
+    return False
 
 
 def _wrap_inline_code(text: str) -> str:
