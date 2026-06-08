@@ -1570,50 +1570,67 @@ def _extract_post_text(content: dict) -> str:
     Handles text elements with style attributes (bold, italic, underline,
     strikethrough, code) and converts them to markdown syntax.
     Also handles media tags: img, media, file, audio, video.
+
+    Supports two Feishu Post formats:
+      1. Wrapped: {"post": {"zh_cn": {"content": [[...]]}}}
+      2. Unwrapped: {"content": [[{"tag": "text", "text": "...", "style": []}], ...]}
     """
     texts = []
     try:
+        rows = []
+        # Format 1: wrapped via {"post": {"zh_cn": {"content": ...}}}
         post = content.get("post", {})
-        for locale in ("zh_cn", "en_us", "ja_jp"):
-            locale_content = post.get(locale, {})
-            for row in locale_content.get("content", []):
-                row_parts = []
-                for elem in row:
-                    tag = elem.get("tag", "")
-                    if tag == "text":
-                        row_parts.append(_render_post_text_element(elem))
-                    elif tag == "a":
-                        href = elem.get("href", "")
-                        label = elem.get("text", "")
-                        escaped = _escape_markdown_text(label) if label else ""
-                        row_parts.append(f"[{escaped}]({href})" if href and escaped else escaped or label)
-                    elif tag == "at":
-                        name = elem.get("user_name", elem.get("user_id", ""))
-                        row_parts.append(f"@{name}")
-                    elif tag == "img":
-                        row_parts.append("[Image]")
-                    elif tag == "media":
-                        row_parts.append("[Media]")
-                    elif tag == "file":
-                        row_parts.append("[File]")
-                    elif tag == "audio":
-                        row_parts.append("[Audio]")
-                    elif tag == "video":
-                        row_parts.append("[Video]")
-                    elif tag == "code":
-                        code = elem.get("text", "")
-                        row_parts.append(_wrap_inline_code(code) if code else "")
-                    elif tag in ("code_block", "pre"):
-                        lang = str(elem.get("language", "") or elem.get("lang", "")).strip()
-                        code = str(elem.get("text", "") or elem.get("content", "")).replace("\r\n", "\n")
-                        trailing = "" if code.endswith("\n") else "\n"
-                        row_parts.append(f"```{lang}\n{code}{trailing}```")
-                    elif tag in ("br",):
-                        row_parts.append("\n")
-                    elif tag in ("hr", "divider"):
-                        row_parts.append("\n\n---\n\n")
-                if row_parts:
-                    texts.append("".join(row_parts))
+        if post:
+            for locale in ("zh_cn", "en_us", "ja_jp"):
+                locale_content = post.get(locale, {})
+                for row in locale_content.get("content", []):
+                    rows.append(row)
+        # Format 2: unwrapped {"content": [[...], ...]}
+        if not rows:
+            raw_content = content.get("content", [])
+            if isinstance(raw_content, list):
+                rows = [[dict(elem) for elem in row] if isinstance(row, list) else row for row in raw_content]
+
+        for row in rows:
+            row_parts = []
+            for elem in row:
+                if not isinstance(elem, dict):
+                    continue
+                tag = elem.get("tag", "")
+                if tag == "text":
+                    row_parts.append(_render_post_text_element(elem))
+                elif tag == "a":
+                    href = elem.get("href", "")
+                    label = elem.get("text", "")
+                    escaped = _escape_markdown_text(label) if label else ""
+                    row_parts.append(f"[{escaped}]({href})" if href and escaped else escaped or label)
+                elif tag == "at":
+                    name = elem.get("user_name", elem.get("user_id", ""))
+                    row_parts.append(f"@{name}")
+                elif tag == "img":
+                    row_parts.append("[Image]")
+                elif tag == "media":
+                    row_parts.append("[Media]")
+                elif tag == "file":
+                    row_parts.append("[File]")
+                elif tag == "audio":
+                    row_parts.append("[Audio]")
+                elif tag == "video":
+                    row_parts.append("[Video]")
+                elif tag == "code":
+                    code = elem.get("text", "")
+                    row_parts.append(_wrap_inline_code(code) if code else "")
+                elif tag in ("code_block", "pre"):
+                    lang = str(elem.get("language", "") or elem.get("lang", "")).strip()
+                    code = str(elem.get("text", "") or elem.get("content", "")).replace("\r\n", "\n")
+                    trailing = "" if code.endswith("\n") else "\n"
+                    row_parts.append(f"```{lang}\n{code}{trailing}```")
+                elif tag in ("br",):
+                    row_parts.append("\n")
+                elif tag in ("hr", "divider"):
+                    row_parts.append("\n\n---\n\n")
+            if row_parts:
+                texts.append("".join(row_parts))
     except Exception:
         pass
     return "\n".join(texts) or "[Post]"
