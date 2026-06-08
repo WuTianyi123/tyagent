@@ -24,6 +24,34 @@ from typing import Any, Dict, List, Optional
 from tyagent.tools.registry import registry, tool_error, tool_result
 
 # ---------------------------------------------------------------------------
+# Environment safety
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_ENV_SUFFIXES = ("_API_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
+
+
+def _parse_bool(val: Any) -> bool:
+    """Parse a boolean value, rejecting truthy non-bool strings."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.lower() in ("true", "1", "yes")
+    return bool(val)
+
+
+def _safe_environ() -> Dict[str, str]:
+    """Return a copy of os.environ with sensitive keys stripped.
+
+    Prevents subprocess tools (terminal, execute_code) from exposing
+    API keys, secrets, and tokens to LLM-controlled commands.
+    """
+    safe = {}
+    for key, val in os.environ.items():
+        if not any(key.endswith(suffix) for suffix in _SENSITIVE_ENV_SUFFIXES):
+            safe[key] = val
+    return safe
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
@@ -183,6 +211,18 @@ def _handle_read_file(args: Dict[str, Any]) -> str:
         return tool_error(f"Not a file: {path}")
 
     try:
+        # Check file size before reading to prevent OOM on large files
+        try:
+            file_size = resolved.stat().st_size
+        except OSError:
+            file_size = 0
+        max_bytes = max(_DEFAULT_MAX_READ_CHARS * 4, 10 * 1024 * 1024)  # 10 MB hard cap
+        if file_size > max_bytes:
+            return tool_error(
+                f"File is too large to read ({file_size:,} bytes). "
+                "Use offset and limit to read a smaller range."
+            )
+
         # Try UTF-8 first, fallback to latin-1
         try:
             content = resolved.read_text(encoding="utf-8")
@@ -266,7 +306,7 @@ WRITE_FILE_SCHEMA = {
 def _handle_write_file(args: Dict[str, Any]) -> str:
     """Write content to a file."""
     path = args.get("path", "")
-    content = args.get("content", "")
+    content = "" if args.get("content") is None else args.get("content", "")
 
     try:
         resolved = _resolve_path(path)
@@ -344,7 +384,7 @@ def _handle_patch(args: Dict[str, Any]) -> str:
     path = args.get("path", "")
     old_string = args.get("old_string", "")
     new_string = args.get("new_string", "")
-    replace_all = bool(args.get("replace_all", False))
+    replace_all = _parse_bool(args.get("replace_all", False))
 
     if old_string is None or new_string is None:
         return tool_error("old_string and new_string are required")
@@ -796,8 +836,8 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
 
     try:
         # Ensure isolated HOME is inherited by subprocess
-        env = os.environ.copy()
-        
+        env = _safe_environ()
+
         with open(output_path, 'w', encoding='utf-8') as out_f:
             try:
                 cmd_args = shlex.split(command)
@@ -868,7 +908,7 @@ def _handle_terminal(args: Dict[str, Any], parent_agent: Any = None) -> str:
 
         # Read full output from file (with size limit to prevent OOM)
         try:
-            with open(output_path) as f:
+            with open(output_path, encoding="utf-8", errors="replace") as f:
                 output = f.read(max_out + 1)
         except OSError as exc:
             _cleanup_terminal_marker(marker, output_path)
@@ -967,7 +1007,7 @@ def _handle_execute_code(args: Dict[str, Any]) -> str:
         # Use the same Python interpreter
         python = os.environ.get("PYTHON", sys.executable)
         # Ensure isolated HOME is inherited by subprocess
-        env = os.environ.copy()
+        env = _safe_environ()
         proc = subprocess.run(
             [python, temp_path],
             capture_output=True,

@@ -35,6 +35,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from tyagent.tools.registry import registry, tool_error, tool_result
+from tyagent.tools.core import _safe_environ  # strip sensitive env vars
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,7 @@ def _run_cmd(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_safe_environ(),  # strip sensitive env vars
         )
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"Browser command timed out after {timeout}s"}

@@ -132,6 +132,18 @@ class GatewaySupervisor:
             )
             gw._draining = False
             gw._restart_requested = False
+            # Notify the user that restart was aborted
+            if gw._restart_notification_pending:
+                try:
+                    platform = gw._restart_notification_pending.get("platform", "")
+                    adapter = gw.adapters.get(platform)
+                    if adapter:
+                        await adapter.send_message(
+                            gw._restart_notification_pending.get("chat_id", ""),
+                            "❌ 重启被取消 — 消息链校验失败，gateway 继续运行。请稍后重试 /restart。",
+                        )
+                except Exception:
+                    pass
             return  # task is fire-and-forget; don't re-raise
         except Exception:
             logger.exception(
@@ -139,20 +151,38 @@ class GatewaySupervisor:
             )
 
         logger.info(
-            "Graceful restart complete — exiting with code 75 for systemd restart"
+            "Graceful restart complete — spawning systemctl restart (avoids RestartSec delay)"
         )
+        import subprocess
 
-        # Exit with code 75 (EX_TEMPFAIL).  The systemd service unit
-        # has Restart=always + RestartForceExitStatus=75, so systemd
-        # treats this exit as an intentional restart request and
-        # re-launches the gateway — no shell wrapper or systemd-run
-        # scope dance needed.
-        #
-        # os._exit() is used (not sys.exit()) because this runs inside
-        # the asyncio event loop, and sys.exit() would raise
-        # SystemExit which may be caught by test runners or the event
-        # loop.  os._exit() is immediate and unconditional.
-        os._exit(75)
+        # Spawn systemctl restart which triggers an immediate restart
+        # without the RestartSec delay.  If it fails, Restart=on-failure
+        # serves as fallback via exit code 75.
+        try:
+            subprocess.Popen(
+                [
+                    "systemd-run",
+                    "--user",
+                    "--scope",
+                    "--unit=tyagent-restart-helper",
+                    "systemctl",
+                    "--user",
+                    "restart",
+                    "tyagent-gateway",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to spawn systemctl restart: %s — falling back to exit 75",
+                exc,
+            )
+            os._exit(75)
+
+        # Exit immediately.  systemctl restart already launched the new
+        # process, and exit code 0 means Restart=on-failure won't double-restart.
+        os._exit(0)
 
     def _write_clean_shutdown_marker(self) -> None:
         """Write .clean_shutdown marker with restart requestor info."""
@@ -208,8 +238,13 @@ class GatewaySupervisor:
                 agent = ctx.agent
                 if agent._in_turn:
                     busy += 1
+                # Only count as busy if there are actually running child tasks
                 elif hasattr(agent, '_bg_tasks') and agent._bg_tasks:
-                    busy += 1
+                    running_children = any(
+                        not task.done() for task in agent._bg_tasks.values()
+                    )
+                    if running_children:
+                        busy += 1
             if busy == 0:
                 logger.info(
                     "Drain complete (%d sessions, all idle) in %.1fs",

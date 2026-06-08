@@ -115,7 +115,10 @@ async def _launch_child_agent(
     )
     child_system = child_system + identity
     if context:
-        child_system = f"{child_system}\n\nTask context: {context}"
+        # Truncate context to prevent prompt injection via oversized
+        # user-controlled context strings
+        safe_context = context[:2000]
+        child_system = f"{child_system}\n\nTask context: {safe_context}"
 
     # ── Create child agent ───────────────────────────────────
     child = TyAgent(
@@ -176,6 +179,12 @@ async def _launch_child_agent(
         # the child agent would leak (orphaned in _child_agents with
         # a live httpx client and no _loop_task to clean it up).
         parent_agent._child_agents.pop(task_path, None)
+        # Also unregister from task_tree to prevent phantom entries
+        if parent_agent._task_tree is not None:
+            try:
+                parent_agent._task_tree.unregister(task_path)
+            except Exception:
+                pass
         try:
             await child.close()
         except Exception:
@@ -212,6 +221,15 @@ async def _child_agent_loop(
             await child.stop()
         except Exception:
             pass
+        # Send FinalNotification so parent knows the child timed out
+        from tyagent.subagent.mailbox import FinalNotification
+        parent_agent._mailbox.send(FinalNotification(
+            task_path=task_path,
+            success=False,
+            summary=f"Child agent {task_path} timed out after {DEFAULT_CHILD_TIMEOUT:.0f}s",
+            error=f"Timeout after {DEFAULT_CHILD_TIMEOUT:.0f}s",
+            duration_seconds=DEFAULT_CHILD_TIMEOUT,
+        ))
     finally:
         try:
             await child.close()
@@ -270,7 +288,9 @@ async def _handle_spawn_task(
         return tool_error(str(exc))
 
     context = args.get("context") or None
-    toolsets: Optional[List[str]] = args.get("toolsets") or None
+    toolsets: Optional[List[str]] = args.get("toolsets")
+    if toolsets is not None and not isinstance(toolsets, list):
+        return tool_error("toolsets must be a list of tool names.")
     fork_turns = args.get("fork_turns", "none")
     max_tool_turns = args.get("max_tool_turns", DEFAULT_SUBAGENT_MAX_TOOL_TURNS)
 
@@ -808,10 +828,11 @@ SEND_INPUT_SCHEMA: Dict[str, Any] = {
     "name": "send_input",
     "description": (
         "Send a message to a running child agent. "
-        "When interrupt=true, the message is prioritised — the child "
-        "will handle it before continuing its current work. "
-        "When interrupt=false (default), the message is queued and "
-        "handled between tool calls. "
+        "The message is injected into the child's message list between "
+        "tool calls (or at the start of the next LLM turn if the child "
+        "is mid-API-call). interrupt=true delivers the message at the "
+        "next available pause point but does NOT cancel an in-flight "
+        "LLM request. "
         "Use when: you discover new information the child needs, "
         "the user refines requirements, or the child's current "
         "direction needs correction."

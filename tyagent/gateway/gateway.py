@@ -280,10 +280,28 @@ class Gateway:
         agent = TyAgent.from_config(self.config.agent, home_dir=self.config.home_dir)
         self._agent_cache[session_key] = agent
         self._agent_cache.move_to_end(session_key)
-        # Evict oldest if over cap
+        # Evict oldest if over cap — skip active sessions
+        # Guard against infinite loop when all cached agents are active
+        eviction_attempts = 0
         while len(self._agent_cache) > _AGENT_CACHE_MAX_SIZE:
             lru_key = next(iter(self._agent_cache))
-            lru_agent = self._agent_cache.pop(lru_key)
+            lru_agent = self._agent_cache[lru_key]
+            # Never evict an agent whose session is still active
+            if lru_key in self._sessions:
+                self._agent_cache.move_to_end(lru_key)
+                eviction_attempts += 1
+                if eviction_attempts >= len(self._agent_cache):
+                    # All cached agents are active — allow cache to grow
+                    logger.warning(
+                        "Agent cache at capacity (%d) with all entries active — "
+                        "allowing growth to %d",
+                        _AGENT_CACHE_MAX_SIZE,
+                        len(self._agent_cache),
+                    )
+                    break
+                continue
+            eviction_attempts = 0
+            self._agent_cache.pop(lru_key)
             loop = asyncio.get_running_loop()
             loop.create_task(lru_agent.close())
         return agent
@@ -354,6 +372,11 @@ class Gateway:
 
         # Track this session as actively processing
         # (per-session state is created by _ensure_session_agent below)
+
+        # Initialize objects that except blocks may reference, so they
+        # are always defined even when an exception fires before creation.
+        progress_sender = None
+        progress_task = None
 
         try:
             # Define the persistence callback for tool loop messages
@@ -452,28 +475,32 @@ class Gateway:
 
         except AgentError as exc:
             logger.error("Agent error: %s", exc)
-            progress_sender.finish()
+            if progress_sender is not None:
+                progress_sender.finish()
             if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
                 try:
                     adapter.remove_pending_reaction(event.message_id)
                 except Exception:
                     pass
-            try: await progress_task
-            except: pass
+            if progress_task is not None:
+                try: await progress_task
+                except: pass
             await adapter.send_message(
                 event.chat_id or "", f"❌ 错误: {exc}",
                 reply_to_message_id=event.message_id,
             )
         except Exception:
             logger.exception("Unexpected agent error")
-            progress_sender.finish()
+            if progress_sender is not None:
+                progress_sender.finish()
             if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
                 try:
                     adapter.remove_pending_reaction(event.message_id)
                 except Exception:
                     pass
-            try: await progress_task
-            except: pass
+            if progress_task is not None:
+                try: await progress_task
+                except: pass
             await adapter.send_message(
                 event.chat_id or "", "Sorry, something went wrong.",
                 reply_to_message_id=event.message_id,
@@ -557,9 +584,12 @@ class Gateway:
                     get_task.cancel()
                     try: await get_task
                     except asyncio.CancelledError: pass
+                    # Drain any remaining outputs before exiting
+                    self._drain_output_queue(agent, ctx)
                     break
                 output = get_task.result()
             except asyncio.CancelledError:
+                self._drain_output_queue(agent, ctx)
                 break
 
             adapter = ctx.adapter if ctx else None
@@ -577,6 +607,30 @@ class Gateway:
             else:
                 # Auto-reply (child completion triggered)
                 await adapter.send_message(chat_id, output.text)
+
+    def _drain_output_queue(self, agent, ctx) -> None:
+        """Drain any remaining outputs from the agent's queue before shutdown.
+
+        Called when _consume_output is about to exit, so no outputs are
+        silently lost.
+        """
+        while not agent._output_queue.empty():
+            try:
+                output = agent._output_queue.get_nowait()
+                if not output.text.strip():
+                    continue
+                adapter = ctx.adapter if ctx else None
+                chat_id = ctx.chat_id if ctx else ""
+                if adapter is None:
+                    continue
+                target = output.reply_target.chat_id if output.reply_target else chat_id
+                msg_id = output.reply_target.message_id if output.reply_target else None
+                kwargs = {"reply_to_message_id": msg_id} if msg_id else {}
+                asyncio.ensure_future(adapter.send_message(target, output.text, **kwargs))
+            except asyncio.QueueEmpty:
+                break
+            except Exception:
+                pass
 
     async def _init_agents_on_startup(self) -> None:
         """Initialize session agents for all sessions with message history.
@@ -643,6 +697,8 @@ class Gateway:
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
         ctx = self._sessions.pop(session_key, None)
+        # Clean up the per-session lock to prevent unbounded growth
+        self._session_locks.pop(session_key, None)
         if ctx is None:
             return
         # Cancel output consumer

@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -148,8 +149,13 @@ class TyAgent:
         """This agent's own mailbox for incoming inter-agent messages."""
         self._allowed_tool_names: Optional[List[str]] = None
         """Tool names this agent is allowed to use (restricted for children)."""
+        # Track when agent was created for duration reporting
+        self._created_at: float = time.monotonic()
         # When True, _run_turn checks inbox between tool calls (child agents)
         self._check_inbox_between_turns: bool = False
+        # Reply target for the current turn — set by agent loop before _run_turn.
+        # Intermediate assistant text (before tool calls) is delivered to this target.
+        self._reply_target: Optional[ReplyTarget] = None
         # System prompt built once at init, then cached for prefix-cache
         # stability across turns.  Rebuilt after compaction so mid-session
         # memory writes are picked up — the cache-miss cost is negligible
@@ -275,12 +281,22 @@ class TyAgent:
             self._current_tool_call_id = tc_id
             self._current_tool_call_name = func_name
             try:
-                if entry and asyncio.iscoroutinefunction(entry.handler):
-                    result = await entry.handler(func_args, parent_agent=self)
-                else:
-                    _loop = asyncio.get_running_loop()
-                    result = await _loop.run_in_executor(
-                        None, registry.dispatch, func_name, func_args, self,
+                try:
+                    if entry and asyncio.iscoroutinefunction(entry.handler):
+                        result = await entry.handler(func_args, parent_agent=self)
+                    else:
+                        _loop = asyncio.get_running_loop()
+                        result = await _loop.run_in_executor(
+                            None, registry.dispatch, func_name, func_args, self,
+                        )
+                except Exception as exc:
+                    result = json.dumps({
+                        "error": f"Tool {func_name} failed: {exc}",
+                        "tool": func_name,
+                    })
+                    logger.warning(
+                        "Tool %s failed (call_id=%s): %s",
+                        func_name, tc_id, exc,
                     )
             finally:
                 self._current_tool_call_id = ""
@@ -519,6 +535,9 @@ class TyAgent:
                 messages[:] = compacted
                 self._refresh_memory_and_prompt()
                 system_prompt = self._system_prompt  # refresh after compaction
+                # Reset last_usage so next threshold check uses estimate,
+                # not stale (pre-compaction) API-reported token counts.
+                self.last_usage = None
 
         payload_base = self._build_payload_base(tools)
         headers = self._build_headers()
@@ -570,7 +589,19 @@ class TyAgent:
             messages.append(assistant_msg)
             self._dispatch_on_message(content, tool_calls, reasoning_content)
 
+            # ── Deliver intermediate text to the gateway ──────────
+            # When the model sends text alongside tool_calls (e.g. "let me
+            # check..."), push it to the output queue immediately so the
+            # user sees it before the tool calls execute.  Pure-text final
+            # responses are returned below and delivered by the agent loop.
+            if content and tool_calls and self._reply_target is not None:
+                await self._output_queue.put(AgentOutput(
+                    text=content,
+                    reply_target=self._reply_target,
+                ))
+
             if not tool_calls:
+                self._completed_normally = True
                 return (content or reasoning_content or "")
 
             if on_segment_break:
@@ -612,6 +643,7 @@ class TyAgent:
                     messages[:] = compacted
                     self._refresh_memory_and_prompt()
                     system_prompt = self._system_prompt  # refresh after compaction
+                    self.last_usage = None  # reset stale token counts
                 # Continue — model sees compacted context and re-decides
                 continue
 
@@ -630,9 +662,9 @@ class TyAgent:
             return
         self._messages = list(history) if history else []
         self._on_message = on_message
-        self._running = True
         self._stop_event.clear()
         self._loop_task = asyncio.create_task(self._agent_loop())
+        self._running = True  # set AFTER loop_task creation to prevent double-start
 
     async def stop(self) -> None:
         """Stop the agent loop and clean up."""
@@ -674,11 +706,18 @@ class TyAgent:
             raise RuntimeError("Agent loop not running. Call start() first.")
         if not text:
             return
-        await self._inbox.put(InboxMessage(
-            text=text, reply_target=reply_target,
-            tool_progress_cb=tool_progress_cb,
-            turn_done_cb=turn_done_cb,
-        ))
+        try:
+            await self._inbox.put(InboxMessage(
+                text=text, reply_target=reply_target,
+                tool_progress_cb=tool_progress_cb,
+                turn_done_cb=turn_done_cb,
+            ))
+        except asyncio.CancelledError:
+            # Agent loop was stopped between the _running check and put().
+            # The message cannot be delivered — caller should retry or handle.
+            raise RuntimeError(
+                "Agent stopped before message could be delivered."
+            )
 
     async def _agent_loop(self) -> None:
         """Permanent agent event loop — waits on inbox, mailbox, and stop signal.
@@ -708,6 +747,10 @@ class TyAgent:
             except AgentError as exc:
                 logger.error("Startup auto-process (chain tail) error: %s", exc)
                 content = f"❌ 错误: {exc}"
+            except asyncio.CancelledError:
+                # Agent is being stopped — abort startup processing
+                logger.info("Startup auto-process (chain tail) cancelled — agent stopping")
+                return
             except Exception as exc:
                 logger.exception("Unexpected error in startup auto-process (chain tail)")
                 content = f"❌ 内部错误: {exc}"
@@ -743,6 +786,9 @@ class TyAgent:
                 except AgentError as exc:
                     logger.error("Startup auto-process (child completions) error: %s", exc)
                     content = f"❌ 错误: {exc}"
+                except asyncio.CancelledError:
+                    logger.info("Startup auto-process (child completions) cancelled — agent stopping")
+                    return
                 except Exception as exc:
                     logger.exception("Unexpected error in startup auto-process (child completions)")
                     content = f"❌ 内部错误: {exc}"
@@ -834,6 +880,10 @@ class TyAgent:
             if not has_user_message and not should_trigger:
                 continue
 
+            # ── Check stop before running an expensive turn ────
+            if self._stop_event.is_set():
+                break
+
             # ── Run turn ───────────────────────────────────────
             tools = registry.get_definitions()
             if self._allowed_tool_names is not None:
@@ -843,9 +893,12 @@ class TyAgent:
             self._inject_child_status()
             prev_tool_cb = self._tool_progress_callback
             self._tool_progress_callback = current_tool_cb
+            self._reply_target = current_reply
             turn_error = None
             try:
                 content = await self._run_turn(tools=tools)
+                # Turn completed without exception — mark as normal completion
+                self._completed_normally = True
             except AgentError as exc:
                 turn_error = str(exc)
                 logger.error("Agent loop error: %s", exc)
@@ -977,17 +1030,28 @@ class TyAgent:
             success=self._completed_normally,
             summary=f"Agent {task_path} {'completed normally' if self._completed_normally else 'stopped'}",
             error=None,
-            duration_seconds=0.0,
+            duration_seconds=self._elapsed_seconds(),
         ))
 
     async def close(self) -> None:
         """Close agent and clean up."""
         if self._running:
             await self.stop()
+        # Ensure all child agents have their HTTP clients closed,
+        # even if stop() timed out before they finished.
+        for child_path, child_agent in list(self._child_agents.items()):
+            try:
+                await child_agent.close()
+            except Exception:
+                pass
         self._bg_tasks.clear()
         self._task_tree = None
         self._child_agents.clear()
         await self._client.aclose()
+
+    def _elapsed_seconds(self) -> float:
+        """Return seconds since this agent was created."""
+        return max(0.0, time.monotonic() - self._created_at)
 
     @classmethod
     def from_config(cls, config: Any, *, home_dir: Optional[Path] = None) -> "TyAgent":
