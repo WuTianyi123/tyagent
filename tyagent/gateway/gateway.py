@@ -649,6 +649,63 @@ class Gateway:
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
 
+    def _drain_output_queue(self, agent, ctx) -> None:
+        """Drain remaining items from the output queue during shutdown.
+
+        Non-async — called from finally/except blocks where the event loop
+        may already be shutting down.  Drains synchronously via
+        get_nowait() and does a best-effort flush of any pending progress.
+        """
+        adapter = ctx.adapter if ctx else None
+        chat_id = ctx.chat_id if ctx else ""
+        progress_lines = []
+        progress_msg_id = None
+
+        # Drain synchronously — we can't await during shutdown
+        while True:
+            try:
+                output = agent._output_queue.get_nowait()
+            except Exception:
+                break
+            if output.kind == "text":
+                # Flush any pending progress first
+                if progress_lines and progress_msg_id and adapter:
+                    # Fire-and-forget (can't await)
+                    asyncio.ensure_future(
+                        adapter.edit_message(
+                            chat_id, progress_msg_id,
+                            "\n".join(progress_lines),
+                        )
+                    )
+                progress_lines.clear()
+                progress_msg_id = None
+                # Send text (fire-and-forget)
+                if adapter:
+                    asyncio.ensure_future(
+                        adapter.send_message(chat_id, output.text)
+                    )
+            elif output.kind == "progress":
+                progress_lines.append(output.text)
+                if output.finish and progress_lines:
+                    if progress_msg_id and adapter:
+                        asyncio.ensure_future(
+                            adapter.edit_message(
+                                chat_id, progress_msg_id,
+                                "\n".join(progress_lines),
+                            )
+                        )
+                    progress_lines.clear()
+                    progress_msg_id = None
+
+        # Flush any remaining progress
+        if progress_lines and progress_msg_id and adapter:
+            asyncio.ensure_future(
+                adapter.edit_message(
+                    chat_id, progress_msg_id,
+                    "\n".join(progress_lines),
+                )
+            )
+
     async def _init_agents_on_startup(self) -> None:
         """Initialize session agents for all sessions with message history.
 
