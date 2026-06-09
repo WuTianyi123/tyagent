@@ -377,7 +377,6 @@ class Gateway:
         # Initialize objects that except blocks may reference, so they
         # are always defined even when an exception fires before creation.
         progress_sender = None
-        progress_task = None
 
         try:
             # Define the persistence callback for tool loop messages
@@ -395,32 +394,9 @@ class Gateway:
                 reply_to_message_id=event.message_id,
                 enabled=bool(event.chat_id) and not event.is_command(),
             )
-            progress_task = asyncio.create_task(progress_sender.run())
-            # Suppress "Task exception was never retrieved" warning and log
-            # any unhandled exception. ProgressSender.run() handles its own
-            # exceptions, so this is belt-and-suspenders.
-            def _on_progress_done(t: asyncio.Task) -> None:
-                # Clean up task reference to prevent memory leak
-                ctx = self._sessions.get(session_key)
-                tasks = ctx.progress_tasks if ctx else []
-                if tasks:
-                    try:
-                        tasks.remove(t)
-                    except ValueError:
-                        pass
-                if not tasks and ctx:
-                    ctx.progress_tasks.clear()
-                if t.cancelled():
-                    return
-                exc = t.exception()
-                if exc is not None:
-                    logger.error("ProgressSender task crashed: %s", exc)
-            progress_task.add_done_callback(_on_progress_done)
             _progress_cb = progress_sender.on_tool_started
 
             # Ensure session agent is running (creates SessionContext if new)
-            # Wire ProgressSender to agent's output queue for unified ordering
-            progress_sender._output_queue = agent._output_queue
             agent = await self._ensure_session_agent(
                 session_key, session,
                 adapter, event.chat_id or "",
@@ -430,18 +406,12 @@ class Gateway:
             # Wire ProgressSender to agent's output queue for unified ordering
             progress_sender._output_queue = agent._output_queue
 
-            # Register progress task in session context
-            ctx = self._sessions.get(session_key)
-            if ctx:
-                ctx.progress_tasks.append(progress_task)
 
             final_text = user_message
 
             # Skip agent interaction for empty messages (image-only, sticker, etc.)
             if not final_text.strip():
                 progress_sender.finish()
-                try: await progress_task
-                except Exception: pass
                 # Clean up the ⌨️ reaction for empty messages
                 if event.message_id and hasattr(adapter, 'remove_pending_reaction'):
                     try:
@@ -476,7 +446,6 @@ class Gateway:
                 final_text,
                 reply_target=reply_target,
                 tool_progress_cb=_progress_cb,
-                segment_break_cb=progress_sender.break_segment,
                 turn_done_cb=_turn_done,
             )
 
@@ -489,9 +458,6 @@ class Gateway:
                     adapter.remove_pending_reaction(event.message_id)
                 except Exception:
                     pass
-            if progress_task is not None:
-                try: await progress_task
-                except: pass
             await adapter.send_message(
                 event.chat_id or "", f"❌ 错误: {exc}",
                 reply_to_message_id=event.message_id,
@@ -505,9 +471,6 @@ class Gateway:
                     adapter.remove_pending_reaction(event.message_id)
                 except Exception:
                     pass
-            if progress_task is not None:
-                try: await progress_task
-                except: pass
             await adapter.send_message(
                 event.chat_id or "", "Sorry, something went wrong.",
                 reply_to_message_id=event.message_id,
@@ -685,6 +648,42 @@ class Gateway:
                     result = await adapter.send_message(chat_id, text)
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
+
+    async def _init_agents_on_startup(self) -> None:
+        """Initialize session agents for all sessions with message history.
+
+        Runs after adapters start. For each session that has messages,
+        creates the agent loop and output consumer. If the chain ends with
+        a tool response (collected after restart), _agent_loop auto-processes
+        it proactively. Otherwise the agent waits for inbox messages.
+        """
+        for session_key in self.session_store.all_session_keys():
+            if session_key in self._sessions:
+                continue
+            try:
+                session = self.session_store.get(session_key)
+                if not session or not session.messages:
+                    continue
+                platform = session_key.split(":", 1)[0] if ":" in session_key else ""
+                adapter = self.adapters.get(platform)
+                if adapter is None:
+                    continue
+                key_parts = session_key.split(":")
+                chat_id = key_parts[1] if len(key_parts) >= 2 else ""
+                _persist_sid = session.metadata.get("current_session_id", "")
+                def _mk_persist(sid, sk=session_key):
+                    def _p(role, content, **extras):
+                        self.session_store.add_message(
+                            sk, role, content, session_id=sid, **extras,
+                        )
+                    return _p
+                await self._ensure_session_agent(
+                    session_key, session, adapter, chat_id,
+                    _mk_persist(_persist_sid),
+                )
+                logger.info("Initialized agent for session %s", session_key)
+            except Exception:
+                logger.exception("Failed to init agent for %s", session_key)
 
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""

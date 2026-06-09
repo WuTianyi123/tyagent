@@ -27,5 +27,4 @@ class InboxMessage:
     text: str
     reply_target: Optional[ReplyTarget] = None
     tool_progress_cb: Optional[Any] = None
-    segment_break_cb: Optional[Any] = None
     turn_done_cb: Optional[Any] = None
