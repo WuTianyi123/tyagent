@@ -721,6 +721,7 @@ class TyAgent:
             await self._inbox.put(InboxMessage(
                 text=text, reply_target=reply_target,
                 tool_progress_cb=tool_progress_cb,
+                segment_break_cb=segment_break_cb,
                 turn_done_cb=turn_done_cb,
             ))
         except asyncio.CancelledError:
