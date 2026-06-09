@@ -200,6 +200,8 @@ class ProgressSender:
         """Signal that a new segment starts — next tool call creates a new message."""
         logger.info("ProgressSender: segment break — resetting message")
         self._progress_msg_id = None
+        import logging; _plog = logging.getLogger(__name__)
+        _plog.info("break_segment: cleared lines, reset msg_id")
         self._progress_lines.clear()
         self._last_delivered_count = 0
 
