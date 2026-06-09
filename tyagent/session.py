@@ -24,6 +24,22 @@ logger = logging.getLogger(__name__)
 # Sentinel for "no store provided"
 _UNSET = object()
 
+
+def _normalise_jsonl_record(record: dict) -> dict:
+    """Normalise a JSONL record to match the format produced by ``_row_to_message``.
+
+    - ``reasoning`` → ``reasoning_content`` (the field name consumers expect)
+    - ``content``: empty string → None (DeepSeek thinking mode compat)
+    """
+    # reasoning → reasoning_content
+    if "reasoning" in record:
+        record["reasoning_content"] = record.pop("reasoning")
+    # content "" → None
+    if record.get("content") == "":
+        record["content"] = None
+    return record
+
+
 class SessionError(Exception):
     """Raised when a session operation fails."""
     pass
@@ -189,7 +205,12 @@ class SessionStore:
             logger.warning("JSONL append failed for %s: %s", session_key, exc)
 
     def _read_jsonl(self, session_key: str, session_id: str = "") -> list[dict]:
-        """Read all message records from the JSONL file."""
+        """Read all message records from the JSONL file.
+
+        Returns messages in append-order (chronological).  Normalises field
+        names to match the format that consumers expect (same as
+        ``_row_to_message`` in db.py).
+        """
         path = self._jsonl_path(session_key)
         if not path.exists():
             return []
@@ -204,6 +225,8 @@ class SessionStore:
                         record = _json.loads(line)
                         if session_id and record.get("session_id") != session_id:
                             continue
+                        # Normalise field names to match _row_to_message output
+                        record = _normalise_jsonl_record(record)
                         messages.append(record)
                     except (_json.JSONDecodeError, KeyError):
                         logger.warning("Skipping malformed JSONL line in %s", path)
@@ -309,16 +332,18 @@ class SessionStore:
     def get_messages(self, session_key: str, session_id: str = "") -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by creation time.
 
+        Reads from JSONL (append-order = chronological).
+
         Args:
             session_key: The session key.
             session_id: Optional filter — only messages with this session_id
                         are returned. Used for session isolation on /new.
         """
-        return self._db.get_messages(session_key, session_id=session_id)
+        return self._read_jsonl(session_key, session_id=session_id)
 
     def get_message_count(self, session_key: str, session_id: str = "") -> int:
         """Return the number of messages in a session (optionally filtered by session_id)."""
-        return self._db.get_message_count(session_key, session_id=session_id)
+        return len(self.get_messages(session_key, session_id=session_id))
 
     def archive(self, session_key: str) -> None:
         """Archive a session: mark as archived in metadata.
@@ -377,8 +402,14 @@ class SessionStore:
         pass
 
     def delete(self, session_key: str) -> None:
-        """Delete a session and its messages from the database."""
+        """Delete a session and its messages from the database and JSONL."""
         self._db.delete_session(session_key)
+        # Also remove the JSONL file
+        jsonl_path = self._jsonl_path(session_key)
+        try:
+            jsonl_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to delete JSONL for %s: %s", session_key, exc)
 
     def all_session_keys(self) -> List[str]:
         """Return all session keys."""
