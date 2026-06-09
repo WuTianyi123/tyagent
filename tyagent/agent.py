@@ -599,7 +599,11 @@ class TyAgent:
                     text=content,
                     reply_target=self._reply_target,
                 ))
-                logger.info("DEBUG: segment break reached, callback=%s", self._segment_break_callback is not None)
+                if self._segment_break_callback:
+                    try:
+                        self._segment_break_callback()
+                    except Exception:
+                        pass
                 if self._segment_break_callback:
                     try:
                         self._segment_break_callback()
