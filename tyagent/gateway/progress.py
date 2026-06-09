@@ -200,8 +200,6 @@ class ProgressSender:
         """Signal that a new segment starts — next tool call creates a new message."""
         logger.info("ProgressSender: segment break — resetting message")
         self._progress_msg_id = None
-        import logging; _plog = logging.getLogger(__name__)
-        _plog.info("break_segment: cleared lines, reset msg_id")
         self._progress_lines.clear()
         self._last_delivered_count = 0
 
@@ -223,7 +221,6 @@ class ProgressSender:
                 logger.debug("Progress disabled — discarded %d queued items", drained)
             return
 
-        progress_lines: list[str] = []
 
         can_edit = True
         last_edit_ts = 0.0
@@ -249,7 +246,7 @@ class ProgressSender:
                     await asyncio.sleep(0.05)
                     continue
 
-                if not progress_lines:
+                if not self._progress_lines:
                     if self._done and self._queue.empty():
                         return
                     await asyncio.sleep(0.05)
