@@ -169,8 +169,8 @@ class ProgressSender:
         self.enabled = enabled
         self._queue: "asyncio.Queue[str]" = asyncio.Queue()
         self._done = False
-        self._progress_msg_id: str | None = None
         self._progress_lines: list[str] = []
+        self._progress_msg_id: str | None = None
         self._last_delivered_count = 0
         self._progress_msg_type: str | None = None
 
@@ -200,7 +200,7 @@ class ProgressSender:
         """Signal that a new segment starts — next tool call creates a new message."""
         logger.info("ProgressSender: segment break — resetting message")
         self._progress_msg_id = None
-        self._self._progress_lines.clear()
+        self._progress_lines.clear()
         self._last_delivered_count = 0
 
     def finish(self) -> None:
@@ -221,7 +221,7 @@ class ProgressSender:
                 logger.debug("Progress disabled — discarded %d queued items", drained)
             return
 
-        self._progress_lines: list[str] = []
+        progress_lines: list[str] = []
 
         can_edit = True
         last_edit_ts = 0.0
@@ -247,7 +247,7 @@ class ProgressSender:
                     await asyncio.sleep(0.05)
                     continue
 
-                if not self._progress_lines:
+                if not progress_lines:
                     if self._done and self._queue.empty():
                         return
                     await asyncio.sleep(0.05)
@@ -260,7 +260,7 @@ class ProgressSender:
                     await asyncio.sleep(self._EDIT_INTERVAL - elapsed)
                     continue
 
-                text = "\n".join(progress_lines)
+                text = "\n".join(self._progress_lines)
 
                 if self._progress_msg_id is not None and can_edit:
                     result = await self.adapter.edit_message(
@@ -269,7 +269,7 @@ class ProgressSender:
                     )
                     if result.success:
                         last_edit_ts = time.monotonic()
-                        last_delivered_count = len(progress_lines)
+                        last_delivered_count = len(self._progress_lines)
                     else:
                         can_edit = False
                         logger.warning(
@@ -279,7 +279,7 @@ class ProgressSender:
                         )
                         # Send only the delta (lines not yet shown) to avoid
                         # duplicating content the user has already seen.
-                        delta_lines = self._self._progress_lines[last_delivered_count:]
+                        delta_lines = self._progress_lines[last_delivered_count:]
                         delta_text = "\n".join(delta_lines) if delta_lines else text
                         fallback = await self.adapter.send_message(
                             self.chat_id, delta_text,
@@ -289,7 +289,7 @@ class ProgressSender:
                             self._progress_msg_id = fallback.message_id
                             can_edit = True
                             self._progress_msg_type = getattr(fallback, "msg_type", None)
-                            # Trim progress_lines to only the undelivered portion so
+                            # Trim self._progress_lines to only the undelivered portion so
                             # subsequent edits don't re-add old content to the new message.
                             self._progress_lines = delta_lines[:]
                             last_delivered_count = 0
@@ -314,7 +314,7 @@ class ProgressSender:
                 else:
                     # Stale progress_msg_id with can_edit=False — retry send
                     # Send only the delta to avoid duplicating already-shown lines.
-                    delta_lines = self._self._progress_lines[last_delivered_count:]
+                    delta_lines = self._progress_lines[last_delivered_count:]
                     delta_text = "\n".join(delta_lines) if delta_lines else text
                     retry = await self.adapter.send_message(
                         self.chat_id, delta_text,
@@ -324,7 +324,7 @@ class ProgressSender:
                         self._progress_msg_id = retry.message_id
                         can_edit = True
                         self._progress_msg_type = getattr(retry, "msg_type", None)
-                        # Trim progress_lines to only the undelivered portion.
+                        # Trim self._progress_lines to only the undelivered portion.
                         self._progress_lines = delta_lines[:]
                         last_delivered_count = 0
                         last_edit_ts = time.monotonic()
