@@ -217,7 +217,7 @@ class ProgressSender:
             return
 
         progress_lines: list[str] = []
-        progress_msg_id: str | None = None
+
         can_edit = True
         last_edit_ts = 0.0
         last_delivered_count = 0  # How many lines were last successfully sent
@@ -236,7 +236,7 @@ class ProgressSender:
                     progress_lines.append(str(item))
 
                 # Skip edit if no new items arrived and we already have a message.
-                if not items and progress_msg_id is not None:
+                if not items and self._progress_msg_id is not None:
                     if self._done and self._queue.empty():
                         return
                     await asyncio.sleep(0.05)
@@ -257,7 +257,7 @@ class ProgressSender:
 
                 text = "\n".join(progress_lines)
 
-                if progress_msg_id is not None and can_edit:
+                if self._progress_msg_id is not None and can_edit:
                     result = await self.adapter.edit_message(
                         self.chat_id, progress_msg_id, text,
                         msg_type=self._progress_msg_type,
@@ -270,7 +270,7 @@ class ProgressSender:
                         logger.warning(
                             "ProgressSender: edit failed for %s (adapter=%s) — "
                             "falling back to new message",
-                            progress_msg_id, type(self.adapter).__name__,
+                            self._progress_msg_id, type(self.adapter).__name__,
                         )
                         # Send only the delta (lines not yet shown) to avoid
                         # duplicating content the user has already seen.
@@ -281,7 +281,7 @@ class ProgressSender:
                             reply_to_message_id=self.reply_to_message_id,
                         )
                         if fallback.success and fallback.message_id:
-                            progress_msg_id = fallback.message_id
+                            self._progress_msg_id = fallback.message_id
                             can_edit = True
                             self._progress_msg_type = getattr(fallback, "msg_type", None)
                             # Trim progress_lines to only the undelivered portion so
@@ -289,13 +289,13 @@ class ProgressSender:
                             progress_lines = delta_lines[:]
                             last_delivered_count = 0
                             last_edit_ts = time.monotonic()
-                elif progress_msg_id is None:
+                elif self._progress_msg_id is None:
                     result = await self.adapter.send_message(
                         self.chat_id, text,
                         reply_to_message_id=self.reply_to_message_id,
                     )
                     if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                        self._progress_msg_id = result.message_id
                         self._progress_msg_type = getattr(result, "msg_type", None)
                         last_edit_ts = time.monotonic()
                     elif result.success and not result.message_id:
@@ -305,7 +305,7 @@ class ProgressSender:
                             type(self.adapter).__name__,
                         )
                         can_edit = False
-                        progress_msg_id = ""
+                        self._progress_msg_id = ""
                 else:
                     # Stale progress_msg_id with can_edit=False — retry send
                     # Send only the delta to avoid duplicating already-shown lines.
@@ -316,7 +316,7 @@ class ProgressSender:
                         reply_to_message_id=self.reply_to_message_id,
                     )
                     if retry.success and retry.message_id:
-                        progress_msg_id = retry.message_id
+                        self._progress_msg_id = retry.message_id
                         can_edit = True
                         self._progress_msg_type = getattr(retry, "msg_type", None)
                         # Trim progress_lines to only the undelivered portion.
