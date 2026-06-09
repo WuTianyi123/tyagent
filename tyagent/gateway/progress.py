@@ -169,6 +169,8 @@ class ProgressSender:
         self.enabled = enabled
         self._queue: "asyncio.Queue[str]" = asyncio.Queue()
         self._done = False
+        self._progress_msg_id: str | None = None
+        self._last_delivered_count = 0
         self._progress_msg_type: str | None = None
 
     def on_tool_started(self, tool_name: str, args: dict | None = None, prefix: str = "") -> None:
