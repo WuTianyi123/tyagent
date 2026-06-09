@@ -6,6 +6,7 @@ Messages are persisted immediately on add_message() — no explicit save() neede
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import shutil
 import tempfile
@@ -148,6 +149,9 @@ class SessionStore:
             self._db_dir = self._temp_dir
         self._db = Database(self._db_dir / "sessions.db")
         self._metadata_lock = Lock()
+        # JSONL rollout directory for message persistence
+        self._rollout_dir = self._db_dir / "rollouts"
+        self._rollout_dir.mkdir(parents=True, exist_ok=True)
 
     def close(self) -> None:
         """Close the database and clean up temporary directories if any."""
@@ -168,6 +172,45 @@ class SessionStore:
     @property
     def db(self) -> Database:
         return self._db
+
+    def _jsonl_path(self, session_key: str) -> Path:
+        """Return the JSONL file path for a session."""
+        # Sanitize session_key for filesystem
+        safe = session_key.replace("/", "_").replace(":", "-")
+        return self._rollout_dir / f"rollout-{safe}.jsonl"
+
+    def _append_jsonl(self, session_key: str, record: dict) -> None:
+        """Append a single message record to the JSONL file."""
+        path = self._jsonl_path(session_key)
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(record, ensure_ascii=False) + chr(10))
+        except OSError as exc:
+            logger.warning("JSONL append failed for %s: %s", session_key, exc)
+
+    def _read_jsonl(self, session_key: str, session_id: str = "") -> list[dict]:
+        """Read all message records from the JSONL file."""
+        path = self._jsonl_path(session_key)
+        if not path.exists():
+            return []
+        messages = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = _json.loads(line)
+                        if session_id and record.get("session_id") != session_id:
+                            continue
+                        messages.append(record)
+                    except (_json.JSONDecodeError, KeyError):
+                        logger.warning("Skipping malformed JSONL line in %s", path)
+                        continue
+        except OSError as exc:
+            logger.warning("JSONL read failed for %s: %s", session_key, exc)
+        return messages
 
     def _build_session(self, session_dict: Dict[str, Any]) -> Session:
         """Create a Session with a back-reference to this store.
@@ -220,7 +263,7 @@ class SessionStore:
         tool_call_id: Optional[str] = None,
         reasoning: Optional[str] = None,
     ) -> int:
-        """Append a message to a session. Persisted immediately.
+        """Append a message to a session. Persisted immediately (dual-write).
 
         If session_id is not provided, auto-injects the current session's
         current_session_id from metadata for isolation.
@@ -237,13 +280,31 @@ class SessionStore:
                     session_id = uuid.uuid4().hex[:16]
                     session_dict["metadata"]["current_session_id"] = session_id
                     self._db.update_session_metadata(session_key, session_dict["metadata"])
-        return self._db.add_message(
+        # SQLite write
+        msg_id = self._db.add_message(
             session_key, role, content,
             session_id=session_id,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning=reasoning,
         )
+        # JSONL dual-write
+        record = {
+            "id": msg_id,
+            "session_key": session_key,
+            "session_id": session_id,
+            "role": role,
+            "content": content or "",
+            "created_at": time.time(),
+        }
+        if tool_calls is not None:
+            record["tool_calls"] = tool_calls
+        if tool_call_id is not None:
+            record["tool_call_id"] = tool_call_id
+        if reasoning is not None:
+            record["reasoning"] = reasoning
+        self._append_jsonl(session_key, record)
+        return msg_id
 
     def get_messages(self, session_key: str, session_id: str = "") -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by creation time.
