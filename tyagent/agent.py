@@ -599,7 +599,7 @@ class TyAgent:
                     text=content,
                     reply_target=self._reply_target,
                 ))
-                # Signal segment break so ProgressSender starts a new message
+                logger.info("DEBUG: segment break reached, callback=%s", self._segment_break_callback is not None)
                 if self._segment_break_callback:
                     try:
                         self._segment_break_callback()
