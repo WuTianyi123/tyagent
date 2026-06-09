@@ -195,6 +195,7 @@ class ProgressSender:
 
     def break_segment(self) -> None:
         """Signal that a new segment starts — next tool call creates a new message."""
+        logger.info("ProgressSender: segment break — resetting message")
         self._progress_msg_id = None
         self._last_delivered_count = 0
 
