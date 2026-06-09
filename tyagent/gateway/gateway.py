@@ -470,6 +470,7 @@ class Gateway:
                 final_text,
                 reply_target=reply_target,
                 tool_progress_cb=_progress_cb,
+                segment_break_cb=progress_sender.break_segment,
                 turn_done_cb=_turn_done,
             )
 

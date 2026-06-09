@@ -599,6 +599,12 @@ class TyAgent:
                     text=content,
                     reply_target=self._reply_target,
                 ))
+                # Signal segment break so ProgressSender starts a new message
+                if self._segment_break_callback:
+                    try:
+                        self._segment_break_callback()
+                    except Exception:
+                        pass
 
             if not tool_calls:
                 self._completed_normally = True
@@ -699,6 +705,7 @@ class TyAgent:
         self, text: str,
         reply_target: Optional[ReplyTarget] = None,
         tool_progress_cb: Any = None,
+        segment_break_cb: Any = None,
         turn_done_cb: Any = None,
     ) -> None:
         """Send a message to the agent loop (fire-and-forget)."""
@@ -874,6 +881,7 @@ class TyAgent:
                 self._messages.append({"role": "user", "content": msg.text})
                 current_reply = msg.reply_target
                 current_tool_cb = msg.tool_progress_cb
+                self._segment_break_callback = msg.segment_break_cb
                 current_turn_done = msg.turn_done_cb
 
             # ── Decide whether to run a turn ────────────────────

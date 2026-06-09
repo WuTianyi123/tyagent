@@ -193,6 +193,11 @@ class ProgressSender:
         # on the event loop before awaiting run_in_executor).
         self._queue.put_nowait(msg)
 
+    def break_segment(self) -> None:
+        """Signal that a new segment starts — next tool call creates a new message."""
+        self._progress_msg_id = None
+        self._last_delivered_count = 0
+
     def finish(self) -> None:
         """Signal that no more progress updates will come."""
         self._done = True
