@@ -168,6 +168,7 @@ class ProgressSender:
         self.reply_to_message_id = reply_to_message_id
         self.enabled = enabled
         self._queue: "asyncio.Queue[str]" = asyncio.Queue()
+        self._output_queue = None  # set after agent is created
         self._done = False
         self._progress_lines: list[str] = []
         self._progress_msg_id: str | None = None
@@ -195,6 +196,15 @@ class ProgressSender:
         # Queue from the event loop thread (agent.chat() fires this callback
         # on the event loop before awaiting run_in_executor).
         self._queue.put_nowait(msg)
+        # Also put on the agent's shared output queue
+        if self._output_queue is not None:
+            try:
+                from tyagent.types import AgentOutput
+                self._output_queue.put_nowait(AgentOutput(
+                    kind="progress", text=msg, finish=False,
+                ))
+            except Exception:
+                pass
 
     def break_segment(self) -> None:
         """Signal that a new segment starts — next tool call creates a new message."""
@@ -206,6 +216,14 @@ class ProgressSender:
     def finish(self) -> None:
         """Signal that no more progress updates will come."""
         self._done = True
+        if self._output_queue is not None:
+            try:
+                from tyagent.types import AgentOutput
+                self._output_queue.put_nowait(AgentOutput(
+                    kind="progress", text="", finish=True,
+                ))
+            except Exception:
+                pass
 
     async def run(self) -> None:
         """Async task: drain queue and edit a single progress message."""

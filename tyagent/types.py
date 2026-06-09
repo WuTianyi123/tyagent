@@ -15,8 +15,10 @@ class ReplyTarget:
 @dataclass
 class AgentOutput:
     """Single output from the agent loop."""
-    text: str
+    kind: str = "text"  # "text" | "progress"
+    text: str = ""
     reply_target: Optional[ReplyTarget] = None
+    finish: bool = False  # for progress: True means finalize this batch
 
 
 @dataclass

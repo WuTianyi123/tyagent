@@ -7,6 +7,7 @@ and handles session lifecycle.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import logging
 import os
@@ -418,11 +419,16 @@ class Gateway:
             _progress_cb = progress_sender.on_tool_started
 
             # Ensure session agent is running (creates SessionContext if new)
+            # Wire ProgressSender to agent's output queue for unified ordering
+            progress_sender._output_queue = agent._output_queue
             agent = await self._ensure_session_agent(
                 session_key, session,
                 adapter, event.chat_id or "",
                 persist_message,
             )
+
+            # Wire ProgressSender to agent's output queue for unified ordering
+            progress_sender._output_queue = agent._output_queue
 
             # Register progress task in session context
             ctx = self._sessions.get(session_key)
@@ -564,17 +570,28 @@ class Gateway:
             return agent
 
     async def _consume_output(self, session_key: str):
-        """Long-running task: consume agent outputs and send to platform."""
+        """Long-running task: consume agent outputs and send to platform.
+
+        Handles both text and progress (tool call) items in a unified queue.
+        Text items are sent immediately.  Progress items are accumulated and
+        edited into one message (with throttling and flood control) until the
+        next text item or a finish marker arrives.
+        """
         ctx = self._sessions.get(session_key)
         agent = ctx.agent if ctx else None
         if agent is None:
             return
 
+        # Progress state (moved from ProgressSender)
+        progress_lines = []
+        progress_msg_id = None
+        can_edit = True
+        last_edit_ts = 0.0
+        last_delivered_count = 0
+        _EDIT_INTERVAL = 1.5
+
         while self._running:
             try:
-                # Race: wait for next output OR shutdown signal.
-                # Using wait() instead of wait_for() avoids the 1s polling
-                # latency — outputs are dispatched as soon as they arrive.
                 get_task = asyncio.ensure_future(agent._output_queue.get())
                 shutdown_task = asyncio.ensure_future(self._shutdown_event.wait())
                 done, _ = await asyncio.wait(
@@ -585,7 +602,6 @@ class Gateway:
                     get_task.cancel()
                     try: await get_task
                     except asyncio.CancelledError: pass
-                    # Drain any remaining outputs before exiting
                     self._drain_output_queue(agent, ctx)
                     break
                 output = get_task.result()
@@ -598,102 +614,77 @@ class Gateway:
             if adapter is None:
                 continue
 
-            if output.reply_target:
-                # User-message-driven reply
-                await adapter.send_message(
-                    output.reply_target.chat_id,
-                    output.text,
-                    reply_to_message_id=output.reply_target.message_id,
-                )
-            else:
-                # Auto-reply (child completion triggered)
-                await adapter.send_message(chat_id, output.text)
-
-    def _drain_output_queue(self, agent, ctx) -> None:
-        """Drain any remaining outputs from the agent's queue before shutdown.
-
-        Called when _consume_output is about to exit, so no outputs are
-        silently lost.
-        """
-        while not agent._output_queue.empty():
-            try:
-                output = agent._output_queue.get_nowait()
-                if not output.text.strip():
-                    continue
-                adapter = ctx.adapter if ctx else None
-                chat_id = ctx.chat_id if ctx else ""
-                if adapter is None:
-                    continue
-                target = output.reply_target.chat_id if output.reply_target else chat_id
-                msg_id = output.reply_target.message_id if output.reply_target else None
-                kwargs = {"reply_to_message_id": msg_id} if msg_id else {}
-                asyncio.ensure_future(adapter.send_message(target, output.text, **kwargs))
-            except asyncio.QueueEmpty:
-                break
-            except Exception:
-                pass
-
-    async def _init_agents_on_startup(self) -> None:
-        """Initialize session agents for all sessions with message history.
-
-        Runs after adapters start. For each session that has messages,
-        creates the agent loop and output consumer. If the chain ends with
-        a tool response (collected after restart), _agent_loop auto-processes
-        it proactively. Otherwise the agent waits for inbox messages.
-        """
-        for session_key in self.session_store.all_session_keys():
-            if session_key in self._sessions:
-                continue
-            try:
-                session = self.session_store.get(session_key)
-                if not session or not session.messages:
-                    continue
-                platform = session_key.split(":", 1)[0] if ":" in session_key else ""
-                adapter = self.adapters.get(platform)
-                if adapter is None:
-                    continue
-                # session_key format: "platform:chat_id" or "platform:chat_id:sender_id"
-                # Extract just the chat_id (always the second part).
-                key_parts = session_key.split(":")
-                chat_id = key_parts[1] if len(key_parts) >= 2 else ""
-                _persist_sid = session.metadata.get("current_session_id", "")
-                def _mk_persist(sid, sk=session_key):
-                    def _p(role, content, **extras):
-                        self.session_store.add_message(
-                            sk, role, content, session_id=sid, **extras,
-                        )
-                    return _p
-                # Create a ProgressSender for the auto-processing turn so
-                # tool progress is visible after restart (separate message
-                # from any pre-restart progress messages).
-                progress_sender = ProgressSender(
-                    adapter, chat_id,
-                    reply_to_message_id=None,
-                    enabled=True,
-                )
-                progress_task = asyncio.create_task(progress_sender.run())
-                try:
-                    # Set the progress callback on the agent before the loop starts
-                    agent = self._get_or_create_agent(session_key)
-                    agent._tool_progress_callback = progress_sender.on_tool_started
-                    await self._ensure_session_agent(
-                        session_key, session, adapter, chat_id,
-                        _mk_persist(_persist_sid),
-                    )
-                finally:
-                    # Finish the startup progress sender so it stops polling.
-                    # The agent's auto-turn (which used this sender) has completed.
-                    progress_sender.finish()
-                    # Wait for the run() loop to exit cleanly (within 100ms)
+            # -- Text output --
+            if output.kind == "text":
+                # Finalize any pending progress batch
+                if progress_lines and progress_msg_id:
                     try:
-                        await asyncio.wait_for(progress_task, timeout=0.1)
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        progress_task.cancel()
-                        try: await progress_task
-                        except asyncio.CancelledError: pass
-                logger.info("Initialized agent for session %s", session_key)
-            except Exception:
-                logger.exception("Failed to init agent for %s", session_key)
+                        await adapter.edit_message(
+                            chat_id, progress_msg_id,
+                            "\n".join(progress_lines),
+                        )
+                    except Exception:
+                        pass
+                progress_lines.clear()
+                progress_msg_id = None
+                can_edit = True
+                last_delivered_count = 0
+
+                if output.reply_target:
+                    await adapter.send_message(
+                        output.reply_target.chat_id, output.text,
+                        reply_to_message_id=output.reply_target.message_id,
+                    )
+                else:
+                    await adapter.send_message(chat_id, output.text)
+                continue
+
+            # -- Progress output --
+            if output.kind == "progress":
+                progress_lines.append(output.text)
+                if output.finish:
+                    if progress_lines and progress_msg_id:
+                        try:
+                            await adapter.edit_message(
+                                chat_id, progress_msg_id,
+                                "\n".join(progress_lines),
+                            )
+                        except Exception:
+                            pass
+                    progress_lines.clear()
+                    progress_msg_id = None
+                    can_edit = True
+                    last_delivered_count = 0
+                    continue
+
+                # Throttle edits
+                now = time.monotonic()
+                if now - last_edit_ts < _EDIT_INTERVAL:
+                    continue
+                last_edit_ts = now
+
+                text = "\n".join(progress_lines)
+
+                if progress_msg_id is not None and can_edit:
+                    result = await adapter.edit_message(
+                        chat_id, progress_msg_id, text,
+                    )
+                    if result.success:
+                        last_delivered_count = len(progress_lines)
+                    else:
+                        can_edit = False
+                        delta_lines = progress_lines[last_delivered_count:]
+                        delta_text = "\n".join(delta_lines) if delta_lines else text
+                        fallback = await adapter.send_message(chat_id, delta_text)
+                        if fallback.success and fallback.message_id:
+                            progress_msg_id = fallback.message_id
+                            can_edit = True
+                            progress_lines = delta_lines[:]
+                            last_delivered_count = 0
+                elif progress_msg_id is None:
+                    result = await adapter.send_message(chat_id, text)
+                    if result.success and result.message_id:
+                        progress_msg_id = result.message_id
 
     async def _stop_session_agent(self, session_key: str):
         """Stop and clean up a session's agent loop and consumer."""
