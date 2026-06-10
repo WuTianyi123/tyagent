@@ -936,6 +936,30 @@ class FeishuAdapter(BasePlatformAdapter):
             try:
                 if do_reaction:
                     await self._add_processing_reaction(ev.message_id)
+
+                # Download media files so the LLM sees real paths, not opaque keys
+                if ev.media_urls:
+                    paths: List[str] = []
+                    for key, mtype in zip(ev.media_urls, ev.media_types or []):
+                        filepath = await self._download_media(
+                            ev.message_id, key, mtype or "file",
+                        )
+                        if filepath:
+                            label = mtype.capitalize() if mtype else "File"
+                            paths.append(f"[{label}: {filepath}]")
+                        else:
+                            label = mtype.capitalize() if mtype else "File"
+                            paths.append(
+                                f"[{label}: download failed — {key}]"
+                            )
+                    if paths:
+                        joined = "\n".join(paths)
+                        ev.text = (
+                            f"{ev.text}\n\n{joined}" if ev.text else joined
+                        )
+                    ev.media_urls = []   # resolved — gateway won't re-append
+                    ev.media_types = []
+
                 return await self._handle_message(ev)
             except asyncio.CancelledError:
                 if do_reaction:
@@ -1087,15 +1111,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     # Try GetImageRequest first (dedicated image API)
                     req = GetImageRequest.builder().image_key(file_key).build()
                     resp = self._client.im.v1.image.get(req)
-                elif media_type == "file":
-                    # Try GetFileRequest first (dedicated file API)
-                    req = GetFileRequest.builder().file_key(file_key).build()
-                    resp = self._client.im.v1.file.get(req)
                 else:
-                    # Fallback to GetMessageResourceRequest for audio/media
+                    # Use GetMessageResourceRequest for file/audio/media.
+                    # GetFileRequest only works for files the APP sent itself;
+                    # for user->bot files we need message_id + file_key + type.
                     req = GetMessageResourceRequest.builder() \
                         .message_id(message_id) \
                         .file_key(file_key) \
+                        .type(media_type) \
                         .build()
                     resp = self._client.im.v1.message_resource.get(req)
 
