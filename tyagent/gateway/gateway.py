@@ -509,6 +509,29 @@ class Gateway:
             agent.session_key = session_key
             agent.current_session_id = session.metadata.get("current_session_id", "")
 
+            # Compaction callback: freshen session and persist compacted messages
+            # so they survive restarts.  Also updates the agent's persist
+            # callback so subsequent messages use the new session_id.
+            async def _on_compacted(compacted_msgs):
+                self.session_store.freshen_session(session_key)
+                new_session = self.session_store.get(session_key)
+                new_sid = new_session.metadata["current_session_id"]
+                for m in compacted_msgs:
+                    self.session_store.add_message(
+                        session_key, m["role"], m.get("content", ""),
+                        session_id=new_sid,
+                        tool_calls=m.get("tool_calls"),
+                        tool_call_id=m.get("tool_call_id"),
+                    )
+                agent.current_session_id = new_sid
+                # Re-bind the persist callback for subsequent turns
+                def _new_persist(role: str, content: str, **extras):
+                    self.session_store.add_message(
+                        session_key, role, content,
+                        session_id=new_sid, **extras,
+                    )
+                agent._on_message = _new_persist
+
             # Start the permanent agent loop with history and persistence
             # Sanitize the message chain to repair orphaned tool_calls from
             # crashes/restarts mid-tool-execution (e.g. assistant with 2 tool_calls
@@ -516,6 +539,7 @@ class Gateway:
             await agent.start(
                 history=_sanitize_message_chain(session.messages),
                 on_message=persist_message,
+                on_compacted=_on_compacted,
             )
 
             self._sessions[session_key] = SessionContext(

@@ -12,10 +12,15 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 # Type alias for the on_message callback
 OnMessageCallback = Callable[..., Any]
+
+# Callback invoked when compaction completes successfully.
+# Receives the compacted messages list.  The gateway uses this to
+# freshen the session and persist the summary for restart survival.
+OnCompactedCallback = Callable[[List[Dict[str, Any]]], Awaitable[None]]
 
 import httpx
 
@@ -131,6 +136,7 @@ class TyAgent:
         self._completed_normally: bool = False  # True when last turn finished without tool calls
         self._messages: List[Dict[str, Any]] = []
         self._on_message: Optional[OnMessageCallback] = None
+        self._on_compacted: Optional[OnCompactedCallback] = None
         self._tool_progress_callback: Optional[Callable[..., Any]] = None
         # ── Child agent management ────────────────────────────────
         self._bg_tasks: Dict[str, asyncio.Task] = {}
@@ -533,6 +539,11 @@ class TyAgent:
             )
             if compacted is not None:
                 messages[:] = compacted
+                if self._on_compacted is not None:
+                    try:
+                        await self._on_compacted(compacted)
+                    except Exception:
+                        logger.exception("on_compacted callback failed")
                 self._refresh_memory_and_prompt()
                 system_prompt = self._system_prompt  # refresh after compaction
                 # Reset last_usage so next threshold check uses estimate,
@@ -642,6 +653,11 @@ class TyAgent:
                 )
                 if compacted is not None:
                     messages[:] = compacted
+                    if self._on_compacted is not None:
+                        try:
+                            await self._on_compacted(compacted)
+                        except Exception:
+                            logger.exception("on_compacted callback failed")
                     self._refresh_memory_and_prompt()
                     system_prompt = self._system_prompt  # refresh after compaction
                     self.last_usage = None  # reset stale token counts
@@ -657,12 +673,14 @@ class TyAgent:
         self,
         history: Optional[List[Dict[str, Any]]] = None,
         on_message: Optional[OnMessageCallback] = None,
+        on_compacted: Optional[OnCompactedCallback] = None,
     ) -> None:
         """Start the permanent agent event loop."""
         if self._running:
             return
         self._messages = list(history) if history else []
         self._on_message = on_message
+        self._on_compacted = on_compacted
         self._stop_event.clear()
         self._loop_task = asyncio.create_task(self._agent_loop())
         self._running = True  # set AFTER loop_task creation to prevent double-start
