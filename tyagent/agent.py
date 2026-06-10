@@ -24,7 +24,8 @@ OnCompactedCallback = Callable[[List[Dict[str, Any]]], Awaitable[None]]
 
 import httpx
 
-from tyagent.compaction import run_compact, total_token_estimate
+from tyagent.compaction import run_compact
+from tyagent.token_counter import count_tokens
 from tyagent.config import CompressionConfig
 from tyagent.model_metadata import get_model_context_length
 from tyagent.prompt_builder import build_system_prompt
@@ -519,11 +520,11 @@ class TyAgent:
 
         # ── Pre-turn compaction ─────────────────────────────────
         # Use exact prompt_tokens from the last API response when available,
-        # falling back to byte-based estimate only for the first-ever call.
+        # falling back to local tokenizer count (accurate to within ~1%).
         if self.last_usage is not None:
             est = self.last_usage["prompt_tokens"]
         else:
-            est = total_token_estimate(messages, system_prompt=system_prompt)
+            est = count_tokens(messages, system_prompt=system_prompt)
         if est >= self.auto_compact_limit:
             logger.info(
                 "Pre-turn compaction: %d prompt_tokens >= %d limit",
@@ -629,7 +630,7 @@ class TyAgent:
             if self.last_usage is not None:
                 est = self.last_usage["prompt_tokens"]
             else:
-                est = total_token_estimate(messages, system_prompt=system_prompt)
+                est = count_tokens(messages, system_prompt=system_prompt)
             if est >= self.auto_compact_limit:
                 mid_turn_compactions += 1
                 if mid_turn_compactions > 3:
